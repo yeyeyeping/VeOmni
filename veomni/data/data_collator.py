@@ -314,6 +314,276 @@ class PackingCollator(DataCollator):
 
 
 @dataclass
+class ContextParallelCollator(DataCollator):
+    """Pad, zigzag-shard, and pack decoder-only samples for context parallelism.
+
+    Unlike Ulysses sequence parallelism, zigzag Ring Attention consumes Q/K/V in
+    their sharded sequence layout. The layout must therefore be created before
+    packing, while individual sample boundaries are still explicit. Each sample
+    is padded to a multiple of ``2 * cp_size``, split into that many equal
+    chunks, and CP rank ``r`` keeps chunks ``r`` and ``2 * cp_size - r - 1``.
+
+    This first implementation intentionally supports decoder-only causal-LM
+    samples with one one-dimensional sequence per feature. Multimodal metadata,
+    sequence-classification labels, pre-packed features with multiple position
+    resets, and hybrid Ulysses x CP layouts require separate layout contracts
+    and are rejected rather than silently producing incorrect attention.
+    """
+
+    collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
+    pad_to_length: int = False
+    seq_classification: bool = False
+    metadata_collate_func: Optional[MetadataCollateFunc] = None
+
+    def __post_init__(self):
+        parallel_state = get_parallel_state()
+        self.cp_size = parallel_state.cp_size
+        self.cp_rank = parallel_state.cp_rank
+        
+        self.ulysses_size = parallel_state.ulysses_size
+        self.ulysses_rank = parallel_state.ulysses_rank
+        
+        
+        if self.cp_size <= 1:
+            raise ValueError("ContextParallelCollator requires cp_size > 1.")
+        if self.seq_classification:
+            raise NotImplementedError("ContextParallelCollator currently supports causal-LM labels only.")
+        if self.metadata_collate_func is not None:
+            raise NotImplementedError("ContextParallelCollator currently supports decoder-only text samples.")
+        if not 0 <= self.cp_rank < self.cp_size:
+            raise ValueError(f"Invalid context-parallel rank {self.cp_rank} for cp_size={self.cp_size}.")
+
+        self.alignment = 2 * self.cp_size
+        if parallel_state.ulysses_enabled:
+            import math
+            self.alignment = math.lcm(2 * self.cp_size, self.ulysses_size * self.cp_size)
+            
+
+    def _get_token_keys(self, features: Sequence[Dict[str, Any]]) -> List[str]:
+        required_keys = {"input_ids", "labels", "position_ids"}
+        missing_keys = required_keys - set(features[0])
+        if missing_keys:
+            raise ValueError(f"Context-parallel samples are missing required keys: {sorted(missing_keys)}")
+
+        sequence_length = features[0]["input_ids"].size(-1)
+        token_keys = []
+        for key, value in features[0].items():
+            collate_info = self.collate_infos.get(key)
+            if (
+                collate_info is not None
+                and collate_info.pack_dim == -1
+                and isinstance(value, torch.Tensor)
+                and value.ndim == 1
+                and value.size(-1) == sequence_length
+            ):
+                token_keys.append(key)
+
+        missing_token_keys = required_keys - set(token_keys)
+        if missing_token_keys:
+            raise ValueError(
+                "ContextParallelCollator requires one-dimensional, sequence-aligned tensors for "
+                f"{sorted(missing_token_keys)}."
+            )
+        return token_keys
+
+    def _validate_feature(self, feature: Dict[str, Any], token_keys: Sequence[str]) -> int:
+        input_ids = feature["input_ids"]
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 1:
+            raise ValueError("ContextParallelCollator expects one-dimensional input_ids per feature.")
+
+        sequence_length = input_ids.size(0)
+        if sequence_length == 0:
+            raise ValueError("ContextParallelCollator does not support empty sequences.")
+
+        for key in token_keys:
+            value = feature.get(key)
+            if not isinstance(value, torch.Tensor) or value.ndim != 1 or value.size(0) != sequence_length:
+                raise ValueError(
+                    f"Context-parallel field {key!r} must be a one-dimensional tensor of length {sequence_length}."
+                )
+
+        position_ids = feature["position_ids"]
+        sequence_starts = position_ids.eq(0).nonzero(as_tuple=False).flatten()
+        if sequence_starts.numel() != 1 or int(sequence_starts[0]) != 0:
+            raise NotImplementedError(
+                "Each ContextParallelCollator feature must contain exactly one logical sequence whose position_ids "
+                "start at zero. Pre-packed DPO-style features with multiple position resets are not supported yet."
+            )
+
+        return sequence_length
+
+    def _padded_length(self, sequence_length: int) -> int:
+        return ((sequence_length + self.alignment - 1) // self.alignment) * self.alignment
+
+    def _shift_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        return F.pad(labels[1:].contiguous(), (0, 1), value=IGNORE_INDEX)
+
+    def _pad_token_field(
+        self,
+        key: str,
+        value: torch.Tensor,
+        pad_length: int,
+    ) -> torch.Tensor:
+        if pad_length == 0:
+            return value
+
+        if key == "position_ids":
+            start = int(value[-1]) + 1
+            padding = torch.arange(start, start + pad_length, dtype=value.dtype, device=value.device)
+        else:
+            collate_info = self.collate_infos[key]
+            if collate_info.sp_pad_value is None:
+                raise ValueError(f"Context-parallel field {key!r} requires a padding value.")
+            padding = torch.full(
+                (pad_length,),
+                fill_value=collate_info.sp_pad_value,
+                dtype=value.dtype,
+                device=value.device,
+            )
+        return torch.cat((value, padding), dim=0)
+
+    def _zigzag_slice(self, value: torch.Tensor) -> torch.Tensor:
+        chunk_length = value.size(0) // self.alignment
+        front_start = self.cp_rank * chunk_length
+        back_start = (self.alignment - self.cp_rank - 1) * chunk_length
+        return torch.cat(
+            (
+                value.narrow(0, front_start, chunk_length),
+                value.narrow(0, back_start, chunk_length),
+            ),
+            dim=0,
+        )
+
+    def _make_tail_padding_feature(self, token_keys: Sequence[str], length: int, template: Dict[str, Any]):
+        padding_feature = {}
+        for key in token_keys:
+            template_value = template[key]
+            if key == "position_ids":
+                padding_feature[key] = torch.arange(length, dtype=template_value.dtype, device=template_value.device)
+                continue
+
+            collate_info = self.collate_infos[key]
+            if collate_info.sp_pad_value is None:
+                raise ValueError(f"Context-parallel field {key!r} requires a padding value.")
+            padding_feature[key] = torch.full(
+                (length,),
+                fill_value=collate_info.sp_pad_value,
+                dtype=template_value.dtype,
+                device=template_value.device,
+            )
+        return padding_feature
+
+    def _collate_non_token_fields(
+        self,
+        features: Sequence[Dict[str, Any]],
+        token_keys: Sequence[str],
+    ) -> Dict[str, Any]:
+        values_by_key = defaultdict(list)
+        for feature in features:
+            for key, value in feature.items():
+                if key not in token_keys:
+                    values_by_key[key].append(value)
+
+        batch = {}
+        for key, values in values_by_key.items():
+            collate_info = self.collate_infos.get(key)
+            if collate_info is not None:
+                try:
+                    batch[key] = torch.cat(values, dim=collate_info.pack_dim)
+                    if collate_info.pack_dim == -1:
+                        batch[key] = batch[key].unsqueeze(0)
+                    continue
+                except Exception:
+                    pass
+
+            try:
+                if key.split("_")[0] in MODALITY:
+                    batch[key] = torch.cat(values, dim=0)
+                else:
+                    batch[key] = default_collate(values)
+            except Exception:
+                batch[key] = values
+        return batch
+
+    def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        if not features:
+            raise ValueError("ContextParallelCollator received an empty feature list.")
+
+        token_keys = self._get_token_keys(features)
+        reference_token_keys = set(token_keys)
+        local_pieces = defaultdict(list)
+        local_lengths = []
+        total_padded_length = 0
+
+        for feature in features:
+            feature_token_keys = self._get_token_keys([feature])
+            if set(feature_token_keys) != reference_token_keys:
+                raise ValueError("All context-parallel features must contain the same sequence-aligned fields.")
+
+            sequence_length = self._validate_feature(feature, token_keys)
+            padded_length = self._padded_length(sequence_length)
+            pad_length = padded_length - sequence_length
+
+            for key in token_keys:
+                value = feature[key]
+                if key == "labels":
+                    value = self._shift_labels(value)
+                value = self._pad_token_field(key, value, pad_length)
+                local_pieces[key].append(self._zigzag_slice(value))
+
+            local_lengths.append(padded_length // self.cp_size)
+            total_padded_length += padded_length
+
+        tail_padding_length = 0
+        if self.pad_to_length:
+            if self.pad_to_length % self.alignment != 0:
+                raise ValueError(
+                    f"pad_to_length={self.pad_to_length} must be divisible by 2 * cp_size={self.alignment}."
+                )
+            if total_padded_length > self.pad_to_length:
+                raise ValueError(
+                    "Per-sequence context-parallel padding exceeds pad_to_length: "
+                    f"padded total {total_padded_length} > target {self.pad_to_length}."
+                )
+
+            global_tail_padding = self.pad_to_length - total_padded_length
+            if global_tail_padding:
+                tail_feature = self._make_tail_padding_feature(token_keys, global_tail_padding, features[0])
+                for key in token_keys:
+                    local_pieces[key].append(self._zigzag_slice(tail_feature[key]))
+                tail_padding_length = global_tail_padding // self.cp_size
+                local_lengths.append(tail_padding_length)
+
+        batch = self._collate_non_token_fields(features, token_keys)
+        for key in token_keys:
+            seq_list = local_pieces[key]
+            if self.ulysses_size > 1:
+                for i in range(len(seq_list)):
+                    ulysses_chunk_size = len(seq_list[i]) // self.ulysses_size
+                    seq_list[i] = seq_list[i][self.ulysses_rank * ulysses_chunk_size:(self.ulysses_rank + 1) * ulysses_chunk_size]
+            batch[key] = torch.cat(local_pieces[key], dim=0).unsqueeze(0)
+
+        cu_device = batch["position_ids"].device
+        local_lengths_tensor = torch.tensor(local_lengths, dtype=torch.int32, device=cu_device)
+        local_cu_seqlens = F.pad(local_lengths_tensor.cumsum(0), (1, 0))
+        local_max_seqlen = int(local_lengths_tensor.max().item())
+
+        batch["cu_seq_lens_q"] = local_cu_seqlens
+        batch["cu_seq_lens_k"] = local_cu_seqlens
+        batch["max_length_q"] = local_max_seqlen
+        batch["max_length_k"] = local_max_seqlen
+        batch["linear_attn_cu_seq_lens_q"] = local_cu_seqlens
+        if tail_padding_length:
+            batch["tail_padding_length"] = torch.tensor(
+                tail_padding_length,
+                dtype=torch.int32,
+                device=cu_device,
+            )
+
+        return batch
+
+
+@dataclass
 class SequenceParallelCollator(DataCollator):
     collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
     seq_classification: bool = (
@@ -474,22 +744,33 @@ class MainCollator(DataCollator):
         assert self.collate_infos["attention_mask"].sp_pad_value == 1
 
         self.preforward_pipeline.append(PrecomputePositionIDsCollator())
-        self.preforward_pipeline.append(
-            PackingCollator(
-                collate_infos=self.collate_infos,
-                pad_to_length=self.pad_to_length,
-                seq_classification=self.seq_classification,
-                metadata_collate_func=self.metadata_collate_func,
-            )
-        )
-        if get_parallel_state().sp_enabled:
+        parallel_state = get_parallel_state()
+        if getattr(parallel_state, "cp_enabled", False):
             self.preforward_pipeline.append(
-                SequenceParallelCollator(
+                ContextParallelCollator(
                     collate_infos=self.collate_infos,
+                    pad_to_length=self.pad_to_length,
                     seq_classification=self.seq_classification,
                     metadata_collate_func=self.metadata_collate_func,
                 )
             )
+        else:
+            self.preforward_pipeline.append(
+                PackingCollator(
+                    collate_infos=self.collate_infos,
+                    pad_to_length=self.pad_to_length,
+                    seq_classification=self.seq_classification,
+                    metadata_collate_func=self.metadata_collate_func,
+                )
+            )
+            if parallel_state.sp_enabled:
+                self.preforward_pipeline.append(
+                    SequenceParallelCollator(
+                        collate_infos=self.collate_infos,
+                        seq_classification=self.seq_classification,
+                        metadata_collate_func=self.metadata_collate_func,
+                    )
+                )
         logger.info_rank0(self.log_collate_infos())
 
     def __call__(self, micro_batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
