@@ -153,21 +153,21 @@ def ring_attention(query, key, value, softmax_scale, dropout_p, **kwargs):
     cu_seq_lens_q = kwargs.pop("cu_seq_lens_q") 
     cu_seq_lens_k = kwargs.pop("cu_seq_lens_k")
     assert torch.equal(cu_seq_lens_k, cu_seq_lens_q), "cross atention is not support in cp now" 
-    query = query.squeeze(0) 
-    value = value.squeeze(0) 
-    key = key.squeeze(0) 
-    cp_group = get_parallel_state().cp_group 
-    attn_output = ZigZagRingNPUFlashAttnVarlenFunc.apply( 
-        query, 
-        key, 
-        value, 
-        cp_group, 
-        cu_seq_lens_q, 
-        softmax_scale, 
-        dropout_p) 
+    if query.ndim == 4 and query.shape[0] == 1:
+        query = query.squeeze(0) 
+        value = value.squeeze(0) 
+        key = key.squeeze(0)
+        attn_output = ZigZagRingNPUFlashAttnVarlenFunc.apply( 
+            query, 
+            key, 
+            value, 
+            get_parallel_state().cp_group, 
+            cu_seq_lens_q, 
+            softmax_scale, 
+            dropout_p) 
+        return attn_output.unsqueeze(0)
+    assert query.ndim == 3, "query should be 3D tensor in CP attention"
     
-    return attn_output.unsqueeze(0)
-
 def flash_attention_forward( 
     module: torch.nn.Module, 
     query: torch.Tensor, 
@@ -244,7 +244,9 @@ def flash_attention_forward(
             target_dtype = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype 
  
     # Instead of relying on the value set in the module directly, we use the is_causal passed in kwargs if it is presented 
-    is_causal = kwargs.pop("is_causal", None) or module.is_causal
+    is_causal = kwargs.pop("is_causal", None)
+    if is_causal is None:
+        is_causal = module.is_causal
     # Ulysses patch 
     ulysses_enabled = get_parallel_state().ulysses_enabled 
     if ulysses_enabled and not skip_ulysses: 
@@ -281,6 +283,10 @@ def flash_attention_forward(
     if get_parallel_state().cp_enabled:
         from veomni.utils.device import IS_NPU_AVAILABLE
         assert IS_NPU_AVAILABLE
+        assert is_causal, "is_causal must be provided for CP attention"
+        if target_dtype and query.dtype == torch.float32:
+                        logger.warning_once(f"Casting fp32 inputs back to {target_dtype} for flash-attn compatibility.")
+                        query, key, value= query.to(target_dtype), key.to(target_dtype), value.to(target_dtype)
         attn_output = ring_attention(query, key, value, softmax_scale=scaling, dropout_p=dropout, **kwargs)
     else:
         if module.config._attn_implementation == "veomni_flash_attention_2_with_sp": 
