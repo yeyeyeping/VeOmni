@@ -244,7 +244,7 @@ def flash_attention_forward(
             target_dtype = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype 
  
     # Instead of relying on the value set in the module directly, we use the is_causal passed in kwargs if it is presented 
-    is_causal = kwargs.pop("is_causal", None) 
+    is_causal = kwargs.pop("is_causal", None) or module.is_causal
     # Ulysses patch 
     ulysses_enabled = get_parallel_state().ulysses_enabled 
     if ulysses_enabled and not skip_ulysses: 
@@ -278,7 +278,7 @@ def flash_attention_forward(
     # loader. By keeping the VeOmni name here, our monkey-patch of 
     # ``load_and_register_attn_kernel`` intercepts it and loads 
     # ``flash_attn.cute`` locally. 
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().cp_enabled:
         from veomni.utils.device import IS_NPU_AVAILABLE
         assert IS_NPU_AVAILABLE
         attn_output = ring_attention(query, key, value, softmax_scale=scaling, dropout_p=dropout, **kwargs)

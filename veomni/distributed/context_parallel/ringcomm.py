@@ -1,9 +1,6 @@
-from __future__ import annotations
-
-from typing import Optional
-
-import torch
 import torch.distributed as dist
+import torch
+from typing import Optional
 
 
 class RingComm:

@@ -343,16 +343,13 @@ class ContextParallelCollator(DataCollator):
         self.ulysses_size = parallel_state.ulysses_size
         self.ulysses_rank = parallel_state.ulysses_rank
         
-        
         if self.cp_size <= 1:
             raise ValueError("ContextParallelCollator requires cp_size > 1.")
         if self.seq_classification:
             raise NotImplementedError("ContextParallelCollator currently supports causal-LM labels only.")
         if self.metadata_collate_func is not None:
             raise NotImplementedError("ContextParallelCollator currently supports decoder-only text samples.")
-        if not 0 <= self.cp_rank < self.cp_size:
-            raise ValueError(f"Invalid context-parallel rank {self.cp_rank} for cp_size={self.cp_size}.")
-
+        
         self.alignment = 2 * self.cp_size
         if parallel_state.ulysses_enabled:
             import math
@@ -443,9 +440,10 @@ class ContextParallelCollator(DataCollator):
         return torch.cat((value, padding), dim=0)
 
     def _zigzag_slice(self, value: torch.Tensor) -> torch.Tensor:
-        chunk_length = value.size(0) // self.alignment
+        num_chunks = 2 * self.cp_size
+        chunk_length = value.size(0) // num_chunks
         front_start = self.cp_rank * chunk_length
-        back_start = (self.alignment - self.cp_rank - 1) * chunk_length
+        back_start = (num_chunks - self.cp_rank - 1) * chunk_length
         return torch.cat(
             (
                 value.narrow(0, front_start, chunk_length),
@@ -506,9 +504,6 @@ class ContextParallelCollator(DataCollator):
         return batch
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        if not features:
-            raise ValueError("ContextParallelCollator received an empty feature list.")
-
         token_keys = self._get_token_keys(features)
         reference_token_keys = set(token_keys)
         local_pieces = defaultdict(list)
@@ -556,12 +551,10 @@ class ContextParallelCollator(DataCollator):
 
         batch = self._collate_non_token_fields(features, token_keys)
         for key in token_keys:
-            seq_list = local_pieces[key]
-            if self.ulysses_size > 1:
-                for i in range(len(seq_list)):
-                    ulysses_chunk_size = len(seq_list[i]) // self.ulysses_size
-                    seq_list[i] = seq_list[i][self.ulysses_rank * ulysses_chunk_size:(self.ulysses_rank + 1) * ulysses_chunk_size]
             batch[key] = torch.cat(local_pieces[key], dim=0).unsqueeze(0)
+            if self.ulysses_size > 1:
+                ulysses_chunk_size = batch[key].shape[1] // self.ulysses_size
+                batch[key] = batch[key][:, ulysses_chunk_size * self.ulysses_rank:ulysses_chunk_size * (self.ulysses_rank + 1)]
 
         cu_device = batch["position_ids"].device
         local_lengths_tensor = torch.tensor(local_lengths, dtype=torch.int32, device=cu_device)

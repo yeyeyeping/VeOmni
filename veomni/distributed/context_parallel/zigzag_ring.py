@@ -16,7 +16,7 @@ def get_half_index(
             return slice(None, cu_seqlens[-1] // 2)
         else:
             return slice(cu_seqlens[-1] // 2, None)
-    index = torch.zeros((cu_seqlens[-1], ), dtype=bool)
+    index = torch.zeros((cu_seqlens[-1], ), dtype=bool, device=cu_seqlens.device)
     for i in range(len(cu_seqlens) - 1):
         start, end = cu_seqlens[i], cu_seqlens[i + 1]
         if front:
@@ -114,8 +114,6 @@ def zigzag_ring_flash_attn_varlen_forward(
                 k0,
                 v0,
                 causal=False,
-                q_is_half=False,
-                kv_is_half=True,
             )
             global_out, global_softmax_max, global_softmax_sum = (
                 npu_ring_attention_update_tnd(
@@ -133,8 +131,6 @@ def zigzag_ring_flash_attn_varlen_forward(
                 k,
                 v,
                 causal=False,
-                q_is_half=True,
-                kv_is_half=False,
             )
             updated_out, updated_max, updated_sum = npu_ring_attention_update_tnd(
                 global_out[half_index1],
@@ -210,7 +206,7 @@ def zigzag_ring_flash_attn_varlen_backward(
     actual_half_seqlen = tuple(half_cu_seqlens[1:].cpu().numpy().tolist())
     
     def backward(
-        dout, q, k, v, out, softmax_max, softmax_sum, casual, rng_state):
+        dout, q, k, v, out, softmax_max, softmax_sum, causal, rng_state):
         seqlen_q = q.shape[0]
         seqlen_kv = k.shape[0]
         cu_seqlens_q = actual_half_seqlen if seqlen_q == block_seq_len else actual_seqlen
@@ -227,7 +223,7 @@ def zigzag_ring_flash_attn_varlen_backward(
             softmax_sum=softmax_sum,
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
-            causal=casual,
+            causal=causal,
             rng_state=rng_state,
             actual_seq_qlen=cu_seqlens_q,
             actual_seq_kvlen=cu_seqlens_kv,
@@ -250,8 +246,6 @@ def zigzag_ring_flash_attn_varlen_backward(
                 softmax_sum,
                 causal=True,
                 rng_state=rng_states[step],
-                q_is_half=False,
-                kv_is_half=False,
             )
             dq = dq_block.float().clone()
             dk = dk_block.float().clone()
@@ -270,8 +264,6 @@ def zigzag_ring_flash_attn_varlen_backward(
                     softmax_sum,
                     causal=False,
                     rng_state=rng_states[step],
-                    q_is_half=False,
-                    kv_is_half=True,
                 )
                 dq += dq_block.float()
             else:
@@ -285,8 +277,6 @@ def zigzag_ring_flash_attn_varlen_backward(
                     softmax_sum1,
                     causal=False,
                     rng_state=rng_states[step],
-                    q_is_half=True,
-                    kv_is_half=False,
                 )
                 dq[half_index1] += dq_block.float()
 
@@ -333,8 +323,8 @@ class ZigZagRingNPUFlashAttnVarlenFunc(torch.autograd.Function):
         k = k.contiguous()
         v = v.contiguous()
 
-        half_index0 = get_half_index(cu_seq_len, front=True, device=q.device)
-        half_index1 = get_half_index(cu_seq_len, front=False, device=q.device)
+        half_index0 = get_half_index(cu_seq_len, front=True)
+        half_index1 = get_half_index(cu_seq_len, front=False)
         global_out, global_softmax_max, global_softmax_sum, rng_states = (
             zigzag_ring_flash_attn_varlen_forward(
                 process_group,

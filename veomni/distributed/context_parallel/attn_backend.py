@@ -1,13 +1,8 @@
-from __future__ import annotations
-
-from typing import Dict, Optional, Tuple
-
 import torch
 import torch_npu
-
+from typing import Dict, Optional, Tuple
 
 _CAUSAL_MASK_CACHE: Dict[Tuple[str, Optional[int]], torch.Tensor] = {}
-
 
 def _causal_mask(device: torch.device) -> torch.Tensor:
     key = (device.type, device.index)
@@ -46,15 +41,7 @@ def npu_fa_forward(
     actual_seq_qlen,
     actual_seq_kvlen,
     softmax_layout: str,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Tuple[int, int, int],
-]:
-    if not 0.0 <= dropout_p < 1.0:
-        raise ValueError(f"dropout_p must be in [0, 1), got {dropout_p}")
-
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[int, int, int]]:
     atten_mask = _causal_mask(q.device) if causal else None
     sparse_mode = 2 if causal else 0 
     (
@@ -100,10 +87,10 @@ def npu_fa_backward(
     softmax_layout: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     atten_mask = _causal_mask(q.device) if causal else None
-    sparse_mode = 2 if causal else 0 
+    sparse_mode = 2 if causal else 0
+     
     seed, offset, numels = rng_state
-
-    dq, dk, dv, _ = torch_npu.npu_fusion_attention_grad(
+    dq, dk, dv, *_ = torch_npu.npu_fusion_attention_grad(
         q,
         k,
         v,
@@ -113,7 +100,6 @@ def npu_fa_backward(
         atten_mask=atten_mask,
         softmax_max=softmax_max,
         softmax_sum=softmax_sum,
-        softmax_in=None,
         attention_in=out,
         scale_value=softmax_scale,
         keep_prob=1.0 - dropout_p,
@@ -136,18 +122,11 @@ def npu_ring_attention_update_tnd(
     cur_softmax_max: torch.Tensor,
     cur_softmax_sum: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Merge one TND KV block using online-softmax statistics.
-
-    NPU FA returns max/sum as [T, N, 8].  The eight lanes are duplicates, so
-    the ring keeps one FP32 lane as [T, N] and restores eight lanes only for
-    the backward API.
-    """
-    cur_max = cur_softmax_max[:, :, 0].float()
-    cur_sum = cur_softmax_sum[:, :, 0].float()
-    cur_out = cur_attn_out.float()
+    cur_max = cur_softmax_max[:, :, 0]
+    cur_sum = cur_softmax_sum[:, :, 0]
 
     if prev_attn_out is None:
-        return cur_out, cur_max, cur_sum
+        return cur_attn_out.to(torch.float32), cur_max, cur_sum
 
     softmax_max = torch.maximum(prev_softmax_max, cur_max)
     prev_scale = torch.exp(prev_softmax_max - softmax_max)
@@ -159,7 +138,7 @@ def npu_ring_attention_update_tnd(
 
     prev_out_scale = (prev_sum_scaled / softmax_sum).unsqueeze(-1)
     cur_out_scale = (cur_sum_scaled / softmax_sum).unsqueeze(-1)
-    attn_out = prev_attn_out * prev_out_scale + cur_out * cur_out_scale
+    attn_out = prev_attn_out * prev_out_scale + cur_attn_out * cur_out_scale
     return attn_out, softmax_max, softmax_sum
 
 
