@@ -26,6 +26,7 @@ from ....distributed.sequence_parallel import (
     gather_seq_scatter_heads,
 )
 from ....utils import logging
+from ....utils.device import get_device_type
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
@@ -316,18 +317,32 @@ def flash_attention_forward(
     # ring only needs to span the ``cp`` group. The data collator lays the
     # sequence out in zig-zag block order (see ``SequenceParallelCollator`` /
     # ``sequence_parallel.data.zigzag_reorder``), so causal attention is balanced
-    # across ``cp`` ranks. Requires a flash-attn backend (FA2 on Ampere/Hopper,
-    # FA4 CuTe on Blackwell/GB200 — auto-selected in ``ring_attention``) and
-    # causal attention. Both dense and packed (varlen) sequences are supported:
-    # packed documents take the ``zigzag_ring_flash_attn_varlen_func`` path with
-    # per-document LOCAL cu_seqlens derived from the FULL ``cu_seq_lens_q``.
+    # across ``cp`` ranks. CUDA uses FA2 on Ampere/Hopper or FA4 CuTe on
+    # Blackwell; Ascend uses torch_npu fusion attention. Both dense and packed
+    # (varlen) sequences are supported, and packed documents use per-document
+    # LOCAL cu_seqlens derived from the FULL ``cu_seq_lens_q``.
     cp_state = get_parallel_state()
     if cp_state.cp_enabled:
         from ....distributed.sequence_parallel.data import local_cu_seqlens
-        from ....distributed.sequence_parallel.ring_attention import (
-            zigzag_ring_flash_attn_func,
-            zigzag_ring_flash_attn_varlen_func,
-        )
+
+        if get_device_type() == "npu":
+            from ....distributed.sequence_parallel.ring_attention_npu import (
+                zigzag_ring_npu_flash_attn_func as zigzag_ring_attn_func,
+            )
+            from ....distributed.sequence_parallel.ring_attention_npu import (
+                zigzag_ring_npu_flash_attn_varlen_func as zigzag_ring_attn_varlen_func,
+            )
+
+            ring_backend_kwargs = {"dropout_p": dropout}
+        else:
+            from ....distributed.sequence_parallel.ring_attention import (
+                zigzag_ring_flash_attn_func as zigzag_ring_attn_func,
+            )
+            from ....distributed.sequence_parallel.ring_attention import (
+                zigzag_ring_flash_attn_varlen_func as zigzag_ring_attn_varlen_func,
+            )
+
+            ring_backend_kwargs = {}
 
         if not is_causal:
             raise NotImplementedError("context-parallel (cp_size>1) ring attention requires causal attention")
@@ -353,7 +368,7 @@ def flash_attention_forward(
             seqlens = local_cu[1:] - local_cu[:-1]
             local_max = int(seqlens.max().item()) if seqlens.numel() else 0
             q3, k3, v3 = query.squeeze(0), key.squeeze(0), value.squeeze(0)
-            attn_output = zigzag_ring_flash_attn_varlen_func(
+            attn_output = zigzag_ring_attn_varlen_func(
                 q3,
                 k3,
                 v3,
@@ -362,16 +377,18 @@ def flash_attention_forward(
                 softmax_scale=scaling,
                 causal=True,
                 group=cp_state.cp_group,
+                **ring_backend_kwargs,
             )
             attn_output = attn_output.unsqueeze(0)
         else:
-            attn_output = zigzag_ring_flash_attn_func(
+            attn_output = zigzag_ring_attn_func(
                 query,
                 key,
                 value,
                 softmax_scale=scaling,
                 causal=True,
                 group=cp_state.cp_group,
+                **ring_backend_kwargs,
             )
     else:
         attn_output = _flash_attention_forward(

@@ -35,6 +35,10 @@ from veomni.distributed.sequence_parallel.data import (
     zigzag_reorder_varlen,
     zigzag_undo,
 )
+from veomni.distributed.sequence_parallel.ring_attention_npu import (
+    prepare_npu_cu_seqlens,
+    update_npu_out_and_softmax_stats,
+)
 from veomni.utils.constants import IGNORE_INDEX
 
 
@@ -99,6 +103,35 @@ def test_local_cu_seqlens_cp2():
     local = local_cu_seqlens(cu, cp_size=2)
     # each document length halved for cp=2
     assert local.tolist() == [0, 6, 10]
+
+
+def test_prepare_npu_cu_seqlens_uses_cpu_endpoints():
+    endpoints = prepare_npu_cu_seqlens(torch.tensor([0, 12, 20], dtype=torch.int32))
+    assert endpoints.device.type == "cpu"
+    assert endpoints.dtype == torch.long
+    assert endpoints.tolist() == [12, 20]
+
+
+def test_npu_softmax_stats_merge_tnd():
+    previous_out = torch.full((2, 3, 4), 2.0)
+    previous_max = torch.zeros((2, 3))
+    previous_sum = torch.ones((2, 3))
+    block_out = torch.full((2, 3, 4), 6.0)
+    block_max = torch.zeros((2, 3, 8))
+    block_sum = torch.full((2, 3, 8), 3.0)
+
+    out, softmax_max, softmax_sum = update_npu_out_and_softmax_stats(
+        previous_out,
+        previous_max,
+        previous_sum,
+        block_out,
+        block_max,
+        block_sum,
+    )
+
+    torch.testing.assert_close(out, torch.full_like(out, 5.0))
+    torch.testing.assert_close(softmax_max, torch.zeros_like(softmax_max))
+    torch.testing.assert_close(softmax_sum, torch.full_like(softmax_sum, 4.0))
 
 
 def test_reorder_varlen_cp1_is_noop():
