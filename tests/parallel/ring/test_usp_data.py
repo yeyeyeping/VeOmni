@@ -27,6 +27,7 @@ import pytest
 import torch
 
 import veomni.data.data_collator as dc
+import veomni.distributed.sequence_parallel.ring_attention_npu as ring_attention_npu
 from veomni.data.data_collator import MainCollator, PackingCollator, SequenceParallelCollator
 from veomni.distributed.sequence_parallel.data import (
     local_cu_seqlens,
@@ -110,6 +111,95 @@ def test_prepare_npu_cu_seqlens_uses_cpu_endpoints():
     assert endpoints.device.type == "cpu"
     assert endpoints.dtype == torch.long
     assert endpoints.tolist() == [12, 20]
+
+
+def test_npu_fusion_attention_uses_endpoint_lists(monkeypatch):
+    class FakeTorchNPU:
+        def npu_fusion_attention(self, q, k, v, **kwargs):
+            self.forward_kwargs = kwargs
+            stats = torch.zeros((*q.shape[:-1], 8), dtype=q.dtype)
+            return q.clone(), stats, stats + 1, None, 11, 22, 33
+
+        def npu_fusion_attention_grad(self, q, k, v, dout, **kwargs):
+            self.backward_kwargs = kwargs
+            return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v), None
+
+    fake_torch_npu = FakeTorchNPU()
+    monkeypatch.setattr(ring_attention_npu, "torch_npu", fake_torch_npu)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
+
+    out, softmax_max, softmax_sum, rng_state = ring_attention_npu._npu_fa_forward(
+        q,
+        q,
+        q,
+        input_layout="TND",
+        softmax_scale=0.5,
+        dropout_p=0.0,
+        causal=False,
+        actual_seq_qlen=cu_seqlens,
+        actual_seq_kvlen=cu_seqlens,
+        softmax_layout="TND",
+    )
+
+    assert fake_torch_npu.forward_kwargs["actual_seq_qlen"] == [2, 6]
+    assert fake_torch_npu.forward_kwargs["actual_seq_kvlen"] == [2, 6]
+    assert fake_torch_npu.forward_kwargs["softmax_layout"] == "TND"
+
+    ring_attention_npu._npu_fa_backward(
+        torch.ones_like(q),
+        q,
+        q,
+        q,
+        out,
+        softmax_max[..., 0],
+        softmax_sum[..., 0],
+        input_layout="TND",
+        softmax_scale=0.5,
+        dropout_p=0.0,
+        causal=False,
+        rng_state=rng_state,
+        actual_seq_qlen=cu_seqlens,
+        actual_seq_kvlen=cu_seqlens,
+        softmax_layout="TND",
+    )
+
+    assert fake_torch_npu.backward_kwargs["actual_seq_qlen"] == [2, 6]
+    assert fake_torch_npu.backward_kwargs["actual_seq_kvlen"] == [2, 6]
+    assert fake_torch_npu.backward_kwargs["softmax_layout"] == "TND"
+    assert fake_torch_npu.backward_kwargs["softmax_max"].shape == (6, 2, 8)
+    assert fake_torch_npu.backward_kwargs["softmax_sum"].shape == (6, 2, 8)
+
+
+def test_npu_fusion_attention_backward_expands_bsnd_stats(monkeypatch):
+    class FakeTorchNPU:
+        def npu_fusion_attention_grad(self, q, k, v, dout, **kwargs):
+            self.backward_kwargs = kwargs
+            return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v), None
+
+    fake_torch_npu = FakeTorchNPU()
+    monkeypatch.setattr(ring_attention_npu, "torch_npu", fake_torch_npu)
+    q = torch.randn(1, 4, 2, 8)
+    softmax_max = torch.zeros(1, 2, 4)
+    softmax_sum = torch.ones(1, 2, 4)
+
+    ring_attention_npu._npu_fa_backward(
+        torch.ones_like(q),
+        q,
+        q,
+        q,
+        q,
+        softmax_max,
+        softmax_sum,
+        input_layout="BSND",
+        softmax_scale=0.5,
+        dropout_p=0.0,
+        causal=False,
+        rng_state=(11, 22, 33),
+    )
+
+    assert fake_torch_npu.backward_kwargs["softmax_max"].shape == (1, 2, 4, 8)
+    assert fake_torch_npu.backward_kwargs["softmax_sum"].shape == (1, 2, 4, 8)
 
 
 def test_npu_softmax_stats_merge_tnd():

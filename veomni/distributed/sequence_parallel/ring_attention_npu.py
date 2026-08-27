@@ -72,6 +72,23 @@ def prepare_npu_cu_seqlens(cu_seqlens: ActualSeqLen) -> Tensor:
     return endpoints.contiguous()
 
 
+def _to_npu_actual_seq_len(actual_seq_len: Optional[ActualSeqLen]) -> Optional[list[int]]:
+    """Convert cumulative lengths to the endpoint list expected by torch_npu."""
+    if actual_seq_len is None:
+        return None
+    if isinstance(actual_seq_len, Tensor):
+        values = actual_seq_len.detach().to(device="cpu", dtype=torch.long)
+    else:
+        values = torch.as_tensor(actual_seq_len, dtype=torch.long, device="cpu")
+    if values.ndim != 1 or values.numel() == 0:
+        raise ValueError("actual_seq_len must be a non-empty 1-D sequence")
+    if values[0].item() == 0:
+        values = values[1:]
+    if values.numel() == 0 or (values <= 0).any() or (values[1:] < values[:-1]).any():
+        raise ValueError("actual_seq_len must contain positive, non-decreasing endpoints")
+    return [int(value) for value in values.tolist()]
+
+
 def _causal_mask(device: torch.device) -> Tensor:
     key = (device.type, device.index)
     mask = _CAUSAL_MASK_CACHE.get(key)
@@ -87,6 +104,8 @@ def _head_num(q: Tensor, input_layout: str) -> int:
         return q.shape[1]
     if input_layout == "BSND":
         return q.shape[2]
+    if input_layout == "BNSD":
+        return q.shape[1]
     raise ValueError(f"Unsupported NPU attention input layout: {input_layout!r}")
 
 
@@ -99,13 +118,15 @@ def _npu_fa_forward(
     softmax_scale: float,
     dropout_p: float,
     causal: bool,
-    actual_seq_qlen: Optional[Tensor] = None,
-    actual_seq_kvlen: Optional[Tensor] = None,
+    actual_seq_qlen: Optional[ActualSeqLen] = None,
+    actual_seq_kvlen: Optional[ActualSeqLen] = None,
     softmax_layout: str = "",
 ) -> Tuple[Tensor, Tensor, Tensor, RNGState]:
     _require_torch_npu()
     attention_mask = _causal_mask(q.device) if causal else None
     sparse_mode = 2 if causal else 0
+    actual_seq_qlen = _to_npu_actual_seq_len(actual_seq_qlen)
+    actual_seq_kvlen = _to_npu_actual_seq_len(actual_seq_kvlen)
     block_out, block_max, block_sum, _, seed, offset, numels = torch_npu.npu_fusion_attention(
         q,
         k,
@@ -137,13 +158,18 @@ def _npu_fa_backward(
     dropout_p: float,
     causal: bool,
     rng_state: RNGState,
-    actual_seq_qlen: Optional[Tensor] = None,
-    actual_seq_kvlen: Optional[Tensor] = None,
+    actual_seq_qlen: Optional[ActualSeqLen] = None,
+    actual_seq_kvlen: Optional[ActualSeqLen] = None,
     softmax_layout: str = "",
 ) -> Tuple[Tensor, Tensor, Tensor]:
     _require_torch_npu()
     attention_mask = _causal_mask(q.device) if causal else None
+    actual_seq_qlen = _to_npu_actual_seq_len(actual_seq_qlen)
+    actual_seq_kvlen = _to_npu_actual_seq_len(actual_seq_kvlen)
     seed, offset, numels = rng_state
+    if softmax_max.ndim == q.ndim - 1:
+        softmax_max = softmax_max.unsqueeze(-1).expand(*softmax_max.shape, 8).contiguous()
+        softmax_sum = softmax_sum.unsqueeze(-1).expand(*softmax_sum.shape, 8).contiguous()
     dq, dk, dv, *_ = torch_npu.npu_fusion_attention_grad(
         q,
         k,
@@ -715,6 +741,6 @@ def zigzag_ring_npu_flash_attn_varlen_func(
 ) -> Tensor:
     """Balanced causal Ring Attention for packed NPU ``(T, N, D)`` tensors."""
     _require_torch_npu()
-    del max_seqlen  # NPU fusion attention uses endpoint-style actual sequence lengths.
+    del max_seqlen  # Compatibility with the shared CUDA/NPU varlen wrapper API.
     group = get_context_parallel_group() if group is None else group
     return _ZigzagRingNPUFlashAttentionVarlen.apply(group, q, k, v, cu_seqlens, dropout_p, softmax_scale, causal)

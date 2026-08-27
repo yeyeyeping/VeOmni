@@ -325,7 +325,8 @@ def flash_attention_forward(
     if cp_state.cp_enabled:
         from ....distributed.sequence_parallel.data import local_cu_seqlens
 
-        if get_device_type() == "npu":
+        use_npu_ring = get_device_type() == "npu"
+        if use_npu_ring:
             from ....distributed.sequence_parallel.ring_attention_npu import (
                 zigzag_ring_npu_flash_attn_func as zigzag_ring_attn_func,
             )
@@ -365,20 +366,32 @@ def flash_attention_forward(
             # document is split evenly across ``cp`` so each local document length
             # is ``doc_len // cp_size``. ``varlen`` FA wants ``(total, h, d)``.
             local_cu = local_cu_seqlens(cu_seq_lens_q.to(torch.int32), cp_state.cp_size)
-            seqlens = local_cu[1:] - local_cu[:-1]
-            local_max = int(seqlens.max().item()) if seqlens.numel() else 0
             q3, k3, v3 = query.squeeze(0), key.squeeze(0), value.squeeze(0)
-            attn_output = zigzag_ring_attn_varlen_func(
-                q3,
-                k3,
-                v3,
-                local_cu,
-                local_max,
-                softmax_scale=scaling,
-                causal=True,
-                group=cp_state.cp_group,
-                **ring_backend_kwargs,
-            )
+            if use_npu_ring:
+                attn_output = zigzag_ring_attn_varlen_func(
+                    q3,
+                    k3,
+                    v3,
+                    local_cu,
+                    softmax_scale=scaling,
+                    causal=True,
+                    group=cp_state.cp_group,
+                    **ring_backend_kwargs,
+                )
+            else:
+                seqlens = local_cu[1:] - local_cu[:-1]
+                local_max = int(seqlens.max().item()) if seqlens.numel() else 0
+                attn_output = zigzag_ring_attn_varlen_func(
+                    q3,
+                    k3,
+                    v3,
+                    local_cu,
+                    local_max,
+                    softmax_scale=scaling,
+                    causal=True,
+                    group=cp_state.cp_group,
+                    **ring_backend_kwargs,
+                )
             attn_output = attn_output.unsqueeze(0)
         else:
             attn_output = zigzag_ring_attn_func(
