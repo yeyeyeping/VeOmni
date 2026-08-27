@@ -15,6 +15,7 @@ veomni/
 │   ├── parallel_state.py   init_parallel_state(), ParallelState, device mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
+│   ├── context_parallel_data.py  Model-owned vision input partition helpers for CP
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
@@ -144,6 +145,7 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
+6. Qwen3-VL dense vision CP uses a model-provided collate hook: ordered frames are assigned to contiguous CP ranges, each range is patch-sliced over its Ulysses group, and ViT outputs are gathered over Ulysses then CP before local decoder injection.
 
 ## Config Structure
 

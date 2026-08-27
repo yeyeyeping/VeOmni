@@ -37,6 +37,8 @@
 #      Use VeOmni precomputed position-id function and unified multimodal token ids
 #    - method_override: Qwen3VLForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
+#    - method_override: Qwen3VLForConditionalGeneration.get_context_parallel_collate_func
+#      Expose Qwen3-VL frame-parallel ViT collation for hybrid CP and Ulysses
 #    - method_override: Qwen3VLForConditionalGeneration.forward
 #      Use VeOmni unified fused loss_function path
 #    - function_replacement: apply_rotary_pos_emb
@@ -81,6 +83,7 @@ from transformers.utils.generic import (
 )
 from transformers.utils.output_capturing import capture_outputs
 
+from veomni.distributed.context_parallel_data import build_qwen3_vl_context_parallel_collate_func
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_outputs,
@@ -316,6 +319,32 @@ def collate_multimodal_metadata(batch, sp_pad):
 
 
 # ================================================================
+# Patch: gather_context_parallel_vision_output (new helper)
+# 1. gather ViT outputs over Ulysses and CP, then trim per-CP padding
+#    so decoder embedding ordinals retain the original frame order
+# ================================================================
+def gather_context_parallel_vision_output(output, vit_metadata):
+    """Restore Ulysses-local ViT outputs, concatenate CP frame ranges, and remove padding."""
+    # --- Patch.1 ---
+    parallel_state = get_parallel_state()
+    if parallel_state.ulysses_enabled:
+        output = gather_outputs(output, gather_dim=0, group=parallel_state.ulysses_group)
+    if parallel_state.cp_enabled:
+        output = gather_outputs(output, gather_dim=0, group=parallel_state.cp_group)
+
+    padded_lengths = vit_metadata["cp_padded_merged_lengths"]
+    real_lengths = vit_metadata["cp_real_merged_lengths"]
+    pieces = output.split(padded_lengths, dim=0)
+    real_pieces = [piece[:real_length] for piece, real_length in zip(pieces, real_lengths) if real_length]
+    if real_pieces:
+        restored = torch.cat(real_pieces, dim=0)
+    else:
+        restored = output[:0]
+    # --- Patch.1 ---
+    return restored
+
+
+# ================================================================
 # Helper: _Qwen3VLFakeForPosID  (emitted into the generated file via
 # add_helper). Picklable fake `self` used by `get_position_id_func`.
 # ================================================================
@@ -500,6 +529,8 @@ class Qwen3VLVisionAttention(nn.Module):
     # 1. accept precomputed max_seqlen from outer forward so the
     #    `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync happens once
     #    (hoisted to the outer visual forward) instead of once per layer
+    # 2. forward the ViT CP-bypass flag to the shared attention adapter so
+    #    frame-local vision attention retains Ulysses without entering CP ring
     # ================================================================
     def forward(
         self,
@@ -526,6 +557,9 @@ class Qwen3VLVisionAttention(nn.Module):
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
+        # --- Patch.2 ---
+        skip_context_parallel = kwargs.pop("skip_context_parallel", False)
+        # --- Patch.2 ---
 
         if is_flash_attention_requested(self.config):
             # --- Patch.1 ---
@@ -544,6 +578,9 @@ class Qwen3VLVisionAttention(nn.Module):
                 max_length_q=max_seqlen,
                 max_length_k=max_seqlen,
                 is_causal=False,
+                # --- Patch.2 ---
+                skip_context_parallel=skip_context_parallel,
+                # --- Patch.2 ---
                 **kwargs,
             )
         else:
@@ -1154,6 +1191,8 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
     # 5. on NPU, move cu_seqlens to CPU — NPU FA2 varlen path requires it
     # 6. return BaseModelOutputWithDeepstackFeatures (v5 contract: the v4
     #    path returned `(merged, deepstack_list)` as a bare tuple)
+    # 7. under CP, use only the local Ulysses subgroup for ViT sequence
+    #    exchange and explicitly bypass decoder CP ring attention
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -1172,6 +1211,22 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
         precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
         precomputed_max_seqlen = vit_metadata.get("max_seqlen")
+        # --- Patch.7 ---
+        vision_context_parallel = vit_metadata.get("context_parallel", False)
+        parallel_state = get_parallel_state()
+        if parallel_state.cp_enabled and not vision_context_parallel:
+            raise RuntimeError(
+                "Qwen3-VL context parallelism requires metadata from get_context_parallel_collate_func()."
+            )
+        if vision_context_parallel:
+            vision_sp_enabled = parallel_state.ulysses_enabled
+            vision_sp_size = parallel_state.ulysses_size
+            vision_sp_group = parallel_state.ulysses_group
+        else:
+            vision_sp_enabled = parallel_state.sp_enabled
+            vision_sp_size = parallel_state.sp_size
+            vision_sp_group = parallel_state.sp_group
+        # --- Patch.7 ---
 
         hidden_states = self.patch_embed(hidden_states)
 
@@ -1184,8 +1239,10 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
 
         # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
-            pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
+        if vision_sp_enabled:
+            pos_embeds = sp_pad_and_slice(
+                pos_embeds, dim=0, pad_value=0, pad_scale=self.spatial_merge_unit, group=vision_sp_group
+            )
         # --- Patch.1 ---
 
         hidden_states = hidden_states + pos_embeds
@@ -1230,16 +1287,16 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         position_embeddings = (emb.cos(), emb.sin())
 
         sp_pad_seq_len = 0
-        if get_parallel_state().sp_enabled:
+        if vision_sp_enabled:
             # --- Patch.1 ---
             cos, sin = position_embeddings
-            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
-            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
+            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=self.spatial_merge_unit, group=vision_sp_group)
+            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=self.spatial_merge_unit, group=vision_sp_group)
             position_embeddings = (cos, sin)
             # --- Patch.1 ---
 
             # --- Patch.3 ---
-            sp_size = get_parallel_state().sp_size
+            sp_size = vision_sp_size
             # total_seq_len is already a host int — no `.item()` sync needed here.
             sp_pad_seq_len = seq_len * sp_size - total_seq_len
             # If cu_seqlens came in precomputed it ALREADY has the sp-pad tail
@@ -1276,6 +1333,9 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
                 max_seqlen=max_seqlen,
                 # --- Patch.4 ---
                 position_embeddings=position_embeddings,
+                # --- Patch.7 ---
+                skip_context_parallel=vision_context_parallel,
+                # --- Patch.7 ---
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
@@ -1307,7 +1367,10 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
     #    from the FULL grid_thw and forward.sp_pad_and_slice's down to per-rank)
     #    at the same dim-0 size for the `hidden_states + pos_embeds` add. Shapes
     #    are derived from the vision config (patch_size / temporal_patch_size /
-    #    in_channels / spatial_merge_size) so model variants don't break.
+    #    in_channels / spatial_merge_size) so model variants don't break. Under
+    #    CP this deliberately uses the local Ulysses subgroup, not unified SP.
+    # 3. pre-slice dummy pixels over the same selected group used by ViT forward
+    # 4. precompute dummy ViT metadata and mark CP so attention bypasses CP ring
     # ================================================================
     def dummy_forward(self):
         # --- Patch.1 ---
@@ -1327,15 +1390,24 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         w = 2 * merge_size
 
         # --- Patch.2 ---
-        if get_parallel_state().sp_enabled:
-            h = h_base * get_parallel_state().sp_size
+        parallel_state = get_parallel_state()
+        if parallel_state.cp_enabled:
+            vision_sp_size = parallel_state.ulysses_size
+            vision_sp_group = parallel_state.ulysses_group
+        else:
+            vision_sp_size = parallel_state.sp_size
+            vision_sp_group = parallel_state.sp_group
+
+        if vision_sp_size > 1:
+            h = h_base * vision_sp_size
         else:
             h = h_base
         # --- Patch.2 ---
 
         num_patches = t * h * w
         pixel_row_size = in_channels * temporal_patch_size * patch_size * patch_size
-        pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=self.dtype, device=self.device)
+        dtype = self.patch_embed.proj.weight.dtype
+        pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=dtype, device=self.device)
         grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
 
         # --- Patch.3 ---
@@ -1345,8 +1417,14 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         # data path produces. Otherwise hidden_states keeps the full size while
         # pos_embeds gets sp_pad_and_slice'd inside forward, and
         # `hidden_states + pos_embeds` mismatches at dim 0 by sp_size.
-        if get_parallel_state().sp_enabled:
-            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
+        if vision_sp_size > 1:
+            pixel_values = sp_pad_and_slice(
+                pixel_values,
+                dim=0,
+                pad_value=0,
+                pad_scale=self.spatial_merge_unit,
+                group=vision_sp_group,
+            )
         # --- Patch.3 ---
 
         # --- Patch.4 ---
@@ -1363,6 +1441,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             "grid_thw_list": [[t, h, w]],
             "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
             "max_seqlen": h * w,
+            "context_parallel": parallel_state.cp_enabled,
         }
         # --- Patch.4 ---
 
@@ -1825,6 +1904,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
     #    graph via fake_embeds * 0, and threads a fake deepstack tensor
     #    down into `_deepstack_process` so those params participate too
     # 5. honor precomputed 3D position_ids: (bs, 3, L) -> (3, bs, L)
+    # 6. consume collator-precomputed ViT metadata, preserving the runtime
+    #    fallback for callers that bypass MainCollator
+    # 7. under CP, gather frame-sharded ViT outputs and inject only the visual
+    #    embedding ordinals referenced by this decoder shard
     # ================================================================
     @auto_docstring
     @can_return_tuple
@@ -1859,10 +1942,14 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # --- Patch.2 ---
         image_mask = kwargs.pop("image_mask", None)
         video_mask = kwargs.pop("video_mask", None)
+        # --- Patch.7 ---
+        image_embed_indices = kwargs.pop("image_embed_indices", None)
+        video_embed_indices = kwargs.pop("video_embed_indices", None)
+        # --- Patch.7 ---
         # v5 multimodal RoPE input; consumed here so it is not forwarded to the
         # language model. Derived from input_ids below when not supplied.
         mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
-        if video_mask is None and image_mask is None:
+        if video_mask is None and image_mask is None and not get_parallel_state().cp_enabled:
             if get_parallel_state().sp_enabled:
                 input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
                 dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
@@ -1884,6 +1971,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
                 "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
                 "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+                "context_parallel": multimodal_metadata.get("vit_image_context_parallel", False),
+                "cp_real_merged_lengths": multimodal_metadata.get("vit_image_cp_real_merged_lengths"),
+                "cp_padded_merged_lengths": multimodal_metadata.get("vit_image_cp_padded_merged_lengths"),
             }
         }
         video_vit_kwargs = {
@@ -1891,6 +1981,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
                 "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
                 "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+                "context_parallel": multimodal_metadata.get("vit_video_context_parallel", False),
+                "cp_real_merged_lengths": multimodal_metadata.get("vit_video_cp_real_merged_lengths"),
+                "cp_padded_merged_lengths": multimodal_metadata.get("vit_video_cp_padded_merged_lengths"),
             }
         }
         # --- Patch.6 ---
@@ -1903,8 +1996,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # --- Patch.3 ---
 
         # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
+        # --- Patch.7 ---
+        if get_parallel_state().sp_enabled and not get_parallel_state().cp_enabled:
             inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
+        # --- Patch.7 ---
         # --- Patch.1 ---
 
         fake_deepstack = None
@@ -1915,14 +2010,27 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             )
             image_embeds = image_outputs.pooler_output
             deepstack_image_embeds = image_outputs.deepstack_features
+            # --- Patch.7 ---
+            image_context_parallel = image_vit_kwargs["vit_metadata"]["context_parallel"]
 
             # --- Patch.1 ---
-            if get_parallel_state().sp_enabled:
+            if image_context_parallel:
+                if image_mask is None or image_embed_indices is None:
+                    raise RuntimeError("Qwen3-VL context parallelism requires image_mask and image_embed_indices.")
+                image_embeds = gather_context_parallel_vision_output(  # noqa: F821 defined via add_helper
+                    image_embeds, image_vit_kwargs["vit_metadata"]
+                )
+                deepstack_image_embeds = [
+                    gather_context_parallel_vision_output(embed, image_vit_kwargs["vit_metadata"])
+                    for embed in deepstack_image_embeds
+                ]
+            elif get_parallel_state().sp_enabled:
                 image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_image_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_image_embeds
                 ]
+            # --- Patch.7 ---
             # --- Patch.1 ---
 
             embeds_image_mask = (
@@ -1936,10 +2044,20 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # argument for the per-layer deepstack embeds (they follow the same row order, sliced into
             # the same `image_mask`).
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
+            # --- Patch.7 ---
+            if image_context_parallel:
+                local_image_indices = image_embed_indices[image_mask].to(device=image_embeds.device, dtype=torch.long)
+                local_image_embeds = image_embeds.index_select(0, local_image_indices)
+                inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, local_image_embeds)
+                deepstack_image_embeds = [
+                    embed.index_select(0, local_image_indices) for embed in deepstack_image_embeds
+                ]
+            else:
+                inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
+            # --- Patch.7 ---
 
             # --- Patch.1 ---
-            if get_parallel_state().sp_enabled:
+            if get_parallel_state().sp_enabled and not image_context_parallel:
                 seq_len = image_mask.shape[1]
                 seq_per_rank = seq_len // get_parallel_state().sp_size
                 rank_start = get_parallel_state().sp_rank * seq_per_rank
@@ -1969,14 +2087,27 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             )
             video_embeds = video_outputs.pooler_output
             deepstack_video_embeds = video_outputs.deepstack_features
+            # --- Patch.7 ---
+            video_context_parallel = video_vit_kwargs["vit_metadata"]["context_parallel"]
 
             # --- Patch.1 ---
-            if get_parallel_state().sp_enabled:
+            if video_context_parallel:
+                if video_mask is None or video_embed_indices is None:
+                    raise RuntimeError("Qwen3-VL context parallelism requires video_mask and video_embed_indices.")
+                video_embeds = gather_context_parallel_vision_output(  # noqa: F821 defined via add_helper
+                    video_embeds, video_vit_kwargs["vit_metadata"]
+                )
+                deepstack_video_embeds = [
+                    gather_context_parallel_vision_output(embed, video_vit_kwargs["vit_metadata"])
+                    for embed in deepstack_video_embeds
+                ]
+            elif get_parallel_state().sp_enabled:
                 video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_video_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_video_embeds
                 ]
+            # --- Patch.7 ---
             # --- Patch.1 ---
 
             embeds_video_mask = (
@@ -1986,10 +2117,20 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # rows, any collator-padded vision rows are trailing and unused — no `video_embeds[:n]`
             # slice (and no `video_mask.sum().item()` host-device sync) needed.
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
+            # --- Patch.7 ---
+            if video_context_parallel:
+                local_video_indices = video_embed_indices[video_mask].to(device=video_embeds.device, dtype=torch.long)
+                local_video_embeds = video_embeds.index_select(0, local_video_indices)
+                inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, local_video_embeds)
+                deepstack_video_embeds = [
+                    embed.index_select(0, local_video_indices) for embed in deepstack_video_embeds
+                ]
+            else:
+                inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
+            # --- Patch.7 ---
 
             # --- Patch.1 ---
-            if get_parallel_state().sp_enabled:
+            if get_parallel_state().sp_enabled and not video_context_parallel:
                 seq_len = video_mask.shape[1]
                 seq_per_rank = seq_len // get_parallel_state().sp_size
                 rank_start = get_parallel_state().sp_rank * seq_per_rank
@@ -2014,8 +2155,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # --- Patch.4 ---
 
         # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
+        # --- Patch.7 ---
+        if get_parallel_state().sp_enabled and not get_parallel_state().cp_enabled:
             inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
+        # --- Patch.7 ---
         # --- Patch.1 ---
 
         visual_pos_masks = None
@@ -2149,7 +2292,7 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, forward
+# Methods patched: get_position_id_func, get_metadata_collate_func, get_context_parallel_collate_func, forward
 # ======================================================================
 
 
@@ -2547,6 +2690,17 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         # add_helper) — a bare function reference is already picklable for the
         # DataLoader workers; the Qwen3-VL-family formula needs no model config.
         return collate_multimodal_metadata  # noqa: F821 defined via add_helper
+
+    # ================================================================
+    # Patch: Qwen3VLForConditionalGeneration.get_context_parallel_collate_func (new)
+    # 1. expose the dense Qwen3-VL frame-parallel collate hook so complete
+    #    contiguous frame ranges are assigned to CP before Ulysses patch slicing
+    # ================================================================
+    def get_context_parallel_collate_func(self):
+        # --- Patch.1 ---
+        collate_func = build_qwen3_vl_context_parallel_collate_func(self.config.vision_config.spatial_merge_size)
+        # --- Patch.1 ---
+        return collate_func
 
 
 __all__ = [

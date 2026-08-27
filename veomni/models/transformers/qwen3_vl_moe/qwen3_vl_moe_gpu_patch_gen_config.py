@@ -89,8 +89,14 @@ config = PatchConfig(
 # below via `@config.add_helper`, mirroring qwen3_vl's helper but binding
 # to `Qwen3VLMoeModel`.
 config.additional_imports.extend(qwen3_vl_config.additional_imports)
-config.post_import_blocks.extend(qwen3_vl_config.post_import_blocks)
-config.helpers.extend(h for h in qwen3_vl_config.helpers if h.__name__ != "_Qwen3VLFakeForPosID")
+config.post_import_blocks.extend(
+    block for block in qwen3_vl_config.post_import_blocks if "context_parallel_data" not in block
+)
+config.helpers.extend(
+    helper
+    for helper in qwen3_vl_config.helpers
+    if helper.__name__ not in {"_Qwen3VLFakeForPosID", "gather_context_parallel_vision_output"}
+)
 
 # Surface ``Qwen3VLMoeCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs / entropy as constructor fields

@@ -245,3 +245,35 @@ def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch)
     assert calls[0][4:] == (group, 2)
     torch.testing.assert_close(calls[2][-1]["s_aux"], auxiliary)
     assert output.shape == (1, 5, 4, 8)
+
+
+def test_flash_attention_can_skip_context_parallel(monkeypatch):
+    calls = []
+    state = SimpleNamespace(ulysses_enabled=False, cp_enabled=True)
+
+    def fake_flash(query, key, value, attention_mask, **kwargs):
+        calls.append(("flash", kwargs))
+        return query
+
+    def fail_ring_attention(*args, **kwargs):
+        raise AssertionError("ring attention must be skipped")
+
+    monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
+    monkeypatch.setattr(flash_backend, "ring_attention", fail_ring_attention)
+
+    query = torch.randn(1, 4, 5, 8, dtype=torch.float16)
+    key = torch.randn(1, 2, 5, 8, dtype=torch.float16)
+    value = torch.randn(1, 2, 5, 8, dtype=torch.float16)
+    output, _ = flash_backend.flash_attention_forward(
+        _FakeAttentionModule("veomni_flash_attention_2_with_sp"),
+        query,
+        key,
+        value,
+        attention_mask=None,
+        skip_context_parallel=True,
+    )
+
+    assert [call[0] for call in calls] == ["flash"]
+    assert "skip_context_parallel" not in calls[0][1]
+    assert output.shape == (1, 5, 4, 8)

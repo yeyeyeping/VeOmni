@@ -552,6 +552,38 @@ def test_qwen3vl_parallel_align(
     )
 
 
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Qwen3-VL context-parallel vision training targets Ascend NPU")
+def test_qwen3vl_context_parallel_align(dummy_qwen3vl_dataset):
+    baseline_results = main(
+        task_name="train_vlm_test",
+        model_name="qwen3vl",
+        config_path="./tests/toy_config/qwen3vl_toy",
+        is_moe=False,
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        max_sp_size=1,
+        train_path=dummy_qwen3vl_dataset,
+        compare_alignment=False,
+    )
+    cp_results = main(
+        task_name="train_vlm_test",
+        model_name="qwen3vl",
+        config_path="./tests/toy_config/qwen3vl_toy",
+        is_moe=False,
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        max_sp_size=2,
+        train_path=dummy_qwen3vl_dataset,
+        extra_args=["--train.accelerator.cp_size=2"],
+    )
+
+    comparison_results = {
+        **{f"baseline_{name}": values for name, values in baseline_results.items()},
+        **{f"cp_{name}": values for name, values in cp_results.items()},
+    }
+    compare_metrics(comparison_results, rtol=_DEFAULT_RTOL, atol=_DEFAULT_ATOL)
+
+
 def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
     lora_config_path = tmp_path / "qwen3vl_lora_smoke.yaml"
     lora_config_path.write_text(

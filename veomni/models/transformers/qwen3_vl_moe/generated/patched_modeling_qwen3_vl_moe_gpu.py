@@ -821,6 +821,8 @@ class Qwen3VLMoeVisionAttention(nn.Module):
     # 1. accept precomputed max_seqlen from outer forward so the
     #    `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync happens once
     #    (hoisted to the outer visual forward) instead of once per layer
+    # 2. forward the ViT CP-bypass flag to the shared attention adapter so
+    #    frame-local vision attention retains Ulysses without entering CP ring
     # ================================================================
     def forward(
         self,
@@ -847,6 +849,9 @@ class Qwen3VLMoeVisionAttention(nn.Module):
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
+        # --- Patch.2 ---
+        skip_context_parallel = kwargs.pop("skip_context_parallel", False)
+        # --- Patch.2 ---
 
         if is_flash_attention_requested(self.config):
             # --- Patch.1 ---
@@ -865,6 +870,9 @@ class Qwen3VLMoeVisionAttention(nn.Module):
                 max_length_q=max_seqlen,
                 max_length_k=max_seqlen,
                 is_causal=False,
+                # --- Patch.2 ---
+                skip_context_parallel=skip_context_parallel,
+                # --- Patch.2 ---
                 **kwargs,
             )
         else:
@@ -1182,6 +1190,8 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
     # 5. on NPU, move cu_seqlens to CPU — NPU FA2 varlen path requires it
     # 6. return BaseModelOutputWithDeepstackFeatures (v5 contract: the v4
     #    path returned `(merged, deepstack_list)` as a bare tuple)
+    # 7. under CP, use only the local Ulysses subgroup for ViT sequence
+    #    exchange and explicitly bypass decoder CP ring attention
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -1200,6 +1210,22 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
         precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
         precomputed_max_seqlen = vit_metadata.get("max_seqlen")
+        # --- Patch.7 ---
+        vision_context_parallel = vit_metadata.get("context_parallel", False)
+        parallel_state = get_parallel_state()
+        if parallel_state.cp_enabled and not vision_context_parallel:
+            raise RuntimeError(
+                "Qwen3-VL context parallelism requires metadata from get_context_parallel_collate_func()."
+            )
+        if vision_context_parallel:
+            vision_sp_enabled = parallel_state.ulysses_enabled
+            vision_sp_size = parallel_state.ulysses_size
+            vision_sp_group = parallel_state.ulysses_group
+        else:
+            vision_sp_enabled = parallel_state.sp_enabled
+            vision_sp_size = parallel_state.sp_size
+            vision_sp_group = parallel_state.sp_group
+        # --- Patch.7 ---
 
         hidden_states = self.patch_embed(hidden_states)
 
@@ -1212,8 +1238,10 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
 
         # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
-            pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
+        if vision_sp_enabled:
+            pos_embeds = sp_pad_and_slice(
+                pos_embeds, dim=0, pad_value=0, pad_scale=self.spatial_merge_unit, group=vision_sp_group
+            )
         # --- Patch.1 ---
 
         hidden_states = hidden_states + pos_embeds
@@ -1258,16 +1286,16 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         position_embeddings = (emb.cos(), emb.sin())
 
         sp_pad_seq_len = 0
-        if get_parallel_state().sp_enabled:
+        if vision_sp_enabled:
             # --- Patch.1 ---
             cos, sin = position_embeddings
-            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
-            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
+            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=self.spatial_merge_unit, group=vision_sp_group)
+            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=self.spatial_merge_unit, group=vision_sp_group)
             position_embeddings = (cos, sin)
             # --- Patch.1 ---
 
             # --- Patch.3 ---
-            sp_size = get_parallel_state().sp_size
+            sp_size = vision_sp_size
             # total_seq_len is already a host int — no `.item()` sync needed here.
             sp_pad_seq_len = seq_len * sp_size - total_seq_len
             # If cu_seqlens came in precomputed it ALREADY has the sp-pad tail
@@ -1304,6 +1332,9 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
                 max_seqlen=max_seqlen,
                 # --- Patch.4 ---
                 position_embeddings=position_embeddings,
+                # --- Patch.7 ---
+                skip_context_parallel=vision_context_parallel,
+                # --- Patch.7 ---
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
@@ -1335,7 +1366,10 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
     #    from the FULL grid_thw and forward.sp_pad_and_slice's down to per-rank)
     #    at the same dim-0 size for the `hidden_states + pos_embeds` add. Shapes
     #    are derived from the vision config (patch_size / temporal_patch_size /
-    #    in_channels / spatial_merge_size) so model variants don't break.
+    #    in_channels / spatial_merge_size) so model variants don't break. Under
+    #    CP this deliberately uses the local Ulysses subgroup, not unified SP.
+    # 3. pre-slice dummy pixels over the same selected group used by ViT forward
+    # 4. precompute dummy ViT metadata and mark CP so attention bypasses CP ring
     # ================================================================
     def dummy_forward(self):
         # --- Patch.1 ---
@@ -1355,15 +1389,24 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         w = 2 * merge_size
 
         # --- Patch.2 ---
-        if get_parallel_state().sp_enabled:
-            h = h_base * get_parallel_state().sp_size
+        parallel_state = get_parallel_state()
+        if parallel_state.cp_enabled:
+            vision_sp_size = parallel_state.ulysses_size
+            vision_sp_group = parallel_state.ulysses_group
+        else:
+            vision_sp_size = parallel_state.sp_size
+            vision_sp_group = parallel_state.sp_group
+
+        if vision_sp_size > 1:
+            h = h_base * vision_sp_size
         else:
             h = h_base
         # --- Patch.2 ---
 
         num_patches = t * h * w
         pixel_row_size = in_channels * temporal_patch_size * patch_size * patch_size
-        pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=self.dtype, device=self.device)
+        dtype = self.patch_embed.proj.weight.dtype
+        pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=dtype, device=self.device)
         grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
 
         # --- Patch.3 ---
@@ -1373,8 +1416,14 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         # data path produces. Otherwise hidden_states keeps the full size while
         # pos_embeds gets sp_pad_and_slice'd inside forward, and
         # `hidden_states + pos_embeds` mismatches at dim 0 by sp_size.
-        if get_parallel_state().sp_enabled:
-            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
+        if vision_sp_size > 1:
+            pixel_values = sp_pad_and_slice(
+                pixel_values,
+                dim=0,
+                pad_value=0,
+                pad_scale=self.spatial_merge_unit,
+                group=vision_sp_group,
+            )
         # --- Patch.3 ---
 
         # --- Patch.4 ---
@@ -1391,6 +1440,7 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
             "grid_thw_list": [[t, h, w]],
             "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
             "max_seqlen": h * w,
+            "context_parallel": parallel_state.cp_enabled,
         }
         # --- Patch.4 ---
 

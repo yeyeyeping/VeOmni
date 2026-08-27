@@ -47,7 +47,7 @@ processor's `image_grid_thw` / `video_grid_thw` CPU `LongTensor`.
 The grid tensor stays in the batch (Model.forward still needs it as the HF
 `get_image_features` arg); the hook only reads it.
 
-## Two model hooks
+## Three model hooks
 
 Patched onto each wired `…ForConditionalGeneration` via patchgen `override_method`:
 
@@ -77,8 +77,26 @@ Optional. Returns model-specific `DataCollateInfo` entries (as tuples
 its collate-info table. Omni models use it to declare the audio feature tensors
 (`input_features`, `audio_feature_lengths`, `audio_mask`).
 
-Both hooks are resolved by `vlm_trainer._build_collate_fn` via `getattr`: a model
+All hooks are resolved by `vlm_trainer._build_collate_fn` via `getattr`: a model
 that doesn't expose them simply gets the runtime fallback (see below).
+
+### `get_context_parallel_collate_func() -> Callable | None`
+
+Optional model-owned hook with signature:
+
+```python
+context_parallel_collate_func(batch: dict, context: ContextParallelCollateContext) -> None
+```
+
+`ContextParallelCollator` invokes it after decoder zigzag slicing and local
+Ulysses slicing. Qwen3-VL dense uses the hook to assign complete image/video
+frames to contiguous CP rank ranges, approximately balancing cumulative `h*w`.
+Patches in each CP range are then evenly sliced over that range's Ulysses group.
+This keeps every vision attention segment inside one frame while allowing the
+text tower to retain its normal CP ring-attention layout.
+
+The initial implementation is intentionally limited to dense Qwen3-VL. Models
+without this hook do not opt into the frame-parallel ViT contract.
 
 ## The `multimodal_metadata` dict contract
 
@@ -92,6 +110,19 @@ that doesn't expose them simply gets the runtime fallback (see below).
 | `vit_image_cu_seqlens` | `torch.IntTensor` (CPU, then auto-moved) | varlen-attention cu_seqlens; already includes the SP-pad tail as one extra "image" entry. |
 | `vit_image_max_seqlen` | `int` (Python) | already includes SP-pad. |
 | `vit_video_cu_seqlens` / `vit_video_max_seqlen` | same | for video. |
+
+Qwen3-VL dense context-parallel collation adds these keys per modality:
+
+| Key | Type | Notes |
+|---|---|---|
+| `vit_{modality}_context_parallel` | `bool` | Selects Ulysses-only ViT attention inside each CP frame range. |
+| `vit_{modality}_cp_real_merged_lengths` | `list[int]` | Real merged-token count for every CP rank, in CP rank order. |
+| `vit_{modality}_cp_padded_merged_lengths` | `list[int]` | Ulysses-aligned merged-token count for every CP rank. |
+
+After the ViT merger, outputs are gathered first over the local Ulysses group
+and then over the CP group. Each CP piece is trimmed from padded to real length,
+restoring the original frame order. Rank-local decoder placeholders select rows
+from that restored tensor through `image_embed_indices` / `video_embed_indices`.
 
 Window-attention ViTs (qwen2.5-VL / qwen2.5-omni) add three more keys per
 modality — the host-side port of `get_window_index`:
@@ -168,6 +199,14 @@ SequenceParallelCollator (CPU, generic)
        records per-modality sp_pad patch counts
     2. add_flash_attention_kwargs_from_position_ids (existing)
     3. invoke metadata_collate_func(batch, sp_pad={pixel_values: N, ...})
+
+       ↓ CP enabled instead ↓
+
+ContextParallelCollator (CPU, generic + model hook)
+    1. zigzag-slice decoder tokens over CP, then contiguous-slice over Ulysses
+    2. create global visual embedding ordinals aligned with local placeholders
+    3. invoke context_parallel_collate_func(batch, context)
+       └─ frame partition over CP → patch partition over Ulysses
 
        ↓ Trainer.preforward (.to_device, recurses into dicts) ↓
 

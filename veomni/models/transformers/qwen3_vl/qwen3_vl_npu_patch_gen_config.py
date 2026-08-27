@@ -25,6 +25,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     apply_rotary_pos_emb_patched,
     apply_rotary_pos_emb_vision_patched,
     qwen3_vl_for_conditional_generation_forward_patched,
+    qwen3_vl_get_context_parallel_collate_func_patched,
     qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_forward_patched,
@@ -135,6 +136,11 @@ config.override_method(
     "Qwen3VLForConditionalGeneration.get_metadata_collate_func",
     replacement=qwen3_vl_get_metadata_collate_func_patched,
     description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+config.override_method(
+    "Qwen3VLForConditionalGeneration.get_context_parallel_collate_func",
+    replacement=qwen3_vl_get_context_parallel_collate_func_patched,
+    description="Expose Qwen3-VL frame-parallel ViT collation for hybrid CP and Ulysses",
 )
 config.override_method(
     "Qwen3VLForConditionalGeneration.forward",

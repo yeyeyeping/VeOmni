@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data._utils.collate import default_collate
 from transformers.modeling_outputs import ModelOutput
 
+from ..distributed.context_parallel_data import ContextParallelCollateContext
 from ..distributed.parallel_state import get_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..utils import logging
@@ -40,6 +41,7 @@ from ..utils.seqlen_pos_transform_utils import (
 # Signature: ``fn(batch: dict, sp_pad: dict[str, int]) -> None`` — mutates
 # ``batch`` in place, writing ``batch["multimodal_metadata"]``.
 MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
+ContextParallelCollateFunc = Callable[[Dict[str, Any], ContextParallelCollateContext], None]
 
 
 logger = logging.get_logger(__name__)
@@ -139,6 +141,7 @@ DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
+    "mm_token_type_ids": DataCollateInfo(-1, True, 0, 1),
     "position_ids": DataCollateInfo(-1, False, 0, 1),
     "pixel_values": DataCollateInfo(0, True, 0, 4),
     "pixel_values_videos": DataCollateInfo(0, True, 0, 4),
@@ -315,7 +318,7 @@ class PackingCollator(DataCollator):
 
 @dataclass
 class ContextParallelCollator(DataCollator):
-    """Pad, zigzag-shard, and pack decoder-only samples for context parallelism.
+    """Pad, zigzag-shard, and pack causal-LM samples for context parallelism.
 
     Unlike Ulysses sequence parallelism, zigzag Ring Attention consumes Q/K/V in
     their sharded sequence layout. The layout must therefore be created before
@@ -323,38 +326,53 @@ class ContextParallelCollator(DataCollator):
     is padded to a multiple of ``2 * cp_size``, split into that many equal
     chunks, and CP rank ``r`` keeps chunks ``r`` and ``2 * cp_size - r - 1``.
 
-    This first implementation intentionally supports decoder-only causal-LM
-    samples with one one-dimensional sequence per feature. Multimodal metadata,
-    sequence-classification labels, pre-packed features with multiple position
-    resets, and hybrid Ulysses x CP layouts require separate layout contracts
-    and are rejected rather than silently producing incorrect attention.
+    Multimodal models may provide a context-parallel collate hook that shards
+    non-token encoder inputs independently from the decoder token layout.
     """
 
     collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
     pad_to_length: int = False
     seq_classification: bool = False
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    context_parallel_collate_func: Optional[ContextParallelCollateFunc] = None
 
     def __post_init__(self):
         parallel_state = get_parallel_state()
         self.cp_size = parallel_state.cp_size
         self.cp_rank = parallel_state.cp_rank
-        
+
         self.ulysses_size = parallel_state.ulysses_size
         self.ulysses_rank = parallel_state.ulysses_rank
-        
+
         if self.cp_size <= 1:
             raise ValueError("ContextParallelCollator requires cp_size > 1.")
         if self.seq_classification:
             raise NotImplementedError("ContextParallelCollator currently supports causal-LM labels only.")
-        if self.metadata_collate_func is not None:
+        if self.metadata_collate_func is not None and self.context_parallel_collate_func is None:
             raise NotImplementedError("ContextParallelCollator currently supports decoder-only text samples.")
-        
+
         self.alignment = 2 * self.cp_size
         if parallel_state.ulysses_enabled:
             import math
+
             self.alignment = math.lcm(2 * self.cp_size, self.ulysses_size * self.cp_size)
-            
+
+    def _add_multimodal_embed_indices(self, features: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        features = [dict(feature) for feature in features]
+        offsets = {"image": 0, "video": 0}
+        for feature in features:
+            for modality in offsets:
+                mask_key = f"{modality}_mask"
+                mask = feature.get(mask_key)
+                if not isinstance(mask, torch.Tensor) or mask.size(-1) != feature["input_ids"].size(-1):
+                    continue
+                indices = mask.to(torch.long).cumsum(dim=-1) - 1 + offsets[modality]
+                indices = indices.masked_fill(~mask.bool(), -1)
+                index_key = f"{modality}_embed_indices"
+                feature[index_key] = indices
+                self.collate_infos.setdefault(index_key, DataCollateInfo(-1, True, -1, 1))
+                offsets[modality] += int(mask.sum().item())
+        return features
 
     def _get_token_keys(self, features: Sequence[Dict[str, Any]]) -> List[str]:
         required_keys = {"input_ids", "labels", "position_ids"}
@@ -370,7 +388,7 @@ class ContextParallelCollator(DataCollator):
                 collate_info is not None
                 and collate_info.pack_dim == -1
                 and isinstance(value, torch.Tensor)
-                and value.ndim == 1
+                and value.ndim >= 1
                 and value.size(-1) == sequence_length
             ):
                 token_keys.append(key)
@@ -378,8 +396,7 @@ class ContextParallelCollator(DataCollator):
         missing_token_keys = required_keys - set(token_keys)
         if missing_token_keys:
             raise ValueError(
-                "ContextParallelCollator requires one-dimensional, sequence-aligned tensors for "
-                f"{sorted(missing_token_keys)}."
+                f"ContextParallelCollator requires sequence-aligned tensors for {sorted(missing_token_keys)}."
             )
         return token_keys
 
@@ -394,13 +411,11 @@ class ContextParallelCollator(DataCollator):
 
         for key in token_keys:
             value = feature.get(key)
-            if not isinstance(value, torch.Tensor) or value.ndim != 1 or value.size(0) != sequence_length:
-                raise ValueError(
-                    f"Context-parallel field {key!r} must be a one-dimensional tensor of length {sequence_length}."
-                )
+            if not isinstance(value, torch.Tensor) or value.ndim < 1 or value.size(-1) != sequence_length:
+                raise ValueError(f"Context-parallel field {key!r} must have trailing length {sequence_length}.")
 
         position_ids = feature["position_ids"]
-        sequence_starts = position_ids.eq(0).nonzero(as_tuple=False).flatten()
+        sequence_starts = position_ids.reshape(-1, sequence_length)[0].eq(0).nonzero(as_tuple=False).flatten()
         if sequence_starts.numel() != 1 or int(sequence_starts[0]) != 0:
             raise NotImplementedError(
                 "Each ContextParallelCollator feature must contain exactly one logical sequence whose position_ids "
@@ -425,31 +440,27 @@ class ContextParallelCollator(DataCollator):
             return value
 
         if key == "position_ids":
-            start = int(value[-1]) + 1
-            padding = torch.arange(start, start + pad_length, dtype=value.dtype, device=value.device)
+            increments = torch.arange(1, pad_length + 1, dtype=value.dtype, device=value.device)
+            padding = value[..., -1:] + increments
         else:
             collate_info = self.collate_infos[key]
             if collate_info.sp_pad_value is None:
                 raise ValueError(f"Context-parallel field {key!r} requires a padding value.")
-            padding = torch.full(
-                (pad_length,),
-                fill_value=collate_info.sp_pad_value,
-                dtype=value.dtype,
-                device=value.device,
-            )
-        return torch.cat((value, padding), dim=0)
+            pad_shape = (*value.shape[:-1], pad_length)
+            padding = torch.full(pad_shape, collate_info.sp_pad_value, dtype=value.dtype, device=value.device)
+        return torch.cat((value, padding), dim=-1)
 
     def _zigzag_slice(self, value: torch.Tensor) -> torch.Tensor:
         num_chunks = 2 * self.cp_size
-        chunk_length = value.size(0) // num_chunks
+        chunk_length = value.size(-1) // num_chunks
         front_start = self.cp_rank * chunk_length
         back_start = (num_chunks - self.cp_rank - 1) * chunk_length
         return torch.cat(
             (
-                value.narrow(0, front_start, chunk_length),
-                value.narrow(0, back_start, chunk_length),
+                value.narrow(-1, front_start, chunk_length),
+                value.narrow(-1, back_start, chunk_length),
             ),
-            dim=0,
+            dim=-1,
         )
 
     def _make_tail_padding_feature(self, token_keys: Sequence[str], length: int, template: Dict[str, Any]):
@@ -457,17 +468,16 @@ class ContextParallelCollator(DataCollator):
         for key in token_keys:
             template_value = template[key]
             if key == "position_ids":
-                padding_feature[key] = torch.arange(length, dtype=template_value.dtype, device=template_value.device)
+                shape = (*template_value.shape[:-1], length)
+                padding_feature[key] = torch.zeros(shape, dtype=template_value.dtype, device=template_value.device)
                 continue
 
             collate_info = self.collate_infos[key]
             if collate_info.sp_pad_value is None:
                 raise ValueError(f"Context-parallel field {key!r} requires a padding value.")
+            shape = (*template_value.shape[:-1], length)
             padding_feature[key] = torch.full(
-                (length,),
-                fill_value=collate_info.sp_pad_value,
-                dtype=template_value.dtype,
-                device=template_value.device,
+                shape, collate_info.sp_pad_value, dtype=template_value.dtype, device=template_value.device
             )
         return padding_feature
 
@@ -504,6 +514,7 @@ class ContextParallelCollator(DataCollator):
         return batch
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        features = self._add_multimodal_embed_indices(features)
         token_keys = self._get_token_keys(features)
         reference_token_keys = set(token_keys)
         local_pieces = defaultdict(list)
@@ -551,10 +562,21 @@ class ContextParallelCollator(DataCollator):
 
         batch = self._collate_non_token_fields(features, token_keys)
         for key in token_keys:
-            batch[key] = torch.cat(local_pieces[key], dim=0).unsqueeze(0)
+            batch[key] = torch.cat(local_pieces[key], dim=-1).unsqueeze(0)
             if self.ulysses_size > 1:
-                ulysses_chunk_size = batch[key].shape[1] // self.ulysses_size
-                batch[key] = batch[key][:, ulysses_chunk_size * self.ulysses_rank:ulysses_chunk_size * (self.ulysses_rank + 1)]
+                ulysses_chunk_size = batch[key].shape[-1] // self.ulysses_size
+                batch[key] = batch[key].narrow(-1, ulysses_chunk_size * self.ulysses_rank, ulysses_chunk_size)
+
+        if self.context_parallel_collate_func is not None:
+            self.context_parallel_collate_func(
+                batch,
+                ContextParallelCollateContext(
+                    cp_size=self.cp_size,
+                    cp_rank=self.cp_rank,
+                    ulysses_size=self.ulysses_size,
+                    ulysses_rank=self.ulysses_rank,
+                ),
+            )
 
         cu_device = batch["position_ids"].device
         local_lengths_tensor = torch.tensor(local_lengths, dtype=torch.int32, device=cu_device)
@@ -696,6 +718,7 @@ class MainCollator(DataCollator):
     pad_to_length: bool = False
     seq_classification: bool = False
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    context_parallel_collate_func: Optional[ContextParallelCollateFunc] = None
 
     """
     Data collator pipeline with a unified collate info.
@@ -711,6 +734,9 @@ class MainCollator(DataCollator):
             Optional model-provided hook (``model.get_metadata_collate_func()``)
             that derives ``multimodal_metadata`` from the packed + SP-padded
             batch. ``None`` for text models. See ``MetadataCollateFunc``.
+        context_parallel_collate_func:
+            Optional model-provided hook that partitions non-token encoder inputs
+            across context-parallel and Ulysses ranks.
     """
 
     def __post_init__(self):
@@ -745,6 +771,7 @@ class MainCollator(DataCollator):
                     pad_to_length=self.pad_to_length,
                     seq_classification=self.seq_classification,
                     metadata_collate_func=self.metadata_collate_func,
+                    context_parallel_collate_func=self.context_parallel_collate_func,
                 )
             )
         else:

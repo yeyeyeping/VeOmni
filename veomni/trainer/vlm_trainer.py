@@ -274,6 +274,8 @@ class VLMTrainer:
         data_collate_info = get_extra_infos() if get_extra_infos is not None else {}
         get_metadata_func = getattr(model, "get_metadata_collate_func", None)
         metadata_collate_func = get_metadata_func() if get_metadata_func is not None else None
+        get_context_parallel_func = getattr(model, "get_context_parallel_collate_func", None)
+        context_parallel_collate_func = get_context_parallel_func() if get_context_parallel_func is not None else None
 
         seq_classification = self.base.args.data.data_type == "classification"
         pad_to_length = self.base.args.train.pad_to_length
@@ -282,6 +284,7 @@ class VLMTrainer:
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
             metadata_collate_func=metadata_collate_func,
+            context_parallel_collate_func=context_parallel_collate_func,
         )
 
     def _build_optimizer(self):

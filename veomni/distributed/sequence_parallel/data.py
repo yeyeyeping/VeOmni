@@ -42,6 +42,7 @@ def sp_pad_and_slice(
     dim: int = -1,
     pad_value: int = 0,
     pad_scale: int = 1,
+    group: Optional[ProcessGroup] = None,
 ) -> torch.Tensor:
     """
     Pads and slices a tensor for sequence parallelism (SP) distribution.
@@ -55,12 +56,17 @@ def sp_pad_and_slice(
         pad_scale: Scaling factor for SP size during padding (default: 1).
                    This is needed for some VLMs that perform token merging to ensure
                    padding is handled correctly before the merge operation
+        group: Optional process group whose size and local rank define the slice.
+               Defaults to the unified sequence-parallel group.
     Returns:
         The sliced tensor chunk for the current SP rank
     """
-    # Get sequence parallelism configuration
-    sp_size = get_parallel_state().sp_size
-    sp_rank = get_parallel_state().sp_rank
+    if group is None:
+        sp_size = get_parallel_state().sp_size
+        sp_rank = get_parallel_state().sp_rank
+    else:
+        sp_size = dist.get_world_size(group)
+        sp_rank = dist.get_rank(group)
     # Phase 1: Pad the tensor to align with (sp_size * pad_scale)
     # This ensures the tensor can be evenly split across all SP ranks
     seq_length = tensor.size(dim)
