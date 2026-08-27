@@ -26,7 +26,6 @@ from torchvision.transforms import InterpolationMode, functional
 from tqdm import tqdm
 
 from ...utils import logging
-from ...utils.import_utils import is_ffmpeg_available
 from .audio_utils import _prepare_audio_stream, _write_audio, extract_audio_from_video
 
 
@@ -446,6 +445,60 @@ def _apply_dynamic_video_max_pixels(nframes: int, kwargs: dict) -> dict:
     return {**kwargs, "video_max_pixels": int(dynamic_max)}
 
 
+def _load_and_process_video_with_pyav(video_input: Union[ByteString, str], use_audio_in_video: bool = True, **kwargs):
+    """Decode a local path or bytes container when torchcodec is unavailable.
+
+    The first pass counts frames without materializing RGB arrays. The second
+    pass converts only the sampled frames, keeping host memory bounded by the
+    configured output frame count rather than the source video length.
+    """
+    from io import BytesIO
+
+    def open_container():
+        source = BytesIO(video_input) if isinstance(video_input, (bytes, bytearray)) else video_input
+        return av.open(source)
+
+    container = open_container()
+    try:
+        if not container.streams.video:
+            raise ValueError("video container has no video stream")
+        stream = container.streams.video[0]
+        video_fps = float(stream.average_rate) if stream.average_rate else float(kwargs.get("fps", 2.0))
+        total_frames = sum(1 for _ in container.decode(stream))
+    finally:
+        container.close()
+    if total_frames == 0:
+        raise ValueError("video container decoded zero frames")
+
+    indices, pad_count = calculate_frame_indices(total_frames=total_frames, video_fps=video_fps, **kwargs)
+    target_indices = set(indices)
+    sampled_frames = {}
+    container = open_container()
+    try:
+        stream = container.streams.video[0]
+        for frame_idx, frame in enumerate(container.decode(stream)):
+            if frame_idx in target_indices:
+                sampled_frames[frame_idx] = torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
+                if len(sampled_frames) == len(target_indices):
+                    break
+    finally:
+        container.close()
+
+    missing_indices = target_indices.difference(sampled_frames)
+    if missing_indices:
+        raise ValueError(f"video container did not decode sampled frame indices: {sorted(missing_indices)}")
+
+    video = torch.stack([sampled_frames[index] for index in indices])
+    resized = smart_resize(video, **_apply_dynamic_video_max_pixels(len(indices) + pad_count, kwargs))
+    if pad_count:
+        resized = torch.cat([resized, resized[-1:].expand(pad_count, -1, -1, -1)], dim=0)
+        indices = indices + [indices[-1]] * pad_count
+    audio, audio_fps = None, None
+    if use_audio_in_video:
+        audio, audio_fps = extract_audio_from_video(video_input)
+    return resized, audio, audio_fps, torch.tensor(indices, dtype=torch.long)
+
+
 def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_video: bool = True, **kwargs):
     """Load and process video using torchcodec (video) and PyAV (audio).
 
@@ -490,32 +543,32 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         frames_indices = torch.arange(video.shape[0])
         return video, audio, audio_fps, frames_indices
 
-    # video_input is str (path/URL) or bytes — the only branch that needs the
-    # ffmpeg / torchcodec stack. dict / List[bytes] / List[PIL.Image] inputs above
-    # never reach this point, so they work in ffmpeg-less environments.
-    if not is_ffmpeg_available():
-        raise RuntimeError(
-            "ffmpeg is not available; required for decoding str/bytes video containers. "
-            "Install with `apt-get install ffmpeg` / `brew install ffmpeg`, or feed the "
-            "video as pre-decoded frames (dict / List[bytes] / List[PIL.Image] — see "
-            "docs/examples/qwen3_omni_offline_av.md)."
-        )
-    from torchcodec.decoders import VideoDecoder
-
+    # Prefer torchcodec, then use PyAV for local path/bytes containers.
     try:
+        from torchcodec.decoders import VideoDecoder
+
         decoder = VideoDecoder(video_input, device="cpu", num_ffmpeg_threads=0)
     except Exception as e:
         if isinstance(video_input, str) and ("http://" in video_input or "https://" in video_input):
             logger.warning(f"Direct URL decoding failed: {e}. Downloading with ffmpeg...")
             try:
                 video_bytes = _download_url_to_bytes(video_input)
-                decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
+                try:
+                    decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
+                except Exception:
+                    return _load_and_process_video_with_pyav(
+                        video_bytes, use_audio_in_video=use_audio_in_video, **kwargs
+                    )
             except Exception as download_error:
                 raise RuntimeError(
                     f"Failed to decode video from URL {video_input}: {download_error}"
                 ) from download_error
         else:
-            raise RuntimeError(f"Failed to create VideoDecoder: {e}") from e
+            logger.warning(f"torchcodec decode failed: {e}. Falling back to PyAV.")
+            try:
+                return _load_and_process_video_with_pyav(video_input, use_audio_in_video=use_audio_in_video, **kwargs)
+            except Exception as pyav_error:
+                raise RuntimeError(f"Failed to create VideoDecoder and PyAV fallback failed: {pyav_error}") from e
 
     metadata = decoder.metadata
     video_fps = metadata.average_fps

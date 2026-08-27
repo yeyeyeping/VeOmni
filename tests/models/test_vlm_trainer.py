@@ -10,6 +10,7 @@ from veomni.trainer.vlm_trainer import (
     VLMTrainer,
     _get_vlm_visual_module,
 )
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from ..tools.training_utils import make_eager_ops_config
 
@@ -21,6 +22,14 @@ _FREEZE_VIT_VLM_CASES = [
     pytest.param("./tests/toy_config/qwen25vl_toy/config.json", id="qwen2_5_vl"),
     pytest.param("./tests/toy_config/qwen3vl_toy/config.json", id="qwen3_vl"),
     pytest.param("./tests/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe"),
+    pytest.param(
+        "./tests/toy_config/minimax_m3_vl_toy/config.json",
+        marks=pytest.mark.skipif(
+            not is_transformers_version_greater_or_equal_to("5.12.0"),
+            reason="MiniMax M3 VL modeling requires transformers>=5.12.0",
+        ),
+        id="minimax_m3_vl",
+    ),
 ]
 
 
