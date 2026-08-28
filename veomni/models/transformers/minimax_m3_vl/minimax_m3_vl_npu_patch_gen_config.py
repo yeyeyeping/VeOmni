@@ -32,6 +32,7 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     minimax_m3_vl_get_parallel_plan_patched,
     minimax_m3_vl_get_position_id_func_patched,
     minimax_m3_vl_model_forward_patched,
+    minimax_m3_vl_rmsnorm_forward_patched,
     minimax_m3_vl_sparse_for_conditional_generation_forward_patched,
     minimax_m3_vl_text_get_parallel_plan_patched,
     minimax_m3_vl_vision_dummy_forward_patched,
@@ -55,11 +56,18 @@ config.add_import(
 )
 config.add_post_import_block(
     """
+veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 """
 )
 config.add_helper(_grid_thw_to_list)
 config.add_helper(collate_multimodal_metadata)
+
+config.override_method(
+    "MiniMaxM3VLRMSNorm.forward",
+    replacement=minimax_m3_vl_rmsnorm_forward_patched,
+    description="Use VeOmni's Gemma-style fused RMSNorm backend when selected",
+)
 
 config.override_method(
     "MiniMaxM3VL3DRotaryEmbedding.forward",

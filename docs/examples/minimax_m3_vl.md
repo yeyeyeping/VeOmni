@@ -56,7 +56,7 @@ MiniMax placeholder ids are preserved in `input_ids` so the upstream forward can
 
 ## Current Scope
 
-This recipe covers config loading, generated modeling import, MiniMax processor-shaped VLM samples, FSDP2 training, checkpoint conversion, and MiniMax multimodal metadata wiring. The current patch does not implement Ulysses sequence parallelism or VeOmni MoE token dispatch for expert parallelism, so keep `ulysses_size: 1`, `cp_size: 1`, and `ep_size: 1`. The NPU generated file is present for runtime selection, but this slice does not claim Ascend-specific RMSNorm, RoPE, attention, MSA, or fused-MoE kernel replacements.
+This recipe covers config loading, generated modeling import, MiniMax processor-shaped VLM samples, FSDP2 training, checkpoint conversion, and MiniMax multimodal metadata wiring. The current patch does not implement Ulysses sequence parallelism or VeOmni MoE token dispatch for expert parallelism, so keep `ulysses_size: 1`, `cp_size: 1`, and `ep_size: 1`. MiniMax's Gemma-style RMSNorm is wired to VeOmni's `rms_norm/qwen3_5` operator variant, selecting Liger on GPU and `torch_npu.npu_rms_norm` on NPU according to `model.ops_implementation.rms_norm_implementation`. The NPU generated file does not yet claim Ascend-specific RoPE, attention, MSA, or fused-MoE kernel replacements.
 
 To regenerate generated modeling files:
 

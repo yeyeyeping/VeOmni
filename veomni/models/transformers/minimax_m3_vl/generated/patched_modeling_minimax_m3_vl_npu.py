@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: MiniMaxM3VLRMSNorm.forward
+#      Use VeOmni's Gemma-style fused RMSNorm backend when selected
 #    - method_override: MiniMaxM3VL3DRotaryEmbedding.forward
 #      Consume collator-precomputed MiniMax vision grid lists when available
 #    - method_override: MiniMaxM3VLVisionModel.forward
@@ -71,6 +73,7 @@ from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 
 
 # Additional import blocks for patches
+veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
 
@@ -188,6 +191,12 @@ class MiniMaxM3VLSparseStaticCacheLayer(StaticLayer):
             self.idx_keys = self.idx_keys.index_select(0, beam_idx.to(self.idx_keys.device))
 
 
+# ======================================================================
+# [MODIFIED CLASS] MiniMaxM3VLRMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
 class MiniMaxM3VLRMSNorm(nn.Module):
     """Gemma-style RMSNorm: normalizes in fp32 and scales by `weight + 1`."""
 
@@ -199,10 +208,17 @@ class MiniMaxM3VLRMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    # ================================================================
+    # Patch: MiniMaxM3VLRMSNorm.forward
+    # 1. dispatch the Gemma-style `(1 + weight)` formulation through VeOmni's
+    #    qwen3_5 RMSNorm variant when an optimized backend is selected
+    # 2. preserve the upstream full-FP32 eager fallback exactly
+    # ================================================================
     def forward(self, x):
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(x, self.weight, self.eps)
+
         output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst MiniMaxM3VL is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
