@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -6,10 +7,13 @@ from PIL import Image
 
 from veomni.data.chat_template import MiniMaxM3VLChatTemplate
 from veomni.data.data_transform import process_sample_minimax_m3_vl
+from veomni.ops.kernels.cross_entropy import install_loss_mapping
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 class _FakeImageProcessor:
+    merge_size = 2
+
     def __init__(self):
         self.calls = []
 
@@ -23,6 +27,8 @@ class _FakeImageProcessor:
 
 
 class _FakeVideoProcessor:
+    merge_size = 2
+
     def __init__(self):
         self.calls = []
 
@@ -154,6 +160,7 @@ class _FakeMiniMaxTokenizer:
         return self._token_ids[token]
 
     def encode(self, text, add_special_tokens=False):
+        self.last_encoded_text = text
         token_ids = []
         idx = 0
         special_tokens = (
@@ -171,6 +178,48 @@ class _FakeMiniMaxTokenizer:
                 token_ids.append(1000 + ord(text[idx]) % 1000)
                 idx += 1
         return token_ids
+
+
+class _ProcessorWithoutReplacementMethods:
+    def __init__(self):
+        self.tokenizer = _FakeMiniMaxTokenizer()
+        self.image_processor = SimpleNamespace(merge_size=2)
+        self.video_processor = SimpleNamespace(merge_size=2, temporal_patch_size=2)
+
+
+def test_minimax_chat_template_expands_media_without_processor_replacement_methods():
+    processor = _ProcessorWithoutReplacementMethods()
+    chat_template = MiniMaxM3VLChatTemplate(processor)
+    encoded = chat_template.encode_messages(
+        [["user", ("image", None), ("video", None), ("image", None), ("video", None)]],
+        processor=processor,
+        image_inputs={"image_grid_thw": torch.tensor([[1, 2, 2], [1, 4, 2]])},
+        video_inputs={
+            "video_grid_thw": torch.tensor([[2, 2, 2], [1, 4, 2]]),
+            "video_metadata": [SimpleNamespace(fps=2.0, frames_indices=[0, 1, 2, 3]), None],
+        },
+    )
+
+    assert (encoded["input_ids"] == chat_template.image_token_id).sum().item() == 3
+    assert (encoded["input_ids"] == chat_template.video_token_id).sum().item() == 4
+    assert "]<]0.0 seconds[>[" in processor.tokenizer.last_encoded_text
+    assert "]<]1.0 seconds[>[" in processor.tokenizer.last_encoded_text
+
+
+@pytest.mark.parametrize("video_metadata", [None, pytest.param("missing", id="missing-key")])
+def test_minimax_chat_template_expands_video_without_metadata(video_metadata):
+    processor = _ProcessorWithoutReplacementMethods()
+    chat_template = MiniMaxM3VLChatTemplate(processor)
+    video_inputs = {"video_grid_thw": torch.tensor([[2, 2, 2]])}
+    if video_metadata != "missing":
+        video_inputs["video_metadata"] = video_metadata
+
+    encoded = chat_template.encode_messages(
+        [["user", ("video", None)]], processor=processor, video_inputs=video_inputs
+    )
+
+    assert (encoded["input_ids"] == chat_template.video_token_id).sum().item() == 2
+    assert "seconds[>[" not in processor.tokenizer.last_encoded_text
 
 
 class _RealMiniMaxVideoProcessorShim:
@@ -196,7 +245,7 @@ class _RealMiniMaxVideoProcessorShim:
         )
 
 
-def test_minimax_m3_vl_transform_uses_real_chat_template_processor_replacements(monkeypatch):
+def test_minimax_m3_vl_transform_uses_real_chat_template_replacements(monkeypatch):
     def fake_conv_preprocess(source, conversations, **kwargs):
         assert source == "minimax_template_test"
         return [
@@ -231,11 +280,11 @@ def test_minimax_m3_vl_transform_uses_real_chat_template_processor_replacements(
         chat_template=chat_template,
     )
 
-    assert processor.replaced_images[0]["image_idx"] == 0
-    assert processor.replaced_videos[0]["video_idx"] == 0
+    assert processor.replaced_images == []
+    assert processor.replaced_videos == []
     assert "video_metadata" not in example
     assert example["image_mask"].sum().item() == 1
-    assert example["video_mask"].sum().item() == 1
+    assert example["video_mask"].sum().item() == 2
     assert torch.equal(example["image_mask"], example["input_ids"] == processor.image_token_id)
     assert torch.equal(example["video_mask"], example["input_ids"] == processor.video_token_id)
     assert torch.all(example["labels"][example["image_mask"] | example["video_mask"]] == -100)
@@ -372,10 +421,24 @@ class _ModelShapeProcessor(_FakeProcessor):
         self.video_processor = _ModelShapeVideoProcessor(pixel_row_size=pixel_row_size, merge_size=merge_size)
 
 
+@pytest.fixture
+def eager_loss_mapping():
+    from transformers.loss.loss_utils import LOSS_MAPPING
+
+    keys = ("ForCausalLM", "ForConditionalGeneration", "ForSequenceClassification")
+    previous = {key: LOSS_MAPPING[key] for key in keys}
+    install_loss_mapping("eager")
+    try:
+        yield
+    finally:
+        LOSS_MAPPING.update(previous)
+
+
 @pytest.mark.skipif(
     not is_transformers_version_greater_or_equal_to("5.12.0"),
     reason="MiniMax M3 VL generated modeling requires transformers>=5.12.0",
 )
+@pytest.mark.usefixtures("eager_loss_mapping")
 def test_minimax_m3_vl_transform_to_collator_to_generated_model_backward(monkeypatch):
     """Exercise transform -> MainCollator -> generated model backward.
 

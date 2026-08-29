@@ -15,7 +15,7 @@
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Union
 
 import torch
 
@@ -593,6 +593,32 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
     def video_pattern(self, token_num: int) -> str:
         return self.VISION_START_TOKEN + self.VIDEO_TOKEN * token_num + self.VISION_END_TOKEN
 
+    def _replace_image_token(self, processor: "ProcessorMixin", image_inputs: Dict[str, torch.Tensor], image_idx: int):
+        merge_length = processor.image_processor.merge_size**2
+        token_num = int(image_inputs["image_grid_thw"][image_idx].prod() // merge_length)
+        return self.image_pattern(token_num)
+
+    def _replace_video_token(self, processor: "ProcessorMixin", video_inputs: Dict[str, Any], video_idx: int):
+        merge_length = processor.video_processor.merge_size**2
+        grid_thw = video_inputs["video_grid_thw"][video_idx]
+        grid_t = int(grid_thw[0])
+        frame_seqlen = int(grid_thw[1:].prod() // merge_length)
+        metadata_list = video_inputs.get("video_metadata")
+        metadata = metadata_list[video_idx] if metadata_list is not None else None
+        temporal_patch_size = getattr(processor.video_processor, "temporal_patch_size", 1)
+
+        chunks = []
+        for frame in range(grid_t):
+            if (
+                metadata is not None
+                and getattr(metadata, "fps", None) is not None
+                and getattr(metadata, "frames_indices", None) is not None
+            ):
+                frame_idx = min(frame * temporal_patch_size, len(metadata.frames_indices) - 1)
+                chunks.append(f"]<]{metadata.frames_indices[frame_idx] / metadata.fps:.1f} seconds[>[")
+            chunks.append(self.video_pattern(frame_seqlen))
+        return "".join(chunks)
+
     def encode_messages(
         self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
@@ -615,13 +641,13 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
                     content += value[1]
                 elif value[0] == "image":
                     if processor is not None and image_inputs:
-                        content += processor.replace_image_token(image_inputs, image_idx)
+                        content += self._replace_image_token(processor, image_inputs, image_idx)
                     else:
                         content += self.image_pattern(next(image_token_num_list))
                     image_idx += 1
                 elif value[0] == "video":
                     if processor is not None and video_inputs:
-                        content += processor.replace_video_token(video_inputs, video_idx)
+                        content += self._replace_video_token(processor, video_inputs, video_idx)
                     else:
                         content += self.video_pattern(next(video_token_num_list))
                     video_idx += 1

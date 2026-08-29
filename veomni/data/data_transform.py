@@ -42,6 +42,37 @@ def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_t
     raise ValueError(f"Cannot find token ({token_names}) in tokenizer vocab.")
 
 
+def _prepare_vlm_media_inputs(
+    sample: Dict[str, Any], processor: "ProcessorMixin", **kwargs
+) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Any]:
+    """Load and tensorize image/video inputs through a model's HF processor."""
+    from .multimodal.image_utils import fetch_images
+    from .multimodal.video_utils import fetch_videos_metadata
+
+    image_inputs, video_inputs = {}, {}
+    video_metadata = None
+
+    if sample.get("images"):
+        images = fetch_images(sample["images"], **kwargs)
+        image_inputs = processor.image_processor(images=images, return_tensors="pt")
+
+    if sample.get("videos"):
+        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
+        video_inputs = processor.video_processor(
+            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
+        )
+        video_metadata = video_inputs.pop("video_metadata", None)
+
+    return image_inputs, video_inputs, video_metadata
+
+
+def _build_vlm_placeholder_masks(
+    input_ids: torch.Tensor, image_token_id: int, video_token_id: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute modality masks before model forward to avoid device-side token scans."""
+    return input_ids == image_token_id, input_ids == video_token_id
+
+
 def build_data_transform(transform_name: str, **kwargs) -> Callable:
     return partial(DATA_TRANSFORM_REGISTRY[transform_name], **kwargs)
 
@@ -290,8 +321,6 @@ def _process_sample_qwen_vl_base(
     **kwargs,
 ):
     from .multimodal import conv_preprocess
-    from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos_metadata
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
 
@@ -301,26 +330,17 @@ def _process_sample_qwen_vl_base(
         conversations = sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
-    token_num_inputs, image_inputs, video_inputs = {}, {}, {}
-    image_grid_thw, video_grid_thw = None, None
-    video_metadata = None
+    token_num_inputs = {}
+    image_inputs, video_inputs, video_metadata = _prepare_vlm_media_inputs(sample, processor, **kwargs)
+    image_grid_thw = image_inputs["image_grid_thw"] if image_inputs else None
+    video_grid_thw = video_inputs["video_grid_thw"] if video_inputs else None
 
-    if "images" in sample and sample["images"]:
-        images = fetch_images(sample["images"], **kwargs)
-        image_inputs = processor.image_processor(images=images, return_tensors="pt")
-        image_grid_thw = image_inputs["image_grid_thw"]
+    if image_grid_thw is not None:
         merge_length = processor.image_processor.merge_size**2
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
 
-    if "videos" in sample and sample["videos"]:
-        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
-        video_inputs = processor.video_processor(
-            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
-        )
-        video_grid_thw = video_inputs["video_grid_thw"]
-        video_metadata = video_inputs.pop("video_metadata", None)
-
+    if video_grid_thw is not None:
         merge_length = processor.video_processor.merge_size**2
         video_token_num = video_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["video"] = video_token_num
@@ -340,8 +360,9 @@ def _process_sample_qwen_vl_base(
     attention_mask = tokenized_example["attention_mask"]
 
     # Masks and Token Types
-    tokenized_example["image_mask"] = input_ids == IMAGE_INPUT_INDEX
-    tokenized_example["video_mask"] = input_ids == VIDEO_INPUT_INDEX
+    image_mask, video_mask = _build_vlm_placeholder_masks(input_ids, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX)
+    tokenized_example["image_mask"] = image_mask
+    tokenized_example["video_mask"] = video_mask
 
     # Position IDs
     position_id_func_kwargs = {
@@ -415,25 +436,12 @@ def process_sample_minimax_m3_vl(
 ):
     """Prepare MiniMax M3 VL image/video inputs and packed 1-D text labels."""
     from .multimodal import conv_preprocess
-    from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos_metadata
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
     conversations = sample.get("conversations") or sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
-    image_inputs, video_inputs = {}, {}
-    video_metadata = None
-    if sample.get("images"):
-        images = fetch_images(sample["images"], **kwargs)
-        image_inputs = processor.image_processor(images=images, return_tensors="pt")
-
-    if sample.get("videos"):
-        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
-        video_inputs = processor.video_processor(
-            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
-        )
-        video_metadata = video_inputs.pop("video_metadata", None)
+    image_inputs, video_inputs, video_metadata = _prepare_vlm_media_inputs(sample, processor, **kwargs)
 
     video_inputs_for_template = video_inputs
     if video_metadata is not None:
@@ -452,10 +460,9 @@ def process_sample_minimax_m3_vl(
     }
 
     input_ids = tokenized_example["input_ids"]
-    image_token_id = getattr(processor, "image_token_id", chat_template.image_token_id)
-    video_token_id = getattr(processor, "video_token_id", chat_template.video_token_id)
-    image_mask = input_ids == image_token_id
-    video_mask = input_ids == video_token_id
+    image_mask, video_mask = _build_vlm_placeholder_masks(
+        input_ids, chat_template.image_token_id, chat_template.video_token_id
+    )
     tokenized_example["image_mask"] = image_mask
     tokenized_example["video_mask"] = video_mask
     tokenized_example["labels"][image_mask | video_mask] = IGNORE_INDEX
