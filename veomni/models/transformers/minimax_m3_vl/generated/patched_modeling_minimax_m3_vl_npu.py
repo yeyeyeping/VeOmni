@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - class_replacement: MiniMaxM3VLExperts
+#      Remove the HF experts decorator and add SwiGLU-OAI fused MoE dispatch
 #    - method_override: MiniMaxM3VLRMSNorm.forward
 #      Use VeOmni's Gemma-style fused RMSNorm backend when selected
 #    - method_override: MiniMaxM3VL3DRotaryEmbedding.forward
@@ -44,7 +46,6 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, DynamicLayer, StaticLayer
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_experts_implementation
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
@@ -75,6 +76,7 @@ from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 # Additional import blocks for patches
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_moe_experts_forward = OpSlot("moe_experts", "swiglu_oai")
 
 
 # ======================================================================
@@ -208,12 +210,6 @@ class MiniMaxM3VLRMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    # ================================================================
-    # Patch: MiniMaxM3VLRMSNorm.forward
-    # 1. dispatch the Gemma-style `(1 + weight)` formulation through VeOmni's
-    #    qwen3_5 RMSNorm variant when an optimized backend is selected
-    # 2. preserve the upstream full-FP32 eager fallback exactly
-    # ================================================================
     def forward(self, x):
         if veomni_rms_norm.use_non_eager_impl:
             return veomni_rms_norm(x, self.weight, self.eps)
@@ -244,11 +240,16 @@ class MiniMaxM3VLDenseMLP(nn.Module):
         return self.down_proj((up + 1.0) * glu)
 
 
-@use_experts_implementation
+# ======================================================================
+# [PATCHED CLASS] MiniMaxM3VLExperts
+# Original class replaced with: PatchedMiniMaxM3VLExperts
+# Reason: Remove the HF experts decorator and add SwiGLU-OAI fused MoE dispatch
+# Source: veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
+# ======================================================================
 class MiniMaxM3VLExperts(nn.Module):
-    """Collection of expert weights stored as 3D tensors."""
+    """MiniMax M3 routed experts with VeOmni fused MoE dispatch."""
 
-    def __init__(self, config: MiniMaxM3VLTextConfig):
+    def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
@@ -259,25 +260,35 @@ class MiniMaxM3VLExperts(nn.Module):
         self.swiglu_alpha = config.swiglu_alpha
         self.swiglu_limit = config.swiglu_limit
 
-    def forward(
-        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        parallel_state = get_parallel_state()
+        if parallel_state.ep_enabled:
+            if self.num_experts % parallel_state.ep_size != 0:
+                raise ValueError(
+                    f"MiniMax M3 num_experts={self.num_experts} must be divisible by ep_size={parallel_state.ep_size}."
+                )
+            if not veomni_moe_experts_forward.use_non_eager_impl:
+                raise RuntimeError(
+                    "MiniMax M3 expert parallelism requires "
+                    "model.ops_implementation.moe_implementation=fused_triton or fused_npu."
+                )
+
+        if veomni_moe_experts_forward.use_non_eager_impl:
+            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+
         final = torch.zeros_like(hidden_states)
         with torch.no_grad():
             mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
             hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in hit:
             expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
             top_k_pos, token_idx = torch.where(mask[expert_idx])
             current = self._apply_gate(F.linear(hidden_states[token_idx], self.gate_up_proj[expert_idx]))
             current = F.linear(current, self.down_proj[expert_idx]) * top_k_weights[token_idx, top_k_pos, None]
             final.index_add_(0, token_idx, current.to(final.dtype))
         return final
 
-    def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
-        # same as GPT OSS, but the weights are not interleaved
+    def _apply_gate(self, gate_up):
         gate, up = gate_up.chunk(2, dim=-1)
         gate = gate.clamp(max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
@@ -1048,9 +1059,9 @@ class MiniMaxM3VLForCausalLM(MiniMaxM3VLPreTrainedModel, GenerationMixin):
         )
 
     def get_parallel_plan(self):
-        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+        from ..parallel_plan import get_text_parallel_plan
 
-        return _get_parallel_plan()
+        return get_text_parallel_plan()
 
 
 class MiniMaxM3VLVisionEmbeddings(nn.Module):
@@ -1819,9 +1830,9 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3VLPreTrainedModel, Genera
         return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 
     def get_parallel_plan(self):
-        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+        from ..parallel_plan import get_vlm_parallel_plan
 
-        return _get_parallel_plan()
+        return get_vlm_parallel_plan()
 
     def get_position_id_func(self):
         return None

@@ -56,7 +56,21 @@ MiniMax placeholder ids are preserved in `input_ids` so the upstream forward can
 
 ## Current Scope
 
-This recipe covers config loading, generated modeling import, MiniMax processor-shaped VLM samples, FSDP2 training, checkpoint conversion, and MiniMax multimodal metadata wiring. The current patch does not implement Ulysses sequence parallelism or VeOmni MoE token dispatch for expert parallelism, so keep `ulysses_size: 1`, `cp_size: 1`, and `ep_size: 1`. MiniMax's Gemma-style RMSNorm is wired to VeOmni's `rms_norm/qwen3_5` operator variant, selecting Liger on GPU and `torch_npu.npu_rms_norm` on NPU according to `model.ops_implementation.rms_norm_implementation`. The NPU generated file does not yet claim Ascend-specific RoPE, attention, MSA, or fused-MoE kernel replacements.
+This recipe covers config loading, generated modeling import, MiniMax processor-shaped VLM samples, FSDP2 training, checkpoint conversion, MiniMax multimodal metadata wiring, and expert parallelism. The current patch does not implement Ulysses sequence parallelism, so keep `ulysses_size: 1` and `cp_size: 1`. MiniMax's Gemma-style RMSNorm is wired to VeOmni's `rms_norm/qwen3_5` operator variant, selecting Liger on GPU and `torch_npu.npu_rms_norm` on NPU according to `model.ops_implementation.rms_norm_implementation`.
+
+MiniMax routed experts use the `moe_experts/swiglu_oai` operator variant. It preserves the model's clamped `(up + 1) * gate * sigmoid(alpha * gate)` activation while reusing VeOmni's standard EP token dispatch. Enable EP with `fused_triton` on GPU or `fused_npu` on NPU:
+
+```yaml
+model:
+  ops_implementation:
+    moe_implementation: fused_triton  # use fused_npu on NPU
+
+train:
+  accelerator:
+    ep_size: 8
+```
+
+The public MiniMax checkpoint stores separate per-expert `w1`/`w2`/`w3` tensors. Its runtime converter must first assemble the complete fused expert tensor, so this checkpoint layout is incompatible with `train.ep_sharded_stream_load=true`. Keep that option disabled unless the checkpoint has first been exported in the fused VeOmni/Hugging Face v5 layout.
 
 To regenerate generated modeling files:
 

@@ -70,7 +70,18 @@ def test_minimax_fqn_index_mapping_merges_layouts():
     assert converted["model.multi_modal_projector.merge_linear_2.weight"] == 8
 
 
-def test_minimax_parallel_plan_rejects_expert_parallelism(monkeypatch):
-    monkeypatch.setattr(parallel_plan, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True))
-    with pytest.raises(NotImplementedError, match="ep_size=1"):
-        parallel_plan.get_parallel_plan()
+def test_minimax_parallel_plans_use_architecture_specific_prefixes():
+    text_plan = parallel_plan.get_text_parallel_plan()
+    vlm_plan = parallel_plan.get_vlm_parallel_plan()
+
+    assert set(text_plan.extra_parallel_plan["ep"]) == {
+        "model.layers.*.mlp.experts.gate_up_proj",
+        "model.layers.*.mlp.experts.down_proj",
+    }
+    assert text_plan.extra_parallel_fsdp_no_shard_module["ep"] == {"model.layers.*.mlp.experts"}
+
+    assert set(vlm_plan.extra_parallel_plan["ep"]) == {
+        "model.language_model.layers.*.mlp.experts.gate_up_proj",
+        "model.language_model.layers.*.mlp.experts.down_proj",
+    }
+    assert vlm_plan.extra_parallel_fsdp_no_shard_module["ep"] == {"model.language_model.layers.*.mlp.experts"}

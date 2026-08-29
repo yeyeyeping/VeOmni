@@ -30,6 +30,8 @@ patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_co
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import MiniMaxM3VLCausalLMOutputWithPast
 
 from veomni.distributed.parallel_state import get_parallel_state
@@ -51,9 +53,24 @@ config.add_import(
 )
 config.add_post_import_block(
     """
+veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_moe_experts_forward = OpSlot("moe_experts", "swiglu_oai")
 """
 )
+
+
+@config.override_method(
+    "MiniMaxM3VLRMSNorm.forward",
+    description="Use VeOmni's Gemma-style fused RMSNorm backend when selected",
+)
+def minimax_m3_vl_rmsnorm_forward_patched(self, x):
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(x, self.weight, self.eps)
+
+    output = self._norm(x.float())
+    output = output * (1.0 + self.weight.float())
+    return output.type_as(x)
 
 
 @config.add_helper
@@ -177,6 +194,60 @@ def minimax_m3_vl_vision_dummy_forward_patched(self):
     vit_metadata = {"grid_thw_list": [[t, h, w]]}
     return self(pixel_values=pixel_values, image_grid_thw=grid_thw, vit_metadata=vit_metadata)
     # --- Patch.1 ---
+
+
+@config.replace_class(
+    "MiniMaxM3VLExperts",
+    description="Remove the HF experts decorator and add SwiGLU-OAI fused MoE dispatch",
+)
+class PatchedMiniMaxM3VLExperts(nn.Module):
+    """MiniMax M3 routed experts with VeOmni fused MoE dispatch."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.limit = config.swiglu_limit
+        self.swiglu_alpha = config.swiglu_alpha
+        self.swiglu_limit = config.swiglu_limit
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        parallel_state = get_parallel_state()
+        if parallel_state.ep_enabled:
+            if self.num_experts % parallel_state.ep_size != 0:
+                raise ValueError(
+                    f"MiniMax M3 num_experts={self.num_experts} must be divisible by ep_size={parallel_state.ep_size}."
+                )
+            if not veomni_moe_experts_forward.use_non_eager_impl:
+                raise RuntimeError(
+                    "MiniMax M3 expert parallelism requires "
+                    "model.ops_implementation.moe_implementation=fused_triton or fused_npu."
+                )
+
+        if veomni_moe_experts_forward.use_non_eager_impl:
+            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+
+        final = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in hit:
+            expert_idx = expert_idx[0]
+            top_k_pos, token_idx = torch.where(mask[expert_idx])
+            current = self._apply_gate(F.linear(hidden_states[token_idx], self.gate_up_proj[expert_idx]))
+            current = F.linear(current, self.down_proj[expert_idx]) * top_k_weights[token_idx, top_k_pos, None]
+            final.index_add_(0, token_idx, current.to(final.dtype))
+        return final
+
+    def _apply_gate(self, gate_up):
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        glu = gate * torch.sigmoid(gate * self.swiglu_alpha)
+        return (up + 1.0) * glu
 
 
 # ================================================================
@@ -400,9 +471,9 @@ class MiniMaxM3VLCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, MiniMaxM3
     description="Register MiniMax M3 VL expert parallel plan for the multimodal training path",
 )
 def minimax_m3_vl_get_parallel_plan_patched(self):
-    from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+    from ..parallel_plan import get_vlm_parallel_plan
 
-    return _get_parallel_plan()
+    return get_vlm_parallel_plan()
 
 
 @config.override_method(
@@ -426,6 +497,6 @@ def minimax_m3_vl_get_metadata_collate_func_patched(self):
     description="Register MiniMax M3 VL expert parallel plan for text-only reduced-layer smoke tests",
 )
 def minimax_m3_vl_text_get_parallel_plan_patched(self):
-    from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+    from ..parallel_plan import get_text_parallel_plan
 
-    return _get_parallel_plan()
+    return get_text_parallel_plan()

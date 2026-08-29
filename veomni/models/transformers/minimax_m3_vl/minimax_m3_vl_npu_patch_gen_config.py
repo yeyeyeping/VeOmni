@@ -14,10 +14,9 @@
 """
 Patch configuration for MiniMax M3 VL NPU code generation.
 
-This path intentionally mirrors the GPU patch set for the first migration
-slice. It provides a checked-in NPU generated artifact and VeOmni registry
-selection without claiming Ascend-specific kernel replacements before NPU
-runtime evidence exists.
+This path mirrors the GPU patch set and binds MiniMax's SwiGLU-OAI experts to
+the NPU fused-MoE registry variant while retaining the upstream eager fallback
+when eager MoE is selected without expert parallelism.
 
 Regen command:
 patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_npu_patch_gen_config -o veomni/models/transformers/minimax_m3_vl/generated --diff
@@ -25,6 +24,7 @@ patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_npu_patch_gen_co
 
 from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config import (
     MiniMaxM3VLCausalLMOutputWithLogProbs,
+    PatchedMiniMaxM3VLExperts,
     _grid_thw_to_list,
     collate_multimodal_metadata,
     minimax_m3_vl_3d_rotary_embedding_forward_patched,
@@ -58,10 +58,17 @@ config.add_post_import_block(
     """
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_moe_experts_forward = OpSlot("moe_experts", "swiglu_oai")
 """
 )
 config.add_helper(_grid_thw_to_list)
 config.add_helper(collate_multimodal_metadata)
+
+config.replace_class(
+    "MiniMaxM3VLExperts",
+    replacement=PatchedMiniMaxM3VLExperts,
+    description="Remove the HF experts decorator and add SwiGLU-OAI fused MoE dispatch",
+)
 
 config.override_method(
     "MiniMaxM3VLRMSNorm.forward",

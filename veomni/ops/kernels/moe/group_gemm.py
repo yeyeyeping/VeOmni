@@ -19,6 +19,7 @@ from ....distributed.parallel_state import get_parallel_state
 from ._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
 from ._scatter import compute_expert_scatter_index
+from .activation import swiglu_oai, swiglu_oai_backward
 
 
 def _apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
@@ -518,6 +519,290 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
         )
+
+
+class SwigluOaiMergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
+    """Merged-fc1 Triton MoE with MiniMax/GPT-OSS SwiGLU-OAI semantics."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        num_experts,
+        gate_weights,
+        expert_index,
+        hidden_states,
+        fc1_1_2_weight,
+        fc2_weight,
+        swiglu_limit,
+        swiglu_alpha,
+    ):
+        splits = expert_histogram(expert_index, num_experts)
+        _, scatter_index = compute_expert_scatter_index(expert_index)
+        scatter_output = moe_scatter(hidden_states, scatter_index)
+        cumsum_t = torch.cumsum(splits, dim=0)
+
+        fc1_output = group_gemm_same_nk(
+            a=scatter_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum_t,
+            max_M=scatter_output.shape[0],
+            transpose_a=False,
+            transpose_b=True,
+        )
+        gate, up = fc1_output.chunk(2, dim=-1)
+        gate, up, mask_gate, mask_up = _apply_swiglu_clamp(gate, up, swiglu_limit)
+        fc1_activation = swiglu_oai(gate, up, swiglu_alpha)
+
+        reshaped_gate_weight = gate_weights.reshape(-1, 1)
+        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
+        scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
+        fc1_weighted_output = fc1_activation * scattered_gate_weight
+
+        fc2_output = group_gemm_same_nk(
+            a=fc1_weighted_output,
+            b=fc2_weight,
+            cumsum_M=cumsum_t,
+            max_M=scatter_output.shape[0],
+            transpose_a=False,
+            transpose_b=True,
+        )
+        output = moe_gather(fc2_output, scatter_index).reshape(hidden_states.shape)
+
+        ctx.swiglu_limit = swiglu_limit
+        ctx.swiglu_alpha = swiglu_alpha
+        ctx.save_for_backward(
+            gate_weights,
+            fc1_1_2_weight,
+            fc2_weight,
+            hidden_states,
+            scatter_index,
+            scatter_output,
+            cumsum_t,
+            gate,
+            up,
+            fc1_activation,
+            scattered_gate_weight,
+            fc1_weighted_output,
+            mask_gate if mask_gate is not None else torch.empty(0, device=hidden_states.device),
+            mask_up if mask_up is not None else torch.empty(0, device=hidden_states.device),
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            gate_weights,
+            fc1_1_2_weight,
+            fc2_weight,
+            hidden_states,
+            scatter_index,
+            scatter_output,
+            cumsum_t,
+            gate,
+            up,
+            fc1_activation,
+            scattered_gate_weight,
+            fc1_weighted_output,
+            mask_gate,
+            mask_up,
+        ) = ctx.saved_tensors
+        grad_output = grad_output.view(-1, grad_output.shape[-1])
+        grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        num_scattered_tokens = grad_fc2_output.shape[0]
+
+        grad_fc1_weighted_output = group_gemm_same_nk(
+            a=grad_fc2_output,
+            b=fc2_weight,
+            cumsum_M=cumsum_t,
+            max_M=num_scattered_tokens,
+            transpose_b=False,
+        )
+
+        grad_fc2_weight = None
+        if fc2_weight.requires_grad:
+            grad_fc2_weight = torch.empty_like(fc2_weight)
+            group_gemm_same_mn(
+                a=grad_fc2_output,
+                b=fc1_weighted_output,
+                c=grad_fc2_weight,
+                cumsum_K=cumsum_t,
+                max_K=num_scattered_tokens,
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
+        grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
+        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()].reshape(gate_weights.shape)
+
+        grad_gate, grad_up = swiglu_oai_backward(grad_fc1_activation, gate, up, ctx.swiglu_alpha)
+        if ctx.swiglu_limit is not None:
+            grad_gate.masked_fill_(~mask_gate, 0)
+            grad_up.masked_fill_(~mask_up, 0)
+        grad_fc1_output = torch.cat([grad_gate, grad_up], dim=-1)
+
+        grad_scatter_output = group_gemm_same_nk(
+            a=grad_fc1_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum_t,
+            max_M=num_scattered_tokens,
+            transpose_b=False,
+        )
+
+        grad_fc1_1_2_weight = None
+        if fc1_1_2_weight.requires_grad:
+            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+            group_gemm_same_mn(
+                a=grad_fc1_output,
+                b=scatter_output,
+                c=grad_fc1_1_2_weight,
+                cumsum_K=cumsum_t,
+                max_K=num_scattered_tokens,
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        grad_hidden_states = moe_gather(grad_scatter_output, scatter_index).reshape(hidden_states.shape)
+        return (
+            None,
+            grad_gate_weight,
+            None,
+            grad_hidden_states,
+            grad_fc1_1_2_weight,
+            grad_fc2_weight,
+            None,
+            None,
+        )
+
+
+class EPSwigluOaiMergedFc1GroupGemm(torch.autograd.Function):
+    """EP-local merged-fc1 GroupGEMM with SwiGLU-OAI semantics."""
+
+    @staticmethod
+    def forward(ctx, permute_tokens, cumsum, fc1_1_2_weight, fc2_weight, swiglu_limit, swiglu_alpha):
+        if fc1_1_2_weight.shape[1] % 2 != 0:
+            raise ValueError(f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}")
+        fc1_output = group_gemm_same_nk(
+            a=permute_tokens,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum,
+            max_M=permute_tokens.shape[0],
+            transpose_a=False,
+            transpose_b=True,
+        )
+        gate, up = fc1_output.chunk(2, dim=-1)
+        gate, up, mask_gate, mask_up = _apply_swiglu_clamp(gate, up, swiglu_limit)
+        fc1_result = swiglu_oai(gate, up, swiglu_alpha)
+        fc2_output = group_gemm_same_nk(
+            a=fc1_result,
+            b=fc2_weight,
+            cumsum_M=cumsum,
+            max_M=permute_tokens.shape[0],
+            transpose_a=False,
+            transpose_b=True,
+        )
+
+        ctx.swiglu_limit = swiglu_limit
+        ctx.swiglu_alpha = swiglu_alpha
+        ctx.save_for_backward(
+            permute_tokens,
+            cumsum,
+            fc1_1_2_weight,
+            fc2_weight,
+            gate,
+            up,
+            mask_gate if mask_gate is not None else torch.empty(0, device=permute_tokens.device),
+            mask_up if mask_up is not None else torch.empty(0, device=permute_tokens.device),
+        )
+        return fc2_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        permute_tokens, cumsum, fc1_1_2_weight, fc2_weight, gate, up, mask_gate, mask_up = ctx.saved_tensors
+        fc1_result = swiglu_oai(gate, up, ctx.swiglu_alpha)
+        grad_fc1_result = group_gemm_same_nk(
+            a=grad_output,
+            b=fc2_weight,
+            cumsum_M=cumsum,
+            max_M=grad_output.shape[0],
+            transpose_b=False,
+        )
+
+        grad_fc2_weight = None
+        if fc2_weight.requires_grad:
+            grad_fc2_weight = torch.empty_like(fc2_weight)
+            group_gemm_same_mn(
+                a=grad_output,
+                b=fc1_result,
+                c=grad_fc2_weight,
+                cumsum_K=cumsum,
+                max_K=grad_output.shape[0],
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        grad_gate, grad_up = swiglu_oai_backward(grad_fc1_result, gate, up, ctx.swiglu_alpha)
+        if ctx.swiglu_limit is not None:
+            grad_gate.masked_fill_(~mask_gate, 0)
+            grad_up.masked_fill_(~mask_up, 0)
+        grad_fc1_output = torch.cat([grad_gate, grad_up], dim=-1)
+
+        grad_permute_tokens = group_gemm_same_nk(
+            a=grad_fc1_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum,
+            max_M=grad_output.shape[0],
+            transpose_b=False,
+        )
+
+        grad_fc1_1_2_weight = None
+        if fc1_1_2_weight.requires_grad:
+            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+            group_gemm_same_mn(
+                a=grad_fc1_output,
+                b=permute_tokens,
+                c=grad_fc1_1_2_weight,
+                cumsum_K=cumsum,
+                max_K=grad_output.shape[0],
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        return grad_permute_tokens, None, grad_fc1_1_2_weight, grad_fc2_weight, None, None
+
+
+def group_gemm_swiglu_oai_fused_moe_forward(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor,
+    swiglu_limit: float,
+    swiglu_alpha: float,
+) -> torch.Tensor:
+    if get_parallel_state().ep_enabled:
+        return dispatch_to_ep_class(
+            EPSwigluOaiMergedFc1GroupGemm,
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_2_weight,
+            fc2_weight,
+            swiglu_limit,
+            swiglu_alpha,
+        )
+    return SwigluOaiMergedFc1TritonFusedMoeExpertFunction.apply(
+        num_experts,
+        routing_weights,
+        selected_experts,
+        hidden_states,
+        fc1_1_2_weight,
+        fc2_weight,
+        swiglu_limit,
+        swiglu_alpha,
+    )
 
 
 def group_gemm_fused_moe_forward(

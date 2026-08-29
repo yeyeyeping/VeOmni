@@ -25,6 +25,7 @@ from ....distributed.moe.moe_utils import sort_chunks_by_idxs
 from ....distributed.parallel_state import get_parallel_state
 from ....utils.device import stream_synchronize
 from ._kernels.kernel.npu_group_gemm import npu_group_gemm
+from .activation import swiglu_oai
 
 
 def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
@@ -51,6 +52,21 @@ def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
     return _clamped_swiglu(x, swiglu_limit)
 
 
+def _swiglu_oai(x: torch.Tensor, swiglu_limit: float, swiglu_alpha: float) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.clamp(max=swiglu_limit)
+    up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    return swiglu_oai(gate, up, swiglu_alpha)
+
+
+def _apply_moe_activation(x: torch.Tensor, swiglu_limit: float | None, swiglu_alpha: float | None) -> torch.Tensor:
+    if swiglu_alpha is None:
+        return _swiglu(x, swiglu_limit)
+    if swiglu_limit is None:
+        raise ValueError("SwiGLU-OAI requires swiglu_limit to be set.")
+    return _swiglu_oai(x, swiglu_limit, swiglu_alpha)
+
+
 def _npu_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -61,6 +77,7 @@ def _npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
 ) -> torch.Tensor:
     """NPU single-device fused MoE forward pass (non-EP).
 
@@ -79,7 +96,7 @@ def _npu_fused_moe_forward(
         fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
     fc1_weight = fc1_weight.transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert)
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+    intermediate_activations = _apply_moe_activation(intermediate_hidden_states, swiglu_limit, swiglu_alpha)
     output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert)
     hidden_states = torch_npu.npu_moe_token_unpermute(output, row_ids_map, probs=routing_weights)
     return hidden_states
@@ -96,6 +113,7 @@ def npu_ep_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: Optional[dist.ProcessGroup] = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
 
@@ -122,7 +140,7 @@ def npu_ep_fused_moe_forward(
         fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
     fc1_weight = fc1_weight.transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+    intermediate_activations = _apply_moe_activation(intermediate_hidden_states, swiglu_limit, swiglu_alpha)
     hidden_states = npu_group_gemm(
         intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
     )
@@ -271,3 +289,41 @@ def npu_fused_moe_forward(
             swiglu_limit=swiglu_limit,
         )
     return final_hidden_states
+
+
+def npu_swiglu_oai_fused_moe_forward(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor,
+    swiglu_limit: float,
+    swiglu_alpha: float,
+) -> torch.Tensor:
+    if get_parallel_state().ep_enabled:
+        return npu_ep_fused_moe_forward(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            None,
+            None,
+            fc2_weight,
+            fc1_1_2_weight,
+            ep_group=get_parallel_state().ep_group,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+        )
+    return _npu_fused_moe_forward(
+        num_experts,
+        routing_weights,
+        selected_experts,
+        hidden_states,
+        None,
+        None,
+        fc2_weight,
+        fc1_1_2_weight,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+    )
