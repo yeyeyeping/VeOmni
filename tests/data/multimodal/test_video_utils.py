@@ -346,7 +346,10 @@ def test_fetch_videos_metadata():
     assert "fps" in video_meta[0], "Video metadata should contain 'fps'"
     assert "total_num_frames" in video_meta[0], "Video metadata should contain 'total_num_frames'"
     assert "frames_indices" in video_meta[0], "Video metadata should contain 'frames_indices'"
-    assert video_meta[0]["total_num_frames"] == videos[0].shape[0], "Metadata frame count should match tensor"
+    with av.open(VIDEO_PATH) as container:
+        stream = container.streams.video[0]
+        assert video_meta[0]["total_num_frames"] == stream.frames
+        assert video_meta[0]["fps"] == pytest.approx(float(stream.average_rate))
 
     # Check frames_indices
     frames_indices = video_meta[0]["frames_indices"]
@@ -392,7 +395,8 @@ def test_smart_video_nframes_explicit_frames():
     assert processed_video.shape[0] == target_frames, (
         f"Expected {target_frames} frames, got {processed_video.shape[0]}"
     )
-    assert processed_meta["total_num_frames"] == target_frames
+    assert processed_meta["total_num_frames"] == video.shape[0]
+    assert len(processed_meta["frames_indices"]) == target_frames
     assert "fps" in processed_meta, "Processed metadata should contain 'fps'"
 
 
@@ -412,8 +416,9 @@ def test_smart_video_nframes_metadata():
     assert "total_num_frames" in processed_meta, "Metadata should contain 'total_num_frames'"
 
     # Check metadata accuracy
-    assert processed_meta["total_num_frames"] == processed_video.shape[0]
-    assert processed_meta["fps"] > 0, "FPS should be positive"
+    assert processed_meta["total_num_frames"] == video.shape[0]
+    assert len(processed_meta["frames_indices"]) == processed_video.shape[0]
+    assert processed_meta["fps"] == video_meta["fps"]
 
 
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
@@ -482,7 +487,10 @@ def test_load_video_metadata_structure():
     assert "fps" in video_meta, "Video metadata should contain 'fps'"
     assert "total_num_frames" in video_meta, "Video metadata should contain 'total_num_frames'"
     assert "frames_indices" in video_meta, "Video metadata should contain 'frames_indices'"
-    assert video_meta["total_num_frames"] == video.shape[0], "Metadata frame count should match tensor"
+    with av.open(VIDEO_PATH) as container:
+        stream = container.streams.video[0]
+        assert video_meta["total_num_frames"] == stream.frames
+        assert video_meta["fps"] == pytest.approx(float(stream.average_rate))
 
     # Check frames_indices
     frames_indices = video_meta["frames_indices"]
@@ -533,7 +541,8 @@ def test_frames_indices_for_qwen3vl():
     assert frames_indices is not None, "frames_indices should not be None"
     assert isinstance(frames_indices, torch.Tensor), "frames_indices should be a torch.Tensor"
     assert frames_indices.dtype == torch.long, f"frames_indices should be torch.long, got {frames_indices.dtype}"
-    assert len(frames_indices) == total_frames, "frames_indices length should match total_num_frames"
+    assert len(frames_indices) == videos[0].shape[0], "Each output frame must have a source index"
+    assert frames_indices.max() < total_frames, "Frame indices must refer to the source video"
 
     # Validate frames_indices values
     assert frames_indices.min() >= 0, "All frame indices should be >= 0"
