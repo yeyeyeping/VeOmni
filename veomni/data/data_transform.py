@@ -362,6 +362,15 @@ def _process_sample_qwen_vl_base(
     tokenized_example["mm_token_type_ids"] = mm_token_type_ids
     position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
 
+    if video_metadata is not None:
+        from ..utils.video_timing import get_video_grid_timestamps
+
+        # Qwen2.5-VL consumes source seconds; other VL position encoders ignore
+        # this kwarg and retain their model-specific temporal conventions.
+        position_id_func_kwargs["video_timestamps"] = get_video_grid_timestamps(
+            video_metadata, video_grid_thw, processor.video_processor.temporal_patch_size
+        )
+
     position_id_returns = position_id_func(**position_id_func_kwargs)
     # Squeeze position_ids to match the per-sample (no batch dim) convention
     # used everywhere else in this dict.

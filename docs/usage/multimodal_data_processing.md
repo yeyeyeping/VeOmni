@@ -92,6 +92,14 @@ and patch construction. Qwen3-VL/Qwen3.5 chat templates compute frame times as
 patch. This uses the source's average FPS; exact timing for variable-frame-rate
 containers would require retaining decoder presentation timestamps separately.
 
+Qwen2.5-VL uses each temporal patch's **first-frame time** for mRoPE, rather
+than Qwen3-VL's textual timestamp convention. The transform passes per-video
+`video_timestamps` vectors into position-ID precomputation, so frame limits,
+nonuniform intervals, and repeated padding remain on the source timeline.
+The position encoder also retains fractional `second_per_grid_ts` for legacy
+callers; conversion to integer position IDs happens after temporal scaling.
+Other Qwen-VL position encoders keep their existing temporal conventions.
+
 ### Spatial Resize Parameters
 
 | Parameter | Description |

@@ -317,6 +317,38 @@ def test_qwen_vl_transform_preserves_video_timestamps(sample_fps, max_frames):
     assert float(timestamps[-1]) > 4.0
 
 
+@pytest.mark.parametrize(
+    "fps,max_frames,expected",
+    [(2, 4, [0, 82]), (1, None, [0, 61, 124]), (4, None, [0, 13, 25, 39, 52, 65, 78, 91, 104, 117])],
+)
+def test_qwen2_5vl_training_positions_use_source_time(fps, max_frames, expected):
+    import torch
+    from transformers import Qwen2_5_VLConfig, Qwen2VLVideoProcessor
+
+    from veomni.data.data_transform import _process_sample_qwen_vl_base
+    from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
+        Qwen2_5_VLForConditionalGeneration,
+    )
+
+    config = Qwen2_5_VLConfig()
+    config.vision_config.tokens_per_second = 25
+    processor = SimpleNamespace(
+        tokenizer=_SpecialTokenTokenizer(),
+        video_processor=Qwen2VLVideoProcessor(size={"shortest_edge": 784, "longest_edge": 784}),
+    )
+    sample = {
+        "source": "LLaVA-Video-178K",
+        "videos": [{"video": torch.zeros(150, 3, 28, 28, dtype=torch.uint8).numpy(), "video_fps": 30}],
+        "conversations": [{"from": "human", "value": "<image>\nDescribe."}],
+    }
+    position_ids = Qwen2_5_VLForConditionalGeneration.get_position_id_func(SimpleNamespace(config=config))
+    result = _process_sample_qwen_vl_base(
+        sample, processor, build_chat_template("qwen2_5vl", processor), position_ids, fps=fps, max_frames=max_frames
+    )[0]
+    temporal = result["position_ids"][0, result["video_mask"]]
+    assert (temporal - temporal[0]).tolist() == expected
+
+
 # Frame/token pairs read off the real Qwen3VLVideoProcessor (temporal_patch_size=2,
 # merge_size=2) at 128x128: the processor pads an odd frame count up, so 15 and 16
 # frames both yield grid_t=8 and 128 tokens.

@@ -19,6 +19,7 @@ patchgen veomni.models.transformers.qwen2_5vl.qwen2_5_vl_gpu_patch_gen_config -o
 """
 
 import copy
+import itertools
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable
@@ -61,6 +62,7 @@ config = PatchConfig(
 )
 
 config.add_import("copy", is_from_import=False)
+config.add_import("itertools", is_from_import=False)
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
@@ -794,6 +796,70 @@ def mm_token_type_ids_from_input_ids(input_ids, config):
     mm_token_type_ids[input_ids == config.image_token_id] = 1
     mm_token_type_ids[input_ids == config.video_token_id] = 2
     return mm_token_type_ids
+
+
+@config.override_method("Qwen2_5_VLModel.get_rope_index")
+def qwen2_5_vl_get_rope_index_patched(
+    self,
+    input_ids,
+    mm_token_type_ids,
+    image_grid_thw=None,
+    video_grid_thw=None,
+    second_per_grid_ts=None,
+    attention_mask=None,
+    video_timestamps=None,
+    **kwargs,
+):
+    """Build mRoPE positions using source patch times when supplied.
+
+    ``video_timestamps`` is one vector of patch-start seconds per video, in
+    video-grid order. Legacy callers can still supply ``second_per_grid_ts``;
+    fractional seconds must survive until the final position quantization.
+    """
+    merge = self.config.vision_config.spatial_merge_size
+    tokens_per_second = self.config.vision_config.tokens_per_second
+    position_ids = torch.zeros(3, *input_ids.shape, dtype=input_ids.dtype, device=input_ids.device)
+    grids = {
+        1: iter(image_grid_thw) if image_grid_thw is not None else None,
+        2: iter(video_grid_thw) if video_grid_thw is not None else None,
+    }
+    intervals = iter(second_per_grid_ts) if second_per_grid_ts is not None else itertools.repeat(1.0)
+    timestamps = iter(video_timestamps) if video_timestamps is not None else None
+    deltas = []
+    for batch_index, ids in enumerate(input_ids):
+        types = mm_token_type_ids[batch_index]
+        mask = attention_mask[batch_index].bool() if attention_mask is not None else None
+        if mask is not None:
+            ids, types = ids[mask], types[mask]
+        current_pos = 0
+        positions = []
+        for modality, group in itertools.groupby(types.tolist()):
+            count = len(list(group))
+            if modality == 0:
+                positions.append(torch.arange(count, device=ids.device).expand(3, -1) + current_pos)
+                current_pos += count
+                continue
+            grid = next(grids[modality])
+            interval = tokens_per_second * float(next(intervals)) if modality == 2 and timestamps is None else 1
+            vision_positions = self.get_vision_position_ids(current_pos, grid, 1, merge, interval, device=ids.device)
+            if modality == 2 and timestamps is not None:
+                times = torch.as_tensor(next(timestamps), dtype=torch.float64, device=ids.device)
+                if times.ndim != 1 or times.numel() != int(grid[0]):
+                    raise ValueError("Video timestamps must match the temporal grid.")
+                spatial_tokens = int(grid[1] * grid[2]) // merge**2
+                vision_positions[0] = (times * tokens_per_second).long().repeat_interleave(
+                    spatial_tokens
+                ) + current_pos
+            positions.append(vision_positions)
+            # Preserve the upstream spatial/text offset convention.
+            current_pos += max(grid[1], grid[2]) // merge
+        positions = torch.cat(positions, dim=1).long()
+        if mask is None:
+            position_ids[:, batch_index] = positions
+        else:
+            position_ids[:, batch_index, mask] = positions
+        deltas.append(positions.max() + 1 - len(ids))
+    return position_ids, torch.stack(deltas).unsqueeze(1)
 
 
 @config.add_helper
