@@ -431,7 +431,7 @@ def process_sample_qwen_omni(
     from .multimodal import conv_preprocess
     from .multimodal.audio_utils import fetch_audios
     from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos
+    from .multimodal.video_utils import fetch_videos_metadata
 
     QWEN_OMNI_SYSTEM_MESSAGE = (
         "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
@@ -482,9 +482,10 @@ def process_sample_qwen_omni(
 
     videos = sample.get("videos", [])
     if videos:
-        videos, video_audios = fetch_videos(videos, **kwargs)
+        videos, video_metadata, video_audios, _ = fetch_videos_metadata(videos, **kwargs)
     else:
         videos, video_audios = [], []
+        video_metadata = None
 
     audios = sample.get("audios", [])
     if audios:
@@ -507,6 +508,8 @@ def process_sample_qwen_omni(
         audios=audios,
         images=images,
         videos=videos,
+        video_metadata=video_metadata,
+        do_sample_frames=False,
         return_tensors="pt",
         padding=True,
     )
@@ -539,6 +542,7 @@ def process_sample_qwen_omni(
         attention_mask=model_inputs["attention_mask"],
         audio_seqlens=audio_feature_lengths,
         second_per_grids=model_inputs.pop("video_second_per_grid", None),
+        video_timestamps=model_inputs.pop("video_timestamps", None),
     )
     position_id_returns["position_ids"] = position_id_returns["position_ids"].clone()
     # Only position_ids is propagated — rope_deltas is generation-only; see

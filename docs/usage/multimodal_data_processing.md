@@ -100,6 +100,15 @@ The position encoder also retains fractional `second_per_grid_ts` for legacy
 callers; conversion to integer position IDs happens after temporal scaling.
 Other Qwen-VL position encoders keep their existing temporal conventions.
 
+Qwen2.5-Omni and Qwen3-Omni also retain source metadata and disable processor
+resampling. Their custom processors use the first frame of each temporal patch
+for both audio/video token interleaving and mRoPE. They return `video_timestamps`
+as a list of per-video tensors, allowing different clip lengths and repeated
+padding without inventing a uniform output FPS. The transform consumes these
+vectors during position-ID precomputation; they are not packed by the collator.
+Direct processor callers without `video_metadata` retain the legacy
+`video_second_per_grid` interface and must supply an appropriate `fps`.
+
 ### Spatial Resize Parameters
 
 | Parameter | Description |

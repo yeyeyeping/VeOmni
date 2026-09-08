@@ -32,6 +32,8 @@ from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import (
 )
 from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import Qwen2_5OmniProcessor as _Qwen2_5OmniProcessor
 
+from veomni.utils.video_timing import get_video_grid_timestamps, get_video_time_positions
+
 
 # ================================================================
 # Patch: Qwen2_5OmniProcessor
@@ -77,6 +79,8 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
         if text is None:
             raise ValueError("You need to specify either a `text` input to process.")
 
+        video_metadata = kwargs.pop("video_metadata", None)
+        video_timestamps = None
         output_kwargs = self._merge_kwargs(
             Qwen2_5OmniProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
@@ -117,16 +121,26 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
             image_grid_thw = iter([])
 
         if videos:
+            if video_metadata is not None:
+                output_kwargs["videos_kwargs"].update(
+                    video_metadata=video_metadata, do_sample_frames=False, return_metadata=True
+                )
             videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
+            sampled_metadata = videos_inputs.pop("video_metadata", None)
 
             # --- Patch.2 ---
-            # TODO: fps parse from args
+            # Legacy callers without source metadata use their declared frame rate.
             fps = output_kwargs["videos_kwargs"].get("fps", 2.0)
             # --- Patch.2 ---
 
             video_grid_thw = videos_inputs["video_grid_thw"]
             second_per_grid_ts = [self.video_processor.temporal_patch_size / fps] * len(video_grid_thw)
-            videos_inputs["video_second_per_grid"] = second_per_grid_ts
+            if video_metadata is not None:
+                video_timestamps = get_video_grid_timestamps(
+                    sampled_metadata, video_grid_thw, self.video_processor.temporal_patch_size
+                )
+            else:
+                videos_inputs["video_second_per_grid"] = second_per_grid_ts
 
             video_grid_thw = iter(video_grid_thw)
             video_second_per_grid = iter(second_per_grid_ts)
@@ -147,15 +161,20 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
             video_second_per_grid=video_second_per_grid,
             position_id_per_seconds=position_id_per_seconds,
             seconds_per_chunk=seconds_per_chunk,
+            video_timestamps=video_timestamps,
         )
         # --- Patch.2 ---
 
         texts_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
 
-        return BatchFeature(
+        result = BatchFeature(
             data={**texts_inputs, **images_inputs, **videos_inputs, **audio_inputs},
             tensor_type=kwargs.get("return_tensors"),
         )
+        # Video lengths vary: keep these vectors out of BatchFeature's tensor stacking.
+        if video_timestamps is not None:
+            result["video_timestamps"] = video_timestamps
+        return result
 
     def replace_multimodal_special_tokens(
         self,
@@ -169,10 +188,12 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
         # --- Patch.2 ---
         position_id_per_seconds,
         seconds_per_chunk,
+        video_timestamps=None,
     ):
         # Extend mm token length
         merge_length_image = self.image_processor.merge_size**2
         merge_length_video = self.video_processor.merge_size**2
+        timestamp_iter = iter(video_timestamps) if video_timestamps is not None else None
 
         processed_text = []
         for sample in text:
@@ -189,27 +210,31 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
                     image_seq_length = next(image_grid_thw).prod() // merge_length_image
                     sample = sample.replace(self.image_token, "<|image_placeholder|>" * image_seq_length, 1)
                 elif special_token == self.video_token:
+                    curr_video_grid_thw = next(video_grid_thw)
+                    # Consume timing for every video, including silent videos.
+                    time_positions = get_video_time_positions(
+                        curr_video_grid_thw[0],
+                        position_id_per_seconds,
+                        timestamps=next(timestamp_iter) if timestamp_iter is not None else None,
+                        seconds_per_grid=next(video_second_per_grid),
+                    )
                     # --- Patch.2 ---
                     audio_length = next(audio_lengths)
                     use_audio_in_video = audio_length != 0
                     # --- Patch.2 ---
                     if not use_audio_in_video:
-                        video_seq_length = next(video_grid_thw).prod() // merge_length_video
+                        video_seq_length = curr_video_grid_thw.prod() // merge_length_video
                         sample = sample.replace(self.video_token, "<|video_placeholder|>" * video_seq_length, 1)
                     else:
                         # --- Patch.2 ---
                         audio_token_indices = np.arange(audio_length)
                         # --- Patch.2 ---
-                        curr_video_grid_thw = next(video_grid_thw)
                         height = curr_video_grid_thw[1] // self.video_processor.merge_size
                         width = curr_video_grid_thw[2] // self.video_processor.merge_size
-                        video_token_indices = np.arange(curr_video_grid_thw[0]).reshape(-1, 1, 1)
+                        video_token_indices = time_positions.numpy().reshape(-1, 1, 1)
                         video_token_indices = np.broadcast_to(
                             video_token_indices, (video_token_indices.shape[0], height, width)
                         ).reshape(-1)
-                        video_token_indices = (
-                            video_token_indices * next(video_second_per_grid) * position_id_per_seconds
-                        )
 
                         tokens_per_chunk = int(position_id_per_seconds * seconds_per_chunk)
                         video_chunk_indexes = self.get_chunked_index(video_token_indices, tokens_per_chunk)

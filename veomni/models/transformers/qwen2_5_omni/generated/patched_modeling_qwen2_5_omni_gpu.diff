@@ -123,7 +123,7 @@
      TransformersKwargs,
      auto_docstring,
      can_return_tuple,
-@@ -51,27 +91,180 @@
+@@ -51,27 +91,181 @@
      logging,
      torch_compilable_check,
  )
@@ -165,6 +165,7 @@
 +from veomni.ops.dispatch import OpSlot
 +from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
++from veomni.utils.video_timing import get_video_time_positions
 +
 +
 +veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -320,7 +321,7 @@
 
 
  logger = logging.get_logger(__name__)
-@@ -121,6 +314,12 @@
+@@ -121,6 +315,12 @@
      normalized_filter /= normalized_filter.sum()
 
      return normalized_filter.view(1, 1, kernel_size)
@@ -333,7 +334,7 @@
 
 
  @auto_docstring
-@@ -136,22 +335,36 @@
+@@ -136,22 +336,36 @@
      _can_compile_fullgraph = False
      _supports_attention_backend = True
 
@@ -382,7 +383,7 @@
 
 
  class Qwen2_5OmniPreTrainedModelForConditionalGeneration(Qwen2_5OmniPreTrainedModel):
-@@ -214,73 +427,28 @@
+@@ -214,73 +428,29 @@
 
          return list(_iter())
 
@@ -414,6 +415,7 @@
 +        # --- Patch.1 ---
 +        audio_seqlens: Optional[torch.LongTensor] = None,
 +        second_per_grids: Optional[torch.Tensor] = None,
++        video_timestamps: Optional[list[torch.Tensor]] = None,
      ) -> tuple[torch.Tensor, torch.Tensor]:
 -        """
 -        Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
@@ -475,7 +477,7 @@
          spatial_merge_size = self.spatial_merge_size
          image_token_id = self.config.image_token_id
          video_token_id = self.config.video_token_id
-@@ -289,12 +457,14 @@
+@@ -289,12 +459,14 @@
          audio_start_token_id = self.config.audio_start_token_id
          position_id_per_seconds = self.config.position_id_per_seconds
          seconds_per_chunk = self.config.seconds_per_chunk
@@ -493,7 +495,7 @@
              position_ids = torch.ones(
                  3,
                  input_ids.shape[0],
-@@ -304,25 +474,28 @@
+@@ -304,25 +476,28 @@
              )
              image_idx, video_idx, audio_idx = 0, 0, 0
              for i, input_ids in enumerate(total_input_ids):
@@ -533,7 +535,7 @@
                  for _ in range(multimodal_nums):
                      st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                      if image_token_id in input_tokens and remain_images > 0:
-@@ -390,94 +563,108 @@
+@@ -390,94 +565,110 @@
                          image_idx += 1
                          remain_images -= 1
 
@@ -646,10 +648,11 @@
 +                            grid_t = video_grid_thw[video_idx][0]
 +                            grid_hs = video_grid_thw[:, 1]
 +                            grid_ws = video_grid_thw[:, 2]
-+                            t_index = (
-+                                torch.arange(grid_t)
-+                                * second_per_grids[video_idx].cpu().float()
-+                                * position_id_per_seconds
++                            t_index = get_video_time_positions(
++                                grid_t,
++                                position_id_per_seconds,
++                                timestamps=video_timestamps[video_idx] if video_timestamps is not None else None,
++                                seconds_per_grid=second_per_grids[video_idx] if second_per_grids is not None else None,
 +                            ).long()
 +                            llm_pos_ids = self.get_llm_pos_ids_for_vision(
 +                                st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
@@ -683,10 +686,11 @@
 +                            grid_hs = video_grid_thw[:, 1]
 +                            grid_ws = video_grid_thw[:, 2]
 +
-+                            t_index = (
-+                                torch.arange(grid_t)
-+                                * second_per_grids[video_idx].cpu().float()
-+                                * position_id_per_seconds
++                            t_index = get_video_time_positions(
++                                grid_t,
++                                position_id_per_seconds,
++                                timestamps=video_timestamps[video_idx] if video_timestamps is not None else None,
++                                seconds_per_grid=second_per_grids[video_idx] if second_per_grids is not None else None,
 +                            ).long()
 +                            video_llm_pos_ids = self.get_llm_pos_ids_for_vision(
 +                                st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
@@ -728,7 +732,7 @@
 
                  if st < len(input_tokens):
                      st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-@@ -485,11 +672,9 @@
+@@ -485,11 +676,9 @@
                      llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
                  llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
@@ -743,7 +747,7 @@
                  mrope_position_deltas.append(llm_positions.max() + 1 - len(input_ids))
              mrope_position_deltas = torch.tensor(mrope_position_deltas).unsqueeze(1).to(device=input_ids.device)
 
-@@ -836,6 +1021,12 @@
+@@ -836,6 +1025,12 @@
      return pair_offsets + local_indices * 2
 
 
@@ -756,7 +760,7 @@
  @auto_docstring(
      custom_intro="""
      Transformer encoder consisting of *config.encoder_layers* self attention layers. Each layer is a
-@@ -885,40 +1076,102 @@
+@@ -885,40 +1080,102 @@
      def set_input_embeddings(self, value: nn.Module):
          self.conv1 = value
 
@@ -877,7 +881,7 @@
              layer_outputs = encoder_layer(
                  hidden_states,
                  cu_seqlens=cu_seqlens,
-@@ -926,10 +1179,29 @@
+@@ -926,10 +1183,29 @@
              )
              hidden_states = layer_outputs[0]
 
@@ -911,7 +915,7 @@
 
      # Ignore copy
      def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
-@@ -982,6 +1254,50 @@
+@@ -982,6 +1258,50 @@
              batch_mask.unsqueeze(1),
              batch_mask_after_cnn.bool(),
          )
@@ -962,7 +966,7 @@
 
 
  def rotate_half(x):
-@@ -1001,6 +1317,12 @@
+@@ -1001,6 +1321,12 @@
      output = (tensor * cos) + (rotate_half(tensor) * sin)
      output = output.to(orig_dtype)
      return output
@@ -975,7 +979,7 @@
 
 
  class Qwen2_5OmniVisionAttention(nn.Module):
-@@ -1019,11 +1341,19 @@
+@@ -1019,11 +1345,19 @@
          self.attention_dropout = 0.0
          self.is_causal = False
 
@@ -996,7 +1000,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -1037,12 +1367,12 @@
+@@ -1037,12 +1371,12 @@
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
 
@@ -1015,7 +1019,7 @@
              max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
              attn_output, _ = attention_interface(
                  self,
-@@ -1060,7 +1390,7 @@
+@@ -1060,7 +1394,7 @@
                  **kwargs,
              )
          else:
@@ -1024,7 +1028,7 @@
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
                  torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-@@ -1081,6 +1411,7 @@
+@@ -1081,6 +1415,7 @@
                  for q, k, v in zip(*splits)
              ]
              attn_output = torch.cat(attn_outputs, dim=1)
@@ -1032,7 +1036,7 @@
 
          attn_output = attn_output.reshape(seq_length, -1).contiguous()
          attn_output = self.proj(attn_output)
-@@ -1210,6 +1541,12 @@
+@@ -1210,6 +1545,12 @@
          return x
 
 
@@ -1045,7 +1049,7 @@
  class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
      config: Qwen2_5OmniVisionEncoderConfig
      _no_split_modules = ["Qwen2_5OmniVisionBlock"]
-@@ -1271,12 +1608,27 @@
+@@ -1271,12 +1612,27 @@
          )
          return window_index, cu_window_seqlens.tolist()
 
@@ -1075,7 +1079,7 @@
          Args:
              hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
                  The final hidden states of the model.
-@@ -1284,32 +1636,127 @@
+@@ -1284,32 +1640,127 @@
                  The temporal, height and width of feature shape of each image in LLM.
 
          Returns:
@@ -1217,7 +1221,7 @@
          for layer_num, blk in enumerate(self.blocks):
              if layer_num in self.fullatt_block_indexes:
                  cu_seqlens_now = cu_seqlens
-@@ -1324,12 +1771,64 @@
+@@ -1324,12 +1775,64 @@
              )
 
          merged_hidden_states = self.merger(hidden_states)
@@ -1282,7 +1286,7 @@
 
 
  class Qwen2_5OmniRotaryEmbedding(nn.Module):
-@@ -1726,6 +2225,12 @@
+@@ -1726,6 +2229,12 @@
          )
 
 
@@ -1295,7 +1299,7 @@
  @auto_docstring(
      custom_intro="""
      The Qwen2.5OmniThinker model which consists of a audio backbone and a language model.
-@@ -1790,40 +2295,33 @@
+@@ -1790,40 +2299,33 @@
          pixel_values = pixel_values.type(self.visual.dtype)
          return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
 
@@ -1354,7 +1358,7 @@
 
      def get_placeholder_mask(
          self,
-@@ -1875,133 +2373,204 @@
+@@ -1875,145 +2377,225 @@
          special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
          return special_image_mask, special_video_mask, special_audio_mask
 
@@ -1425,6 +1429,7 @@
 +        # --- Patch.1 ---
 +        cache_position: Optional[torch.LongTensor] = None,
 +        video_second_per_grid: Optional[torch.LongTensor] = None,
++        video_timestamps: Optional[list[torch.Tensor]] = None,
          **kwargs: Unpack[TransformersKwargs],
 -    ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithPast:
 +    ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithLogProbs:
@@ -1486,6 +1491,8 @@
 -        >>> response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 -        ```"""
 -
++        video_timestamps (`list[torch.Tensor]`, *optional*):
++            Source patch-start seconds per video; takes precedence over constant intervals.
 +        """
          if inputs_embeds is None:
 -            # 1. Extract the input embeddings
@@ -1642,8 +1649,9 @@
 -                    use_audio_in_video,
                      audio_feature_lengths,
                      video_second_per_grid,
++                    video_timestamps=video_timestamps,
                  )
-@@ -2009,11 +2578,16 @@
+                 rope_deltas = rope_deltas - delta0
                  self.rope_deltas = rope_deltas
              else:
                  batch_size, seq_length = input_ids.shape
@@ -1661,7 +1669,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2021,27 +2595,61 @@
+@@ -2021,27 +2603,61 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1733,7 +1741,7 @@
 
      def prepare_inputs_for_generation(
          self,
-@@ -2090,860 +2698,54 @@
+@@ -2090,860 +2706,54 @@
 
          return model_inputs
 
@@ -2642,7 +2650,7 @@
 
 
  # Modified from Llama with a different rotate function, will fixed in next release
-@@ -2980,708 +2782,10 @@
+@@ -2980,708 +2790,10 @@
      return q_embed, k_embed
 
 
@@ -3355,7 +3363,7 @@
 
 
  ############################
-@@ -3708,22 +2812,74 @@
+@@ -3708,22 +2820,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3440,7 +3448,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3785,244 +2941,71 @@
+@@ -3785,244 +2949,71 @@
 
          return model
 

@@ -82,6 +82,7 @@ from veomni.utils.constants import (
     VIDEO_INPUT_INDEX,
 )
 from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
+from veomni.utils.video_timing import get_video_time_positions
 
 
 config = PatchConfig(
@@ -95,6 +96,7 @@ config = PatchConfig(
 # Additional imports needed by the patched methods in the generated file
 # ================================================================
 config.add_import("copy", is_from_import=False)
+config.add_import("veomni.utils.video_timing", names=["get_video_time_positions"])
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.nn.functional", alias="F", is_from_import=False)
@@ -237,6 +239,7 @@ def qwen2_5_omni_get_rope_index_patched(
     # --- Patch.1 ---
     audio_seqlens: Optional[torch.LongTensor] = None,
     second_per_grids: Optional[torch.Tensor] = None,
+    video_timestamps: Optional[list[torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     spatial_merge_size = self.spatial_merge_size
     image_token_id = self.config.image_token_id
@@ -375,8 +378,11 @@ def qwen2_5_omni_get_rope_index_patched(
                         grid_t = video_grid_thw[video_idx][0]
                         grid_hs = video_grid_thw[:, 1]
                         grid_ws = video_grid_thw[:, 2]
-                        t_index = (
-                            torch.arange(grid_t) * second_per_grids[video_idx].cpu().float() * position_id_per_seconds
+                        t_index = get_video_time_positions(
+                            grid_t,
+                            position_id_per_seconds,
+                            timestamps=video_timestamps[video_idx] if video_timestamps is not None else None,
+                            seconds_per_grid=second_per_grids[video_idx] if second_per_grids is not None else None,
                         ).long()
                         llm_pos_ids = self.get_llm_pos_ids_for_vision(
                             st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
@@ -410,8 +416,11 @@ def qwen2_5_omni_get_rope_index_patched(
                         grid_hs = video_grid_thw[:, 1]
                         grid_ws = video_grid_thw[:, 2]
 
-                        t_index = (
-                            torch.arange(grid_t) * second_per_grids[video_idx].cpu().float() * position_id_per_seconds
+                        t_index = get_video_time_positions(
+                            grid_t,
+                            position_id_per_seconds,
+                            timestamps=video_timestamps[video_idx] if video_timestamps is not None else None,
+                            seconds_per_grid=second_per_grids[video_idx] if second_per_grids is not None else None,
                         ).long()
                         video_llm_pos_ids = self.get_llm_pos_ids_for_vision(
                             st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
@@ -1107,6 +1116,7 @@ def qwen2_5_omni_thinker_forward_patched(
     # --- Patch.1 ---
     cache_position: Optional[torch.LongTensor] = None,
     video_second_per_grid: Optional[torch.LongTensor] = None,
+    video_timestamps: Optional[list[torch.Tensor]] = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithLogProbs:
     r"""
@@ -1122,6 +1132,8 @@ def qwen2_5_omni_thinker_forward_patched(
         The rope index difference between sequence length and multimodal rope.
     video_second_per_grid (`torch.LongTensor` of shape `(num_videos)`, *optional*):
         Number of seconds per grid for each video, used for temporal feature mapping.
+    video_timestamps (`list[torch.Tensor]`, *optional*):
+        Source patch-start seconds per video; takes precedence over constant intervals.
     """
     if inputs_embeds is None:
         inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -1257,6 +1269,7 @@ def qwen2_5_omni_thinker_forward_patched(
                 attention_mask,
                 audio_feature_lengths,
                 video_second_per_grid,
+                video_timestamps=video_timestamps,
             )
             rope_deltas = rope_deltas - delta0
             self.rope_deltas = rope_deltas

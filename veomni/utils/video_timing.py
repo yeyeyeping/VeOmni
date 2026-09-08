@@ -32,3 +32,21 @@ def get_video_grid_timestamps(video_metadata, video_grid_thw, temporal_patch_siz
             raise ValueError("Sampled frame indices do not match the processor's temporal grid.")
         timestamps.append(times)
     return timestamps
+
+
+def get_video_time_positions(num_patches, positions_per_second, timestamps=None, seconds_per_grid=None):
+    """Scale patch times identically for Omni token ordering and mRoPE.
+
+    Explicit timestamps take precedence over the legacy constant interval.
+    Keep the float32 positions used by Omni; Qwen2.5-Omni subsequently
+    quantizes them to integers, while Qwen3-Omni retains fractions.
+    """
+    if timestamps is None:
+        if seconds_per_grid is None:
+            raise ValueError("Video positions require timestamps or seconds_per_grid.")
+        times = torch.arange(int(num_patches), dtype=torch.float64) * float(seconds_per_grid)
+    else:
+        times = torch.as_tensor(timestamps, dtype=torch.float64, device="cpu")
+        if times.ndim != 1 or times.numel() != int(num_patches):
+            raise ValueError("Video timestamps must match the temporal grid.")
+    return (times * positions_per_second).float()
