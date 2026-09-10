@@ -355,6 +355,12 @@ def _process_sample_qwen_vl_base(
         "video_grid_thw": video_grid_thw,
         "attention_mask": attention_mask.unsqueeze(0),
     }
+    if video_metadata is not None and "second_per_grid_ts" in getattr(processor, "model_input_names", ()):
+        # We bypass Qwen2.5-VLProcessor.__call__, which normally supplies this.
+        # sampled_fps accounts for frame limits and differs from the source FPS.
+        position_id_func_kwargs["second_per_grid_ts"] = [
+            processor.video_processor.temporal_patch_size / metadata.sampled_fps for metadata in video_metadata
+        ]
 
     mm_token_type_ids = torch.zeros_like(input_ids)
     mm_token_type_ids[tokenized_example["image_mask"]] = 1

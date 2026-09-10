@@ -92,6 +92,12 @@ and patch construction. Qwen3-VL/Qwen3.5 chat templates compute frame times as
 patch. This uses the source's average FPS; exact timing for variable-frame-rate
 containers would require retaining decoder presentation timestamps separately.
 
+Qwen2.5-VL position precomputation receives `second_per_grid_ts`, calculated as
+`temporal_patch_size / sampled_fps` for each video, matching its Hugging Face
+processor. The sampled FPS accounts for frame-count limits; it is not the source
+FPS or necessarily the requested `mm_configs.fps`. This value is consumed before
+packing, since training receives the resulting `position_ids` directly.
+
 ### Spatial Resize Parameters
 
 | Parameter | Description |

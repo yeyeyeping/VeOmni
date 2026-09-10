@@ -272,22 +272,26 @@ def _video_metadata(total_num_frames, fps=2.0, frames_indices=None):
     )
 
 
-@pytest.mark.parametrize("sample_fps,max_frames", [(2.0, 4), (2.0, None), (1.0, None)])
-def test_qwen_vl_transform_preserves_video_timestamps(sample_fps, max_frames):
+@pytest.mark.parametrize("model_family", ["qwen2_5vl", "qwen3vl"])
+@pytest.mark.parametrize("sample_fps,max_frames", [(2.0, 4), (2.0, None), (1.0, None), (4.0, None)])
+def test_qwen_vl_transform_preserves_video_timestamps(sample_fps, max_frames, model_family):
     import re
 
     import torch
-    from transformers import Qwen3VLVideoProcessor
+    from transformers import Qwen2VLVideoProcessor, Qwen3VLVideoProcessor
 
     from veomni.data.data_transform import _process_sample_qwen_vl_base
 
     # Five seconds at 30 FPS. Each frame's pixels identify its source index.
     frames = torch.arange(150, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 32, 32).numpy()
+    is_qwen2_5 = model_family == "qwen2_5vl"
+    video_processor_cls = Qwen2VLVideoProcessor if is_qwen2_5 else Qwen3VLVideoProcessor
     processor = SimpleNamespace(
         tokenizer=_SpecialTokenTokenizer(),
-        video_processor=Qwen3VLVideoProcessor(size={"shortest_edge": 32 * 32, "longest_edge": 32 * 32}),
+        video_processor=video_processor_cls(size={"shortest_edge": 32 * 32, "longest_edge": 32 * 32}),
+        model_input_names=["second_per_grid_ts"] if is_qwen2_5 else [],
     )
-    template = build_chat_template("qwen3vl", processor)
+    template = build_chat_template("qwen2vl" if is_qwen2_5 else "qwen3vl", processor)
     sample = {
         "source": "LLaVA-Video-178K",
         "videos": [{"video": frames, "video_fps": 30.0}],
@@ -295,11 +299,21 @@ def test_qwen_vl_transform_preserves_video_timestamps(sample_fps, max_frames):
     }
 
     def position_ids(**kwargs):
+        if is_qwen2_5:
+            # The clip lasts five seconds; a frame cap changes effective FPS.
+            sampled_frames = min(int(5 * sample_fps), max_frames or int(5 * sample_fps))
+            assert kwargs["second_per_grid_ts"] == pytest.approx([2 * 5 / sampled_frames])
+        else:
+            assert "second_per_grid_ts" not in kwargs
         return {"position_ids": torch.arange(kwargs["input_ids"].shape[-1]).view(1, 1, -1)}
 
     result = _process_sample_qwen_vl_base(
         sample, processor, template, position_ids, fps=sample_fps, max_frames=max_frames
     )[0]
+    if is_qwen2_5:
+        # Timing is consumed during position precompute, not packed as a model input.
+        assert "second_per_grid_ts" not in result
+        return
     decoded = "".join(chr(i - 1000) for i in result["input_ids"].tolist() if i >= 1000)
     timestamps = re.findall(r"<([\d.]+) seconds>", decoded)
     # Recover the selected frames independently from processor pixel output.
