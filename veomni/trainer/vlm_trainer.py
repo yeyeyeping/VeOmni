@@ -34,7 +34,7 @@ from ..utils import helper
 from ..utils.device import get_device_type, synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, VeOmniIter
+from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
 
 
 logger = helper.create_logger(__name__)
@@ -157,8 +157,8 @@ class VLMTrainer:
         self.base.model = build_foundation_model(
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
-            torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=args.train.init_device,
+            torch_dtype="float32" if args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+            init_device=args.model.accelerator.init_device,
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
             ops_implementation=args.model.ops_implementation,
@@ -168,12 +168,15 @@ class VLMTrainer:
 
     def _validate_torch_compile(self):
         args: VeOmniVLMArguments = self.base.args
-        if not args.train.torch_compile.enable:
+        if not args.model.accelerator.torch_compile.enable:
             return
 
-        accelerator = args.train.accelerator
+        accelerator = args.model.accelerator
         compile_config = CompileConfig(
-            **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
+            **{
+                field.name: getattr(args.model.accelerator.torch_compile, field.name)
+                for field in fields(CompileConfig)
+            }
         )
         validate_compile_model(
             self.base.model,
@@ -301,18 +304,19 @@ class VLMTrainer:
         if vit_params:
             param_groups.append({"params": vit_params, "lr": args.train.vit_lr})
         if other_params:
-            param_groups.append({"params": other_params, "lr": args.train.optimizer.lr})
+            param_groups.append({"params": other_params, "lr": args.model.optimizer.lr})
 
         self.base.optimizer = build_optimizer(
             self.base.model,
-            lr=args.train.optimizer.lr,
-            weight_decay=args.train.optimizer.weight_decay,
+            lr=args.model.optimizer.lr,
+            betas=args.model.optimizer.betas,
+            weight_decay=args.model.optimizer.weight_decay,
             fused=True,
-            optimizer_type=args.train.optimizer.type,
+            optimizer_type=args.model.optimizer.type,
             param_groups=param_groups,
-            no_decay_modules=args.train.optimizer.no_decay_modules,
-            no_decay_params=args.train.optimizer.no_decay_params,
-            optimizer_config=args.train.optimizer,
+            no_decay_modules=args.model.optimizer.no_decay_modules,
+            no_decay_params=args.model.optimizer.no_decay_params,
+            optimizer_config=args.model.optimizer,
         )
 
     def on_train_begin(self):
@@ -330,8 +334,8 @@ class VLMTrainer:
     def on_step_begin(self, micro_batches=None):
         self.base.on_step_begin(micro_batches=micro_batches)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
 
     def train_step(
         self,
@@ -342,6 +346,7 @@ class VLMTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
+        self.base._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
@@ -349,6 +354,7 @@ class VLMTrainer:
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
+        total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
         self.base.micro_batches_token_len = count_loss_token(micro_batches)
@@ -361,24 +367,32 @@ class VLMTrainer:
             self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
+            aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
             self.base.micro_batch_token_len = count_loss_token(micro_batch)
-            loss, loss_dict = self.base.forward_backward_step(micro_batch)
+            loss, loss_dict, aux_metrics = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
+            for k, v in aux_metrics.items():
+                total_aux_metrics[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()
         self.base.lr_scheduler.step()
         self.base.optimizer.zero_grad()
 
-        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+        self.on_step_end(
+            loss=total_loss,
+            loss_dict=total_loss_dict,
+            grad_norm=grad_norm,
+            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+        )
 
     def train(self):
         args: VeOmniVLMArguments = self.base.args

@@ -59,7 +59,11 @@ def _prepare_vlm_media_inputs(
     if sample.get("videos"):
         videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
         video_inputs = processor.video_processor(
-            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
+            videos=videos,
+            video_metadata=metadata,
+            do_sample_frames=False,
+            return_tensors="pt",
+            return_metadata=True,
         )
         video_metadata = video_inputs.pop("video_metadata", None)
 

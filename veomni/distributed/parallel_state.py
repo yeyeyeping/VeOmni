@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
+    from ..arguments import AcceleratorConfig
+
 
 logger = logging.get_logger(__name__)
 
@@ -78,8 +80,20 @@ class ParallelState:
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
-        if self.cp_size > 1:
-            raise NotImplementedError("Ring attention is not supported yet.")
+        # The product check below cannot catch a negative cp_size on its own: a
+        # caller passing dp_size=-1 alongside cp_size=-1 lands on a product of +1,
+        # so an invalid topology would be admitted with CP reported as disabled.
+        # TrainingArguments validates this too, but a ParallelState can be built
+        # directly, which is how a per-module state under use_parallel_state is made.
+        if self.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         if self.pp_size * self.dp_size * self.cp_size * self.ulysses_size * self.tp_size != self.world_size:
             raise ValueError("The product of parallel sizes should be equal to the world size.")
@@ -100,7 +114,8 @@ class ParallelState:
         if self.sp_enabled and self.device_mesh is None:
             raise ValueError(
                 "A sequence-parallel ParallelState must be built with a device mesh "
-                "(use init_parallel_state); meshless sequence-parallel init is no longer supported."
+                "(use init_parallel_state_from_config); meshless sequence-parallel init "
+                "is no longer supported."
             )
 
     @property
@@ -424,7 +439,7 @@ def clear_parallel_state() -> None:
     Drop the ambient state, topology cache, and named registry.
 
     Call after ``destroy_process_group()`` (or in test teardown) so a later
-    ``init_parallel_state`` with the same topology cannot reuse DeviceMesh /
+    ``_init_parallel_state`` with the same topology cannot reuse DeviceMesh /
     process groups from a destroyed distributed session.
     """
     global _PARALLEL_STATE
@@ -441,7 +456,7 @@ def get_parallel_state_by_name(name: str) -> "ParallelState":
     return _PARALLEL_STATE_REGISTRY[name]
 
 
-def init_parallel_state(
+def _init_parallel_state(
     dp_size: int = 1,
     dp_replicate_size: int = 1,
     dp_shard_size: int = 1,
@@ -461,6 +476,13 @@ def init_parallel_state(
     """
     Initialize a parallel state, register it under ``name``, and set it as the
     global state when none is current yet.
+
+    Private: every parallelism knob here also lives on
+    :class:`~veomni.arguments.AcceleratorConfig`, so a second mapping restated
+    at a call site is a second place to keep in sync. Production code goes
+    through :func:`init_parallel_state_from_config`. Tests call this
+    directly to build a topology no job config can express — a CPU mesh, or a
+    rank layout unrelated to ``WORLD_SIZE``.
 
     If ``name`` is already registered, log a warning and return the existing
     state without building, caching, or overwriting anything.
@@ -665,6 +687,29 @@ def init_parallel_state(
     return parallel_state
 
 
+def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Optional[str]) -> "ParallelState":
+    """Build the mesh an :class:`AcceleratorConfig` describes and register it as ``name``.
+
+    Every parallelism knob already lives on the config, so a caller that has one
+    should not be restating the mapping.
+    """
+    return _init_parallel_state(
+        dp_size=accelerator.dp_size,
+        dp_replicate_size=accelerator.dp_replicate_size,
+        dp_shard_size=accelerator.dp_shard_size,
+        tp_size=accelerator.tp_size,
+        pp_size=accelerator.pp_size,
+        cp_size=accelerator.cp_size,
+        ulysses_size=accelerator.ulysses_size,
+        extra_parallel_sizes=accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=accelerator.extra_parallel_names,
+        dp_mode=accelerator.fsdp_config.fsdp_mode,
+        async_enabled=accelerator.enable_async,
+        name=name,
+    )
+
+
 def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelState"]:
     """
     Set the global parallel state to ``parallel_state``; returns the previous one.
@@ -697,6 +742,19 @@ def use_parallel_state(parallel_state: Union[str, "ParallelState"]):
         yield
     finally:
         set_parallel_state(old)
+
+
+def is_parallel_state_initialized() -> bool:
+    """Whether a ``ParallelState`` has been installed as the global state.
+
+    ``get_parallel_state`` falls back to *constructing* a default single-process
+    state, and that default raises when the process is in fact part of a
+    multi-rank world, since ``dp_size=1`` then contradicts the real world size.
+    Callers that only want to ask *whether* a form of parallelism is on -- rather
+    than use it -- should check this first, so that an uninitialized process
+    answers "off" instead of raising.
+    """
+    return _PARALLEL_STATE is not None
 
 
 def get_parallel_state() -> "ParallelState":
