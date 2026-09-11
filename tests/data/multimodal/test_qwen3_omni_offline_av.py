@@ -321,3 +321,220 @@ def test_qwen3_omni_offline_av_end_to_end():
         f"audio tokens = {int(audio_mask.sum())} ({audio_runs} runs)"
     )
     print(f"[OK] input_ids length = {out['input_ids'].numel()}")
+
+
+@pytest.fixture(params=["qwen2_5_omni", "qwen3_omni_moe"])
+def omni_processor(request):
+    """Real processors with a local tokenizer; no checkpoint download required."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import (
+        PreTrainedTokenizerFast,
+        Qwen2VLImageProcessor,
+        Qwen2VLVideoProcessor,
+        WhisperFeatureExtractor,
+    )
+
+    from veomni.models.transformers.qwen2_5_omni.processing_qwen2_5_omni import Qwen2_5OmniProcessor
+    from veomni.models.transformers.qwen3_omni_moe.processing_qwen3_omni_moe import Qwen3OmniMoeProcessor
+
+    tokens = {
+        "image_token": "<|image_pad|>",
+        "video_token": "<|video_pad|>",
+        "audio_token": "<|audio_pad|>",
+        "vision_bos_token": "<|vision_start|>",
+        "vision_eos_token": "<|vision_end|>",
+        "audio_bos_token": "<|audio_start|>",
+        "audio_eos_token": "<|audio_end|>",
+    }
+    special = [*tokens.values(), "<|im_start|>", "<|im_end|>", "user", "assistant", "system", "separator"]
+    vocab = {token: i for i, token in enumerate(["<unk>", "<pad>", *special])}
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="<unk>")),
+        unk_token="<unk>",
+        pad_token="<pad>",
+        additional_special_tokens=special,
+    )
+    for key, value in tokens.items():
+        setattr(tokenizer, key, value)
+    processor_cls = Qwen2_5OmniProcessor if request.param == "qwen2_5_omni" else Qwen3OmniMoeProcessor
+    return processor_cls(
+        tokenizer=tokenizer,
+        image_processor=Qwen2VLImageProcessor(size={"shortest_edge": 56**2, "longest_edge": 56**2}),
+        video_processor=Qwen2VLVideoProcessor(size={"shortest_edge": 56**2, "longest_edge": 56**2}),
+        feature_extractor=WhisperFeatureExtractor(feature_size=128),
+        chat_template=(
+            "{% for m in messages %}{{ '<|im_start|>' + m['role'] }}"
+            "{% for c in m['content'] %}"
+            "{% if c['type'] == 'video' %}<|vision_start|><|video_pad|><|vision_end|>"
+            "{% else %}{{ c['text'] }}{% endif %}"
+            "{% endfor %}<|im_end|>{% endfor %}"
+        ),
+    )
+
+
+@pytest.mark.parametrize("duration,expected_interval", [(10.0, 1.0), (30.0, 3.0), (0.5, 0.25)])
+def test_omni_transform_uses_effective_fps(omni_processor, monkeypatch, duration, expected_interval):
+    from veomni.data.data_transform import process_sample_qwen_omni
+
+    def no_resampling(*args, **kwargs):
+        pytest.fail("Already sampled video must not be sampled again")
+
+    monkeypatch.setattr(omni_processor.video_processor, "sample_frames", no_resampling)
+    original_preprocess = omni_processor.video_processor.preprocess
+
+    def check_video_kwargs(*args, **kwargs):
+        assert kwargs["do_sample_frames"] is False
+        assert kwargs["return_metadata"] is True
+        metadata = kwargs["video_metadata"][0]
+        assert metadata["fps"] == 30.0
+        assert metadata["total_num_frames"] == int(duration * 30)
+        return original_preprocess(*args, **kwargs)
+
+    monkeypatch.setattr(omni_processor.video_processor, "preprocess", check_video_kwargs)
+
+    def position_ids(input_ids, second_per_grids, **kwargs):
+        assert second_per_grids.tolist() == pytest.approx([expected_interval])
+        return {"position_ids": torch.arange(input_ids.shape[-1]).view(1, 1, -1)}
+
+    sample = {
+        "videos": [
+            {
+                "video": np.zeros((int(duration * 30), 8, 8, 3), dtype=np.uint8),
+                "video_fps": 30.0,
+                "audio": np.zeros(int(duration * 16000), dtype=np.float32),
+                "audio_fps": 16000,
+            }
+        ],
+        "conversations": [{"from": "human", "value": "<video>question"}, {"from": "gpt", "value": "answer"}],
+    }
+    result = process_sample_qwen_omni(
+        sample,
+        processor=omni_processor,
+        position_id_func=position_ids,
+        source_name="qwen_omni_offline_av",
+        fps=2.0,
+        min_frames=4,
+        max_frames=20,
+        frame_factor=2,
+        scale_factor=28,
+        video_min_pixels=56**2,
+        video_max_pixels=56**2,
+    )[0]
+    assert result["video_mask"].sum() == result["video_grid_thw"].prod() // 4
+    assert result["audio_mask"].sum() > 0
+    assert "video_second_per_grid" not in result
+    assert "video_metadata" not in result
+
+
+@pytest.mark.parametrize("first_has_audio", [False, True])
+def test_omni_per_video_fps_preserves_interleaving(omni_processor, first_has_audio):
+    video_text = "<|vision_start|><|video_pad|><|vision_end|>"
+    image_text = "<|vision_start|><|image_pad|><|vision_end|>"
+    audio_text = "<|audio_start|><|audio_pad|><|audio_end|>"
+    video = np.zeros((4, 3, 56, 56), dtype=np.uint8)
+    audio = np.zeros(4 * 16000, dtype=np.float32)
+    result = omni_processor(
+        text=image_text + audio_text + video_text + "separator" + video_text,
+        images=[PIL.Image.new("RGB", (56, 56))],
+        videos=[video, video],
+        audios=[audio, audio if first_has_audio else None, audio],
+        video_metadata=[
+            {"fps": 30.0, "total_num_frames": 60, "frames_indices": [0, 20, 39, 59]},
+            {"fps": 30.0, "total_num_frames": 240, "frames_indices": [0, 80, 159, 239]},
+        ],
+        fps=2.0,
+        do_sample_frames=False,
+        return_tensors="pt",
+    )
+    reference = omni_processor(
+        text=video_text,
+        videos=[video],
+        audios=[audio],
+        fps=0.5,
+        do_sample_frames=False,
+        return_tensors="pt",
+    )
+    assert result["video_second_per_grid"].tolist() == [1.0, 4.0]
+    ids = result["input_ids"][0]
+    separator = (ids == omni_processor.tokenizer.convert_tokens_to_ids("separator")).nonzero().item()
+    # A preceding video (with or without audio) cannot change the second
+    # video's interleaving. The legacy FPS call provides an independent reference.
+    assert torch.equal(ids[separator + 1 :], reference["input_ids"][0])
+    assert "pixel_values" in result
+    assert result["input_features"].shape[0] == 3
+
+
+@pytest.mark.parametrize("fps", [None, 2.0, 0.5])
+def test_omni_metadata_keeps_legacy_fps(omni_processor, fps):
+    kwargs = {
+        "text": "<|vision_start|><|video_pad|><|vision_end|>",
+        "videos": [np.zeros((4, 3, 56, 56), dtype=np.uint8)],
+        "audios": [None],
+        "do_sample_frames": False,
+        "return_tensors": "pt",
+    }
+    legacy = omni_processor(**kwargs, **({"fps": fps} if fps is not None else {}))
+    if fps is None:
+        fps = 2.0 if type(omni_processor).__name__ == "Qwen2_5OmniProcessor" else 1.0
+    assert legacy["video_second_per_grid"].tolist() == [2.0 / fps]
+    total_frames = int(4 / fps * 30)
+    explicit = omni_processor(
+        **kwargs,
+        video_metadata=[
+            {
+                "fps": 30.0,
+                "total_num_frames": total_frames,
+                "frames_indices": np.linspace(0, total_frames - 1, 4).round().astype(int).tolist(),
+            }
+        ],
+    )
+    assert legacy.keys() == explicit.keys()
+    assert all(torch.equal(legacy[key], explicit[key]) for key in legacy)
+
+
+def test_omni_empty_metadata_preserves_other_modalities(omni_processor):
+    for extra in ({}, {"images": [PIL.Image.new("RGB", (56, 56))]}, {"audios": [np.zeros(16000)]}):
+        # No video: an empty metadata list has no effect on other modalities.
+        text = "<|image_pad|>" if "images" in extra else "<|audio_pad|>" if "audios" in extra else "text"
+        original = omni_processor(text=text, return_tensors="pt", **extra)
+        empty = omni_processor(text=text, return_tensors="pt", video_metadata=[], **extra)
+        assert original.keys() == empty.keys()
+        assert all(torch.equal(original[key], empty[key]) for key in original)
+
+
+@pytest.mark.parametrize("nested_kwargs", [False, True])
+def test_omni_returns_requested_metadata(omni_processor, nested_kwargs):
+    metadata = {"fps": 30.0, "total_num_frames": 120, "frames_indices": [0, 40, 79, 119]}
+    kwargs = {"video_metadata": [metadata], "return_metadata": True}
+    if nested_kwargs:
+        kwargs = {"videos_kwargs": kwargs}
+    result = omni_processor(
+        text="<|vision_start|><|video_pad|><|vision_end|>",
+        videos=[np.zeros((4, 3, 56, 56), dtype=np.uint8)],
+        audios=[None],
+        do_sample_frames=False,
+        return_tensors="pt",
+        **kwargs,
+    )
+    returned_metadata = result["video_metadata"][0]
+    assert all(returned_metadata[key] == value for key, value in metadata.items())
+    assert result["video_second_per_grid"].tolist() == [2.0]
+
+
+def test_omni_metadata_does_not_disable_sampling(omni_processor):
+    # Metadata can describe unsampled frames too. Respect the explicit sampling
+    # flag and compute timing from the metadata returned after sampling.
+    result = omni_processor(
+        text="<|vision_start|><|video_pad|><|vision_end|>",
+        videos=[np.zeros((64, 3, 56, 56), dtype=np.uint8)],
+        audios=[None],
+        video_metadata=[{"fps": 8.0, "total_num_frames": 64, "frames_indices": list(range(64))}],
+        fps=2.0,
+        do_sample_frames=True,
+        return_metadata=True,
+        return_tensors="pt",
+    )
+    assert len(result["video_metadata"][0].frames_indices) == 16
+    assert result["video_grid_thw"][0, 0] == 8
+    assert result["video_second_per_grid"].tolist() == [1.0]

@@ -98,6 +98,18 @@ processor. The sampled FPS accounts for frame-count limits; it is not the source
 FPS or necessarily the requested `mm_configs.fps`. This value is consumed before
 packing, since training receives the resulting `position_ids` directly.
 
+Qwen2.5-Omni and Qwen3-Omni also fetch source video metadata and disable further
+sampling. Their transform passes `video_metadata` unchanged. The Omni processors
+read each returned metadata object's `sampled_fps` property, calculated as
+`len(frames_indices) / total_num_frames * fps`, for audio/video token interleaving
+and `video_second_per_grid` in position precomputation. Source metadata retains
+its original FPS and frame indices; there is no separate sampling-FPS argument.
+Calls that omit `video_metadata` retain the legacy `fps` behavior (2 FPS for
+Qwen2.5-Omni, 1 FPS for Qwen3-Omni when `fps` is also omitted). Metadata is returned
+to the caller only when `return_metadata=True`. Supplying metadata does not
+disable sampling: callers with already-sampled frames must still pass
+`do_sample_frames=False`.
+
 ### Spatial Resize Parameters
 
 | Parameter | Description |

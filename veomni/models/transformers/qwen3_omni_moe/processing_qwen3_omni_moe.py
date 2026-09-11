@@ -47,6 +47,11 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
         # --- Patch.2 ---
         **kwargs,
     ) -> BatchFeature:
+        """Encode multimodal inputs using effective FPS derived from supplied video metadata.
+
+        Pass `do_sample_frames=False` for already-sampled videos. Without metadata,
+        temporal encoding retains the legacy `fps` behavior.
+        """
         if text is None:
             raise ValueError("You need to specify either a `text` input to process.")
 
@@ -58,7 +63,6 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
 
         seconds_per_chunk = output_kwargs["videos_kwargs"].pop("seconds_per_chunk")
         position_id_per_seconds = output_kwargs["videos_kwargs"].pop("position_id_per_seconds")
-        fps = output_kwargs["videos_kwargs"].get("fps", 1.0)
 
         # --- Patch.2 ---
         _ = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
@@ -90,12 +94,21 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
         # Modification: use truthy check instead of `is not None`
         if videos:
             videos = make_batched_videos(videos)
-            videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
-            fps = [fps] * len(videos)
+            video_kwargs = output_kwargs["videos_kwargs"]
+            return_metadata = video_kwargs.pop("return_metadata", False)
+            videos_inputs = self.video_processor(videos=videos, return_metadata=True, **video_kwargs)
+            video_metadata = (
+                videos_inputs["video_metadata"] if return_metadata else videos_inputs.pop("video_metadata")
+            )
+            video_grid_thw = videos_inputs["video_grid_thw"]
+            if video_kwargs.get("video_metadata") is not None:
+                sample_fps = [metadata.sampled_fps for metadata in video_metadata]
+            else:
+                sample_fps = [video_kwargs.get("fps", 1.0)] * len(video_grid_thw)
             videos_inputs["video_second_per_grid"] = [
-                self.video_processor.temporal_patch_size / fps[i] for i in range(len(fps))
+                self.video_processor.temporal_patch_size / fps for fps in sample_fps
             ]
-            video_grid_thw = iter(videos_inputs["video_grid_thw"])
+            video_grid_thw = iter(video_grid_thw)
             video_second_per_grid = iter(videos_inputs["video_second_per_grid"])
         else:
             videos_inputs = {}
@@ -154,6 +167,8 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
                     image_seq_length = next(image_grid_thw).prod() // merge_length_image
                     sample = sample.replace(self.image_token, "<|image_placeholder|>" * image_seq_length, 1)
                 elif special_token == self.video_token:
+                    # Every video consumes its timing entry, including videos without audio.
+                    current_second_per_grid = next(video_second_per_grid)
                     # --- Patch.2 ---
                     audio_length = next(audio_lengths)
                     use_audio_in_video = audio_length != 0
@@ -173,9 +188,7 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
                         video_token_indices = np.broadcast_to(
                             video_token_indices, (video_token_indices.shape[0], height, width)
                         ).reshape(-1)
-                        video_token_indices = (
-                            video_token_indices * next(video_second_per_grid) * position_id_per_seconds
-                        )
+                        video_token_indices = video_token_indices * current_second_per_grid * position_id_per_seconds
 
                         video_data_index, audio_data_index = 0, 0
                         placeholder_string = self.vision_bos_token + self.audio_bos_token

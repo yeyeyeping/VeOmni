@@ -72,6 +72,9 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
                 tensor, or a nested list of 3D frames. Both channels-first and channels-last formats are supported.
             audio (`np.ndarray`, `List[np.ndarray]`):
                 The audio or batch of audio to be prepared. Each audio can be a NumPy array.
+            video_metadata (optional):
+                Source video metadata used to derive each video's effective FPS for temporal encoding.
+                Pass `do_sample_frames=False` for already-sampled videos. Without metadata, use the legacy `fps`.
         """
 
         if text is None:
@@ -117,15 +120,19 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
             image_grid_thw = iter([])
 
         if videos:
-            videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
-
-            # --- Patch.2 ---
-            # TODO: fps parse from args
-            fps = output_kwargs["videos_kwargs"].get("fps", 2.0)
-            # --- Patch.2 ---
+            video_kwargs = output_kwargs["videos_kwargs"]
+            return_metadata = video_kwargs.pop("return_metadata", False)
+            videos_inputs = self.video_processor(videos=videos, return_metadata=True, **video_kwargs)
+            video_metadata = (
+                videos_inputs["video_metadata"] if return_metadata else videos_inputs.pop("video_metadata")
+            )
 
             video_grid_thw = videos_inputs["video_grid_thw"]
-            second_per_grid_ts = [self.video_processor.temporal_patch_size / fps] * len(video_grid_thw)
+            if video_kwargs.get("video_metadata") is not None:
+                sample_fps = [metadata.sampled_fps for metadata in video_metadata]
+            else:
+                sample_fps = [video_kwargs.get("fps", 2.0)] * len(video_grid_thw)
+            second_per_grid_ts = [self.video_processor.temporal_patch_size / fps for fps in sample_fps]
             videos_inputs["video_second_per_grid"] = second_per_grid_ts
 
             video_grid_thw = iter(video_grid_thw)
@@ -189,6 +196,8 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
                     image_seq_length = next(image_grid_thw).prod() // merge_length_image
                     sample = sample.replace(self.image_token, "<|image_placeholder|>" * image_seq_length, 1)
                 elif special_token == self.video_token:
+                    # Every video consumes its timing entry, including videos without audio.
+                    current_second_per_grid = next(video_second_per_grid)
                     # --- Patch.2 ---
                     audio_length = next(audio_lengths)
                     use_audio_in_video = audio_length != 0
@@ -207,9 +216,7 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
                         video_token_indices = np.broadcast_to(
                             video_token_indices, (video_token_indices.shape[0], height, width)
                         ).reshape(-1)
-                        video_token_indices = (
-                            video_token_indices * next(video_second_per_grid) * position_id_per_seconds
-                        )
+                        video_token_indices = video_token_indices * current_second_per_grid * position_id_per_seconds
 
                         tokens_per_chunk = int(position_id_per_seconds * seconds_per_chunk)
                         video_chunk_indexes = self.get_chunked_index(video_token_indices, tokens_per_chunk)
