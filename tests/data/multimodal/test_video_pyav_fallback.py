@@ -47,12 +47,12 @@ def test_pyav_fallback_materializes_only_sampled_frames(monkeypatch):
     monkeypatch.setattr(video_utils.av, "open", fake_open)
     monkeypatch.setattr(video_utils, "smart_resize", lambda video, **kwargs: video.float())
 
-    video, audio, audio_fps, indices = video_utils._load_and_process_video_with_pyav(
+    video, audio, audio_fps, metadata = video_utils._load_and_process_video_with_pyav(
         b"video", use_audio_in_video=False, fps=1.0, max_frames=8
     )
 
     assert open_count == 2
-    assert materialized == indices.tolist()
+    assert materialized == metadata["frames_indices"].tolist()
     assert video.shape == (8, 3, 2, 2)
     assert video.dtype == torch.float32
     assert audio is None
