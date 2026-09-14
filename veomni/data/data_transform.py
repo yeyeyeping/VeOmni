@@ -447,16 +447,12 @@ def process_sample_minimax_m3_vl(
 
     image_inputs, video_inputs, video_metadata = _prepare_vlm_media_inputs(sample, processor, **kwargs)
 
-    video_inputs_for_template = video_inputs
-    if video_metadata is not None:
-        video_inputs_for_template = dict(video_inputs)
-        video_inputs_for_template["video_metadata"] = video_metadata
-
     tokenized_example = chat_template.encode_messages(
         conversations,
         processor=processor,
         image_inputs=image_inputs,
-        video_inputs=video_inputs_for_template,
+        video_inputs=video_inputs,
+        video_metadata=video_metadata,
     )
     tokenized_example = {
         key: value if isinstance(value, torch.Tensor) else torch.tensor(value)

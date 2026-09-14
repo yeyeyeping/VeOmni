@@ -28,12 +28,17 @@ def _drop_nested_model_type(config_dict):
     return config_dict
 
 
-def _default_rope_parameters(rope_parameters, rope_theta):
+def _default_rope_parameters(rope_parameters, rope_theta, partial_rotary_factor=1.0):
     if rope_parameters is None:
-        return {"rope_theta": rope_theta, "rope_type": "default"}
+        return {
+            "rope_theta": rope_theta,
+            "partial_rotary_factor": partial_rotary_factor,
+            "rope_type": "default",
+        }
 
     rope_parameters = deepcopy(rope_parameters)
     rope_parameters.setdefault("rope_theta", rope_theta)
+    rope_parameters.setdefault("partial_rotary_factor", partial_rotary_factor)
     rope_parameters.setdefault("rope_type", "default")
     return rope_parameters
 
@@ -100,6 +105,7 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         moe_layer_freq=None,
         mlp_layer_types=None,
         layer_types=None,
+        partial_rotary_factor=None,
         index_n_heads=4,
         index_head_dim=128,
         index_block_size=128,
@@ -162,7 +168,10 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_limit = swiglu_limit
         self.rope_scaling = rope_scaling
-        self.rope_parameters = _default_rope_parameters(rope_parameters, rope_theta)
+        if partial_rotary_factor is None:
+            partial_rotary_factor = rotary_dim / head_dim
+        self.rope_parameters = _default_rope_parameters(rope_parameters, rope_theta, partial_rotary_factor)
+        self.partial_rotary_factor = self.rope_parameters["partial_rotary_factor"]
         self.rope_theta = rope_theta
         self.sparse_attention_config = sparse_attention_config
         self.moe_layer_freq = moe_layer_freq

@@ -966,7 +966,6 @@ def test_container_metadata_preserves_source_time(monkeypatch, max_frames, expec
     decoders = ModuleType("torchcodec.decoders")
     decoders.VideoDecoder = Decoder
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
-    monkeypatch.setattr(video_utils, "is_ffmpeg_available", lambda: True)
     kwargs = dict(fps=2.0, max_frames=max_frames, use_audio_in_video=False)
     videos, metadata, audios, _ = video_utils.fetch_videos_metadata([container], **kwargs)
     meta = metadata[0]
@@ -1029,7 +1028,6 @@ def test_decoder_fallback_keeps_repeated_first_frame_time(monkeypatch):
     decoders = ModuleType("torchcodec.decoders")
     decoders.VideoDecoder = Decoder
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
-    monkeypatch.setattr(video_utils, "is_ffmpeg_available", lambda: True)
     videos, metadata, _, _ = video_utils.fetch_videos_metadata(
         ["video.mp4"], fps=2, min_frames=4, frame_factor=2, use_audio_in_video=False
     )

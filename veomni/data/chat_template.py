@@ -570,7 +570,7 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("minimax_m3_vl")
 class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
-    """Chat template for the MiniMax M3 VL processor contract."""
+    """MiniMax M3 VL media expansion with the processor's native chat template."""
 
     IMAGE_TOKEN = "]<]image[>["
     VIDEO_TOKEN = "]<]video[>["
@@ -581,11 +581,36 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
         super().__init__(processor)
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.IMAGE_TOKEN)
         self.video_token_id = self.tokenizer.convert_tokens_to_ids(self.VIDEO_TOKEN)
-        self.eos = (
-            self.tokenizer.encode(self.tokenizer.eos_token, add_special_tokens=False)
-            if self.tokenizer.eos_token
-            else []
+        self.chat_template_kwargs = kwargs
+
+    def save_pretrained(self, output_dir: str) -> None:
+        # Multimodal chat templates live on the processor. VLMTrainer saves the
+        # processor immediately before this adapter, so saving it again is
+        # idempotent and avoids overwriting its native template with the empty
+        # MultimodalChatTemplate.get_jinja_template() value.
+        self.processor.save_pretrained(output_dir)
+
+    def _render_and_tokenize(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> List[int]:
+        rendered = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            **self.chat_template_kwargs,
         )
+        if not isinstance(rendered, str):
+            raise TypeError(
+                "MiniMax M3 VL processor.apply_chat_template(tokenize=False) must return a string, "
+                f"but got {type(rendered).__name__}."
+            )
+        return self.tokenizer.encode(rendered, add_special_tokens=False)
+
+    @staticmethod
+    def _require_prefix(prefix: List[int], sequence: List[int], context: str) -> None:
+        if sequence[: len(prefix)] != prefix:
+            raise ValueError(
+                f"The MiniMax M3 VL native chat template rewrote the {context}; "
+                "assistant-only loss masking requires prefix-stable rendering."
+            )
 
     def image_pattern(self, token_num: int) -> str:
         return self.VISION_START_TOKEN + self.IMAGE_TOKEN * token_num + self.VISION_END_TOKEN
@@ -598,24 +623,33 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
         token_num = int(image_inputs["image_grid_thw"][image_idx].prod() // merge_length)
         return self.image_pattern(token_num)
 
-    def _replace_video_token(self, processor: "ProcessorMixin", video_inputs: Dict[str, Any], video_idx: int):
+    @staticmethod
+    def _metadata_value(metadata: Any, key: str, default=None):
+        if isinstance(metadata, dict):
+            return metadata.get(key, default)
+        return getattr(metadata, key, default)
+
+    def _replace_video_token(
+        self,
+        processor: "ProcessorMixin",
+        video_inputs: Dict[str, Any],
+        video_idx: int,
+        video_metadata: Sequence[Any] = None,
+    ):
         merge_length = processor.video_processor.merge_size**2
         grid_thw = video_inputs["video_grid_thw"][video_idx]
         grid_t = int(grid_thw[0])
         frame_seqlen = int(grid_thw[1:].prod() // merge_length)
-        metadata_list = video_inputs.get("video_metadata")
-        metadata = metadata_list[video_idx] if metadata_list is not None else None
+        metadata = video_metadata[video_idx] if video_metadata is not None else None
         temporal_patch_size = getattr(processor.video_processor, "temporal_patch_size", 1)
+        fps = self._metadata_value(metadata, "fps")
+        frames_indices = self._metadata_value(metadata, "frames_indices")
 
         chunks = []
         for frame in range(grid_t):
-            if (
-                metadata is not None
-                and getattr(metadata, "fps", None) is not None
-                and getattr(metadata, "frames_indices", None) is not None
-            ):
-                frame_idx = min(frame * temporal_patch_size, len(metadata.frames_indices) - 1)
-                chunks.append(f"]<]{metadata.frames_indices[frame_idx] / metadata.fps:.1f} seconds[>[")
+            if fps is not None and frames_indices is not None and len(frames_indices) > 0:
+                frame_idx = min(frame * temporal_patch_size, len(frames_indices) - 1)
+                chunks.append(f"]<]{frames_indices[frame_idx] / fps:.1f} seconds[>[")
             chunks.append(self.video_pattern(frame_seqlen))
         return "".join(chunks)
 
@@ -625,12 +659,13 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
         if num_tokens is None:
             num_tokens = defaultdict(list)
 
-        processor = kwargs.get("processor")
+        processor = kwargs.get("processor") or self.processor
         image_inputs = kwargs.get("image_inputs") or {}
         video_inputs = kwargs.get("video_inputs") or {}
+        video_metadata = kwargs.get("video_metadata")
         image_token_num_list = iter(num_tokens.get("image", []))
         video_token_num_list = iter(num_tokens.get("video", []))
-        input_ids, attention_mask, labels = [], [], []
+        messages: List[Dict[str, str]] = []
         image_idx = video_idx = 0
 
         for message in conversations:
@@ -647,21 +682,41 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
                     image_idx += 1
                 elif value[0] == "video":
                     if processor is not None and video_inputs:
-                        content += self._replace_video_token(processor, video_inputs, video_idx)
+                        content += self._replace_video_token(
+                            processor, video_inputs, video_idx, video_metadata=video_metadata
+                        )
                     else:
                         content += self.video_pattern(next(video_token_num_list))
                     video_idx += 1
                 else:
                     raise ValueError(f"Unknown value type: {value[0]}")
 
-            message_ids = self.tokenizer.encode(f"{role}\n{content}", add_special_tokens=False) + self.eos
-            input_ids += message_ids
-            attention_mask += [1] * len(message_ids)
-            labels += message_ids if role == "assistant" else [IGNORE_INDEX] * len(message_ids)
+            messages.append({"role": role, "content": content})
+
+        input_ids: List[int] = []
+        labels: List[int] = []
+        history: List[Dict[str, str]] = []
+        for message in messages:
+            if message["role"] == "assistant":
+                generation_prefix = self._render_and_tokenize(history, add_generation_prompt=True)
+                self._require_prefix(input_ids, generation_prefix, "rendered conversation history")
+
+                current_ids = self._render_and_tokenize(history + [message], add_generation_prompt=False)
+                self._require_prefix(generation_prefix, current_ids, "assistant generation prefix")
+
+                labels.extend([IGNORE_INDEX] * (len(generation_prefix) - len(input_ids)))
+                labels.extend(current_ids[len(generation_prefix) :])
+            else:
+                current_ids = self._render_and_tokenize(history + [message], add_generation_prompt=False)
+                self._require_prefix(input_ids, current_ids, "rendered conversation history")
+                labels.extend([IGNORE_INDEX] * (len(current_ids) - len(input_ids)))
+
+            input_ids = current_ids
+            history.append(message)
 
         tokenized_example = {
             "input_ids": torch.tensor(input_ids),
-            "attention_mask": torch.tensor(attention_mask),
+            "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
             "labels": torch.tensor(labels),
         }
         image_mask = tokenized_example["input_ids"] == self.image_token_id

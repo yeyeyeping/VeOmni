@@ -25,16 +25,28 @@ patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_npu_patch_gen_co
 from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config import (
     MiniMaxM3VLCausalLMOutputWithLogProbs,
     PatchedMiniMaxM3VLExperts,
+    PatchedMiniMaxM3VLPreTrainedModel,
+    _build_bsnd_causal_mask,
+    _eager_bsnd_attention_forward,
     _grid_thw_to_list,
+    _pack_from_bsnd,
+    _prepare_packed_layout,
+    _unpack_to_bsnd,
+    _validate_minimax_m3_ep,
     collate_multimodal_metadata,
     minimax_m3_vl_3d_rotary_embedding_forward_patched,
+    minimax_m3_vl_attention_forward_patched,
+    minimax_m3_vl_for_causal_lm_forward_patched,
     minimax_m3_vl_get_metadata_collate_func_patched,
     minimax_m3_vl_get_parallel_plan_patched,
     minimax_m3_vl_get_position_id_func_patched,
+    minimax_m3_vl_indexer_build_block_mask_patched,
+    minimax_m3_vl_indexer_forward_patched,
     minimax_m3_vl_model_forward_patched,
     minimax_m3_vl_rmsnorm_forward_patched,
     minimax_m3_vl_sparse_for_conditional_generation_forward_patched,
     minimax_m3_vl_text_get_parallel_plan_patched,
+    minimax_m3_vl_text_model_forward_patched,
     minimax_m3_vl_vision_dummy_forward_patched,
     minimax_m3_vl_vision_model_forward_patched,
 )
@@ -52,8 +64,20 @@ config.add_import("veomni.distributed.parallel_state", names=["get_parallel_stat
 config.add_import("veomni.ops.dispatch", names=["OpSlot"])
 config.add_import(
     "veomni.utils.model_outputs",
-    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"],
+    names=["CausalLMOutputWithLogProbs", "FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"],
 )
+config.drop_import_names("MoeCausalLMOutputWithPast")
+config.exclude_from_output("load_balancing_loss_func")
+config.add_import(
+    "veomni.distributed.sequence_parallel",
+    names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"],
+)
+config.add_import(
+    "veomni.ops.kernels.attention.ulysses",
+    names=["prepare_ulysses_qkv", "restore_ulysses_output"],
+)
+config.add_import("veomni.models.transformers.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
+config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
 config.add_post_import_block(
     """
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
@@ -62,7 +86,19 @@ veomni_moe_experts_forward = OpSlot("moe_experts", "swiglu_oai")
 """
 )
 config.add_helper(_grid_thw_to_list)
+config.add_helper(_prepare_packed_layout)
+config.add_helper(_unpack_to_bsnd)
+config.add_helper(_pack_from_bsnd)
+config.add_helper(_build_bsnd_causal_mask)
+config.add_helper(_eager_bsnd_attention_forward)
+config.add_helper(_validate_minimax_m3_ep)
 config.add_helper(collate_multimodal_metadata)
+
+config.replace_class(
+    "MiniMaxM3VLPreTrainedModel",
+    replacement=PatchedMiniMaxM3VLPreTrainedModel,
+    description="Allow VeOmni flash-attention implementations for the config-driven vision tower",
+)
 
 config.replace_class(
     "MiniMaxM3VLExperts",
@@ -84,7 +120,7 @@ config.override_method(
 config.override_method(
     "MiniMaxM3VLVisionModel.forward",
     replacement=minimax_m3_vl_vision_model_forward_patched,
-    description="Consume MiniMax collator-precomputed vision grid metadata",
+    description="Add MiniMax vision SP RoPE and varlen-attention metadata handling",
 )
 config.override_method(
     "MiniMaxM3VLVisionModel.dummy_forward",
@@ -95,6 +131,31 @@ config.override_method(
     "MiniMaxM3VLModel.forward",
     replacement=minimax_m3_vl_model_forward_patched,
     description="Add MiniMax VLM metadata fast path and FSDP dummy vision branch",
+)
+config.override_method(
+    "MiniMaxM3VLIndexer.forward",
+    replacement=minimax_m3_vl_indexer_forward_patched,
+    description="Run the MiniMax indexer on temporary BSND views of packed training inputs",
+)
+config.override_method(
+    "MiniMaxM3VLIndexer.build_block_mask",
+    replacement=minimax_m3_vl_indexer_build_block_mask_patched,
+    description="Compose MiniMax block selection with BSND padding and causality",
+)
+config.override_method(
+    "MiniMaxM3VLAttention.forward",
+    replacement=minimax_m3_vl_attention_forward_patched,
+    description="Run MiniMax language attention on temporary BSND views while decoder states stay packed",
+)
+config.override_method(
+    "MiniMaxM3VLTextModel.forward",
+    replacement=minimax_m3_vl_text_model_forward_patched,
+    description="Keep decoder states packed and share a temporary BSND attention layout",
+)
+config.override_method(
+    "MiniMaxM3VLForCausalLM.forward",
+    replacement=minimax_m3_vl_for_causal_lm_forward_patched,
+    description="Unpack VeOmni causal LM loss tuple for MiniMax text-only training",
 )
 config.override_method(
     "MiniMaxM3SparseForConditionalGeneration.forward",

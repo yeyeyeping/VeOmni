@@ -45,10 +45,11 @@ The public checkpoint can be referenced through either Hugging Face or ModelScop
 
 ## Data Path
 
-The `minimax_m3_vl` data transform reuses VeOmni's multimodal fetch and collate pipeline, then delegates image and video tensorization to the MiniMax Hugging Face processors:
+The `minimax_m3_vl` data transform reuses VeOmni's multimodal fetch and collate pipeline, then delegates image/video tensorization and conversation rendering to the MiniMax Hugging Face processor:
 
 - `processor.image_processor(..., return_tensors="pt")` emits `pixel_values` and `image_grid_thw`.
 - `processor.video_processor(..., return_metadata=True)` emits `pixel_values_videos`, `video_grid_thw`, and metadata used to expand MiniMax video timestamp tokens.
+- `processor.apply_chat_template(..., tokenize=False)` applies the checkpoint's native MiniMax conversation protocol; VeOmni tokenizes the rendered string and masks the generation header, non-assistant turns, and visual placeholders in the labels.
 - `MainCollator` packs `pixel_values`, `pixel_values_videos`, `image_grid_thw`, and `video_grid_thw` through the existing VLM collate rules.
 - The MiniMax generated model exposes `get_metadata_collate_func()`, which converts packed `image_grid_thw` / `video_grid_thw` into `multimodal_metadata` grid lists on CPU. The vision tower consumes those lists to avoid calling `grid_thw.tolist()` inside the CUDA/NPU forward path.
 
@@ -56,7 +57,11 @@ MiniMax placeholder ids are preserved in `input_ids` so the upstream forward can
 
 ## Current Scope
 
-This recipe covers config loading, generated modeling import, MiniMax processor-shaped VLM samples, FSDP2 training, checkpoint conversion, MiniMax multimodal metadata wiring, and expert parallelism. The current patch does not implement Ulysses sequence parallelism, so keep `ulysses_size: 1` and `cp_size: 1`. MiniMax's Gemma-style RMSNorm is wired to VeOmni's `rms_norm/qwen3_5` operator variant, selecting Liger on GPU and `torch_npu.npu_rms_norm` on NPU according to `model.ops_implementation.rms_norm_implementation`.
+This recipe covers config loading, generated modeling import, MiniMax processor-shaped VLM samples, FSDP2 training, checkpoint conversion, multimodal metadata wiring, expert parallelism, and packed Ulysses sequence parallelism. Context parallelism is not supported, so keep `cp_size: 1`.
+
+`model.ops_implementation.attn_implementation` controls the vision tower only. Keep it on a FlashAttention variant: ViT uses the varlen metadata to isolate multiple images/videos, and VeOmni's `*_with_sp` wrapper performs the ViT Ulysses all-to-all when `ulysses_size > 1`. The language tower deliberately ignores this generic setting for now. Each decoder layer keeps its input and output in local packed `[1, T_local, D]` form; its indexer gathers the small index Q/K tensors, while its main Q/K/V use Ulysses sequence/head exchange, temporarily unpack to padded BSND for MiniMax's sparse-attention reference math, then repack before the inverse exchange. RoPE is applied to local packed Q/K before communication, and the packed-to-BSND layout is built once per language-model forward and reused by every layer.
+
+MiniMax's Gemma-style RMSNorm is wired to VeOmni's `rms_norm/qwen3_5` operator variant, selecting Liger on GPU and `torch_npu.npu_rms_norm` on NPU according to `model.ops_implementation.rms_norm_implementation`.
 
 MiniMax routed experts use the `moe_experts/swiglu_oai` operator variant. It preserves the model's clamped `(up + 1) * gate * sigmoid(alpha * gate)` activation while reusing VeOmni's standard EP token dispatch. Enable EP with `fused_triton` on GPU or `fused_npu` on NPU:
 
@@ -64,13 +69,13 @@ MiniMax routed experts use the `moe_experts/swiglu_oai` operator variant. It pre
 model:
   ops_implementation:
     moe_implementation: fused_triton  # use fused_npu on NPU
-
-train:
   accelerator:
     ep_size: 8
 ```
 
-The public MiniMax checkpoint stores separate per-expert `w1`/`w2`/`w3` tensors. Its runtime converter must first assemble the complete fused expert tensor, so this checkpoint layout is incompatible with `train.ep_sharded_stream_load=true`. Keep that option disabled unless the checkpoint has first been exported in the fused VeOmni/Hugging Face v5 layout.
+Router auxiliary load balancing is intentionally disabled for MiniMax M3. The upstream Switch-style loss recomputes routing with `softmax(router_logits)`, while MiniMax selects experts with `sigmoid(router_logits) + e_score_correction_bias`; these can select different experts. Keep `output_router_logits=false`. VeOmni raises an error if router-logit capture is requested until a MiniMax-specific balancing recipe is available.
+
+The public MiniMax checkpoint stores separate per-expert `w1`/`w2`/`w3` tensors. Its runtime converter must first assemble the complete fused expert tensor, so this checkpoint layout is incompatible with `model.ep_sharded_stream_load=true`. Keep that option disabled unless the checkpoint has first been exported in the fused VeOmni/Hugging Face v5 layout.
 
 To regenerate generated modeling files:
 

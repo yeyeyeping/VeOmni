@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,31 @@ from veomni.data.chat_template import MiniMaxM3VLChatTemplate
 from veomni.data.data_transform import process_sample_minimax_m3_vl
 from veomni.ops.kernels.cross_entropy import install_loss_mapping
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+
+def _render_fake_minimax_chat_template(messages, *, add_generation_prompt):
+    rendered = "]~!b[]~b]system\nMiniMax system prompt[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n"
+    for message in messages:
+        role = "ai" if message["role"] == "assistant" else message["role"]
+        rendered += f"]~b]{role}\n"
+        if message["role"] == "assistant":
+            rendered += "</mm:think>"
+        rendered += f"{message['content']}[e~[\n"
+    if add_generation_prompt:
+        rendered += "]~b]ai\n"
+    return rendered
+
+
+class _FakeNativeTemplateProcessor:
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert tokenize is False
+        self.chat_template_calls.append(
+            {
+                "messages": deepcopy(messages),
+                "add_generation_prompt": add_generation_prompt,
+            }
+        )
+        return _render_fake_minimax_chat_template(messages, add_generation_prompt=add_generation_prompt)
 
 
 class _FakeImageProcessor:
@@ -32,15 +58,17 @@ class _FakeVideoProcessor:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, *, videos, video_metadata, return_tensors, return_metadata):
+    def __call__(self, *, videos, video_metadata, do_sample_frames, return_tensors, return_metadata):
         self.calls.append(
             {
                 "videos": videos,
                 "video_metadata": video_metadata,
+                "do_sample_frames": do_sample_frames,
                 "return_tensors": return_tensors,
                 "return_metadata": return_metadata,
             }
         )
+        assert do_sample_frames is False
         assert return_tensors == "pt"
         assert return_metadata is True
         return {
@@ -50,7 +78,7 @@ class _FakeVideoProcessor:
         }
 
 
-class _FakeProcessor:
+class _FakeProcessor(_FakeNativeTemplateProcessor):
     image_token_id = 200025
     video_token_id = 200026
 
@@ -60,6 +88,7 @@ class _FakeProcessor:
         self.video_processor = _FakeVideoProcessor()
         self.replaced_images = []
         self.replaced_videos = []
+        self.chat_template_calls = []
 
     def replace_image_token(self, image_inputs, image_idx):
         self.replaced_images.append({"image_inputs": image_inputs, "image_idx": image_idx})
@@ -71,7 +100,6 @@ class _FakeProcessor:
         self.replaced_videos.append({"video_inputs": video_inputs, "video_idx": video_idx})
         assert "pixel_values_videos" in video_inputs
         assert "video_grid_thw" in video_inputs
-        assert video_inputs["video_metadata"] == [{"timestamps": [0.0, 1.0]}]
         return MiniMaxM3VLChatTemplate.VIDEO_TOKEN
 
 
@@ -91,7 +119,6 @@ class _FakeMiniMaxChatTemplate:
         assert "image_grid_thw" in image_inputs
         assert "pixel_values_videos" in video_inputs
         assert "video_grid_thw" in video_inputs
-        assert video_inputs["video_metadata"] == [{"timestamps": [0.0, 1.0]}]
 
         return {
             "input_ids": torch.tensor([101, self.image_token_id, 102, self.video_token_id, 103], dtype=torch.long),
@@ -148,12 +175,15 @@ def test_minimax_m3_vl_transform_uses_hf_image_and_video_processors(monkeypatch)
 
 
 class _FakeMiniMaxTokenizer:
-    eos_token = "<eos>"
+    eos_token = "[e~["
 
     _token_ids = {
         MiniMaxM3VLChatTemplate.IMAGE_TOKEN: 200025,
         MiniMaxM3VLChatTemplate.VIDEO_TOKEN: 200026,
-        "<eos>": 200027,
+        "[e~[": 200027,
+        "]~!b[": 200028,
+        "]~b]": 200029,
+        "</mm:think>": 200030,
     }
 
     def convert_tokens_to_ids(self, token):
@@ -166,7 +196,10 @@ class _FakeMiniMaxTokenizer:
         special_tokens = (
             MiniMaxM3VLChatTemplate.IMAGE_TOKEN,
             MiniMaxM3VLChatTemplate.VIDEO_TOKEN,
-            "<eos>",
+            "</mm:think>",
+            "]~!b[",
+            "]~b]",
+            "[e~[",
         )
         while idx < len(text):
             for token in special_tokens:
@@ -180,11 +213,38 @@ class _FakeMiniMaxTokenizer:
         return token_ids
 
 
-class _ProcessorWithoutReplacementMethods:
+class _ProcessorWithoutReplacementMethods(_FakeNativeTemplateProcessor):
     def __init__(self):
         self.tokenizer = _FakeMiniMaxTokenizer()
         self.image_processor = SimpleNamespace(merge_size=2)
         self.video_processor = SimpleNamespace(merge_size=2, temporal_patch_size=2)
+        self.chat_template_calls = []
+
+
+def test_minimax_chat_template_uses_hf_native_template_and_masks_generation_prefix():
+    processor = _ProcessorWithoutReplacementMethods()
+    chat_template = MiniMaxM3VLChatTemplate(processor)
+    encoded = chat_template.encode_messages(
+        [["user", ("text", "Question")], ["assistant", ("text", "Answer")]],
+        processor=processor,
+    )
+
+    expected_messages = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "Answer"},
+    ]
+    expected_text = _render_fake_minimax_chat_template(expected_messages, add_generation_prompt=False)
+    expected_ids = processor.tokenizer.encode(expected_text, add_special_tokens=False)
+    prompt_text = _render_fake_minimax_chat_template(expected_messages[:1], add_generation_prompt=True)
+    prompt_length = len(processor.tokenizer.encode(prompt_text, add_special_tokens=False))
+
+    assert encoded["input_ids"].tolist() == expected_ids
+    assert torch.all(encoded["labels"][:prompt_length] == -100)
+    assert encoded["labels"][prompt_length:].tolist() == expected_ids[prompt_length:]
+    assert [call["add_generation_prompt"] for call in processor.chat_template_calls] == [False, True, False]
+    assert processor.chat_template_calls[-1]["messages"] == expected_messages
+    assert "]~b]ai\n" in expected_text
+    assert "]~b]assistant\n" not in expected_text
 
 
 def test_minimax_chat_template_expands_media_without_processor_replacement_methods():
@@ -196,8 +256,8 @@ def test_minimax_chat_template_expands_media_without_processor_replacement_metho
         image_inputs={"image_grid_thw": torch.tensor([[1, 2, 2], [1, 4, 2]])},
         video_inputs={
             "video_grid_thw": torch.tensor([[2, 2, 2], [1, 4, 2]]),
-            "video_metadata": [SimpleNamespace(fps=2.0, frames_indices=[0, 1, 2, 3]), None],
         },
+        video_metadata=[{"fps": 2.0, "frames_indices": [0, 1, 2, 3]}, None],
     )
 
     assert (encoded["input_ids"] == chat_template.image_token_id).sum().item() == 3
@@ -211,18 +271,19 @@ def test_minimax_chat_template_expands_video_without_metadata(video_metadata):
     processor = _ProcessorWithoutReplacementMethods()
     chat_template = MiniMaxM3VLChatTemplate(processor)
     video_inputs = {"video_grid_thw": torch.tensor([[2, 2, 2]])}
-    if video_metadata != "missing":
-        video_inputs["video_metadata"] = video_metadata
 
     encoded = chat_template.encode_messages(
-        [["user", ("video", None)]], processor=processor, video_inputs=video_inputs
+        [["user", ("video", None)]],
+        processor=processor,
+        video_inputs=video_inputs,
+        video_metadata=None if video_metadata != "missing" else None,
     )
 
     assert (encoded["input_ids"] == chat_template.video_token_id).sum().item() == 2
     assert "seconds[>[" not in processor.tokenizer.last_encoded_text
 
 
-class _RealMiniMaxVideoProcessorShim:
+class _RealMiniMaxVideoProcessorShim(_FakeNativeTemplateProcessor):
     image_token_id = 200025
     video_token_id = 200026
 
@@ -231,6 +292,7 @@ class _RealMiniMaxVideoProcessorShim:
 
         self.tokenizer = _FakeMiniMaxTokenizer()
         self.video_processor = MiniMaxM3VLVideoProcessor()
+        self.chat_template_calls = []
 
     def replace_video_token(self, video_inputs, video_idx):
         merge_length = self.video_processor.merge_size**2
@@ -395,15 +457,17 @@ class _ModelShapeVideoProcessor(_FakeVideoProcessor):
         self.pixel_row_size = pixel_row_size
         self.merge_size = merge_size
 
-    def __call__(self, *, videos, video_metadata, return_tensors, return_metadata):
+    def __call__(self, *, videos, video_metadata, do_sample_frames, return_tensors, return_metadata):
         self.calls.append(
             {
                 "videos": videos,
                 "video_metadata": video_metadata,
+                "do_sample_frames": do_sample_frames,
                 "return_tensors": return_tensors,
                 "return_metadata": return_metadata,
             }
         )
+        assert do_sample_frames is False
         assert return_tensors == "pt"
         assert return_metadata is True
         grid = torch.tensor([[1, self.merge_size, self.merge_size]], dtype=torch.long)
@@ -502,10 +566,13 @@ def test_minimax_m3_vl_transform_to_collator_to_generated_model_backward(monkeyp
     )
     batch = MainCollator(metadata_collate_func=model.get_metadata_collate_func())(features)
 
-    assert batch["multimodal_metadata"] == {
-        "image_grid_thw_list": batch["image_grid_thw"].tolist(),
-        "video_grid_thw_list": batch["video_grid_thw"].tolist(),
-    }
+    multimodal_metadata = batch["multimodal_metadata"]
+    assert multimodal_metadata["image_grid_thw_list"] == batch["image_grid_thw"].tolist()
+    assert multimodal_metadata["video_grid_thw_list"] == batch["video_grid_thw"].tolist()
+    assert multimodal_metadata["vit_image_cu_seqlens"].tolist() == [0, merge**2]
+    assert multimodal_metadata["vit_video_cu_seqlens"].tolist() == [0, merge**2]
+    assert multimodal_metadata["vit_image_max_seqlen"] == merge**2
+    assert multimodal_metadata["vit_video_max_seqlen"] == merge**2
     assert batch["image_mask"].sum().item() == 1
     assert batch["video_mask"].sum().item() == 1
 

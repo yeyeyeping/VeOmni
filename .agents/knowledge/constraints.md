@@ -99,6 +99,11 @@ Core entry points:
    - Device mesh: `init_parallel_state_from_config()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
 
+8a. **A shared MoE load-balancing loss is valid only when it matches the model's router semantics**
+   - Do not attach the Switch-style `load_balancing_loss_func` merely because a model exposes raw router logits. That loss applies `softmax(router_logits)` and performs its own top-k selection.
+   - Routers such as MiniMax M3 instead select experts from `sigmoid(router_logits) + e_score_correction_bias`, then derive expert weights from the unbiased sigmoid scores. A softmax-based auxiliary loss can therefore optimize a different expert assignment from the one executed by the model.
+   - For these models, leave router-logit capture and the generic auxiliary loss disabled until a model-specific balancing algorithm, statistics scope, and distributed update rule are verified against the model's training recipe.
+
 ## Data Pipeline
 
 Core files:

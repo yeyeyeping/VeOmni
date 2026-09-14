@@ -500,7 +500,12 @@ def _load_and_process_video_with_pyav(video_input: Union[ByteString, str], use_a
     audio, audio_fps = None, None
     if use_audio_in_video:
         audio, audio_fps = extract_audio_from_video(video_input)
-    return resized, audio, audio_fps, torch.tensor(indices, dtype=torch.long)
+    video_metadata = {
+        "fps": video_fps,
+        "total_num_frames": total_frames,
+        "frames_indices": torch.tensor(indices, dtype=torch.long),
+    }
+    return resized, audio, audio_fps, video_metadata
 
 
 def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_video: bool = True, **kwargs):

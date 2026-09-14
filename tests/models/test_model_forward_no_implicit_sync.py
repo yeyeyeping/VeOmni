@@ -213,11 +213,11 @@ CASES = [
     # MiniMax M3 VL — full multimodal path with collator-precomputed vision
     # grid lists. The model is available starting in transformers 5.12.
     Case(
-        "minimax_m3_vl-eager",
+        "minimax_m3_vl-fa2",
         _toy("minimax_m3_vl_toy"),
         "MiniMaxM3SparseForConditionalGeneration",
         "vlm_full",
-        attn_implementation="eager",
+        attn_implementation="flash_attention_2",
         dtype="bfloat16",
     ),
 ]
@@ -382,7 +382,7 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     "qwen2_5_omni-fa2": {},
     # MiniMax's collator hook supplies image/video grid lists, so the patched
     # 3D RoPE path does not call ``grid_thw.tolist()`` on the accelerator.
-    "minimax_m3_vl-eager": {},
+    "minimax_m3_vl-fa2": {},
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
@@ -409,18 +409,18 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen2_vl-fa2",
     "qwen2_5_vl-fa2",
     "qwen2_5_omni-fa2",
-    "minimax_m3_vl-eager",
+    "minimax_m3_vl-fa2",
 }
 
 
 def _skip_if_transformers_model_unavailable(case: Case) -> None:
-    if case.case_id == "minimax_m3_vl-eager" and not is_transformers_version_greater_or_equal_to("5.12.0"):
+    if case.case_id == "minimax_m3_vl-fa2" and not is_transformers_version_greater_or_equal_to("5.12.0"):
         pytest.skip("MiniMax M3 VL modeling requires transformers>=5.12.0.")
 
 
 def _make_gate_config(case: Case):
     config = _make_config(case)
-    if case.case_id == "minimax_m3_vl-eager":
+    if case.case_id == "minimax_m3_vl-fa2":
         # The generic VLM fixture places the real MiniMax placeholder IDs in
         # input_ids. Its tiny training toy keeps vocab_size=256 and normally
         # uses inputs_embeds, so expand only this forward-gate config.
