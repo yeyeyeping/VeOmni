@@ -19,6 +19,7 @@ MiniMax M3 run always gets this class regardless of which one ``AutoProcessor``
 resolved from the checkpoint.
 """
 
+from transformers import AutoTokenizer
 from transformers.models.minimax_m3_vl.processing_minimax_m3_vl import (
     MiniMaxM3VLProcessor as HfMiniMaxM3VLProcessor,
 )
@@ -72,6 +73,72 @@ class MiniMaxM3VLProcessor(HfMiniMaxM3VLProcessor):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        processor = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        try:
+            # Force ``trust_remote_code=False`` so a checkpoint that only offers
+            # its sub-processors as remote code fails here immediately and
+            # deterministically, instead of blocking on transformers' interactive
+            # "run custom code? [y/N]" prompt in a TTY. VeOmni never wants the
+            # bundled processor code, so this loses nothing.
+            standard_kwargs = {**kwargs, "trust_remote_code": False}
+            processor = super().from_pretrained(pretrained_model_name_or_path, **standard_kwargs)
+        except Exception as exc:
+            # The public MiniMaxAI/MiniMax-M3 checkpoint declares its image and
+            # video processors *only* through a remote ``auto_map`` (its
+            # ``preprocessor_config.json`` leaves ``image_processor_type`` /
+            # ``video_processor_type`` unset), so ``ProcessorMixin.from_pretrained``
+            # resolves them via ``AutoImageProcessor`` / ``AutoVideoProcessor`` and
+            # demands ``trust_remote_code=True``. ``get_model_processor`` strips
+            # that flag before it re-loads a registered processor, so the resolve
+            # raises -- and the loader's outer ``except`` then masks it as a
+            # misleading "no processor_config.json".
+            #
+            # VeOmni pins M3 to the transformers>=5.12 native classes anyway (the
+            # generated modeling and the HF parity test are written against them),
+            # so build those sub-processors by name, which needs no remote code.
+            logger.warning_rank0(
+                f"[PROCESSOR] MiniMax M3 VL processor could not load through the standard path "
+                f"({type(exc).__name__}: {exc}); rebuilding from the transformers native "
+                "image/video processors. This is expected for the public checkpoint, whose "
+                "sub-processors are declared only via a trust_remote_code auto_map."
+            )
+            processor = cls._from_pretrained_native(pretrained_model_name_or_path, **kwargs)
         _adopt_tokenizer_chat_template(processor)
         return processor
+
+    @classmethod
+    def _from_pretrained_native(cls, pretrained_model_name_or_path, **kwargs):
+        """Construct the processor from the native transformers sub-processors.
+
+        Loads the image and video processors by their concrete class instead of
+        through the Auto* registry, so the checkpoint's remote ``auto_map`` never
+        triggers a ``trust_remote_code`` requirement. ``chat_template`` is read
+        from ``chat_template.jinja`` when present; otherwise
+        ``_adopt_tokenizer_chat_template`` fills it from the tokenizer.
+        """
+        from transformers import MiniMaxM3VLImageProcessor, MiniMaxM3VLVideoProcessor
+        from transformers.utils import CHAT_TEMPLATE_FILE, cached_file
+
+        # ``trust_remote_code`` only ever gated the sub-processor resolution we
+        # are bypassing; the native classes take no such argument.
+        kwargs.pop("trust_remote_code", None)
+
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
+        image_processor = MiniMaxM3VLImageProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        video_processor = MiniMaxM3VLVideoProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+        chat_template = None
+        template_file = cached_file(
+            pretrained_model_name_or_path,
+            CHAT_TEMPLATE_FILE,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if template_file is not None:
+            with open(template_file, encoding="utf-8") as reader:
+                chat_template = reader.read()
+
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            video_processor=video_processor,
+            chat_template=chat_template,
+        )

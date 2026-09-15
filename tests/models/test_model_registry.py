@@ -86,6 +86,34 @@ def test_minimax_m3_vl_processor_chat_template_fallback(processor_template, toke
     assert processor.chat_template == expected
 
 
+@pytest.mark.skipif(
+    not is_transformers_version_greater_or_equal_to("5.12.0"),
+    reason="MiniMax M3 VL processor requires transformers>=5.12.0.",
+)
+def test_minimax_m3_vl_processor_falls_back_to_native_subprocessors(monkeypatch):
+    # The public MiniMaxAI/MiniMax-M3 checkpoint declares its image/video
+    # processors only through a trust_remote_code auto_map, so the standard
+    # ProcessorMixin.from_pretrained raises once get_model_processor has stripped
+    # trust_remote_code. from_pretrained must recover by building the native
+    # sub-processors instead of letting that error surface (masked by the
+    # loader as a misleading "no processor_config.json").
+    from veomni.models.transformers.minimax_m3_vl import processing_minimax_m3_vl as mod
+
+    def _boom(*args, **kwargs):
+        raise ValueError("contains custom code which must be executed ... trust_remote_code=True")
+
+    sentinel = object()
+
+    def _fake_native(cls, path, **kwargs):
+        return sentinel
+
+    monkeypatch.setattr(mod.HfMiniMaxM3VLProcessor, "from_pretrained", classmethod(_boom), raising=False)
+    monkeypatch.setattr(mod.MiniMaxM3VLProcessor, "_from_pretrained_native", classmethod(_fake_native))
+    monkeypatch.setattr(mod, "_adopt_tokenizer_chat_template", lambda processor: None)
+
+    assert mod.MiniMaxM3VLProcessor.from_pretrained("unused") is sentinel
+
+
 @pytest.mark.parametrize(
     "config_path, is_hf_model, load_processor, hf_registered, veomni_registered", local_test_cases
 )
