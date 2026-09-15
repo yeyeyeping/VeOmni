@@ -1,6 +1,8 @@
+from types import SimpleNamespace
+
 import pytest
 
-from veomni.models.loader import get_model_class, get_model_config, get_model_processor
+from veomni.models.loader import MODEL_PROCESSOR_REGISTRY, get_model_class, get_model_config, get_model_processor
 from veomni.models.transformers.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLTextConfig
 from veomni.utils.helper import get_cache_dir
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -36,6 +38,52 @@ def test_minimax_m3_text_rope_uses_only_rotary_dim_channels():
     config = MiniMaxM3VLTextConfig(head_dim=128, rotary_dim=64)
 
     assert MiniMaxM3VLRotaryEmbedding(config).inv_freq.shape == (32,)
+
+
+# Public MiniMax M3 checkpoints ship their own processing_minimax.py, so which
+# class name AutoProcessor resolves depends on the checkpoint's auto_map. Both
+# must route to VeOmni's processor.
+@pytest.mark.parametrize("processor_class_name", ["MiniMaxM3VLProcessor", "MiniMaxVLProcessor"])
+def test_minimax_m3_vl_processor_is_registered(processor_class_name):
+    assert processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys()
+
+
+@pytest.mark.skipif(
+    not is_transformers_version_greater_or_equal_to("5.12.0"),
+    reason="MiniMax M3 VL processor requires transformers>=5.12.0.",
+)
+@pytest.mark.parametrize("processor_class_name", ["MiniMaxM3VLProcessor", "MiniMaxVLProcessor"])
+def test_minimax_m3_vl_processor_registry_resolves_to_veomni_class(processor_class_name):
+    from veomni.models.transformers.minimax_m3_vl.processing_minimax_m3_vl import MiniMaxM3VLProcessor
+
+    assert MODEL_PROCESSOR_REGISTRY[processor_class_name]() is MiniMaxM3VLProcessor
+
+
+@pytest.mark.skipif(
+    not is_transformers_version_greater_or_equal_to("5.12.0"),
+    reason="MiniMax M3 VL processor requires transformers>=5.12.0.",
+)
+@pytest.mark.parametrize(
+    "processor_template, tokenizer_template, expected",
+    [
+        # A processor class that drops **kwargs in __init__ -- or a checkpoint
+        # that keeps its template in tokenizer_config.json -- leaves the
+        # processor with no template at all, and encode_messages would then die
+        # on the first sample.
+        pytest.param(None, "{{ tokenizer_template }}", "{{ tokenizer_template }}", id="recovered_from_tokenizer"),
+        pytest.param("{{ processor_template }}", "{{ tokenizer_template }}", "{{ processor_template }}", id="kept"),
+        pytest.param(None, None, None, id="nothing_to_recover"),
+    ],
+)
+def test_minimax_m3_vl_processor_chat_template_fallback(processor_template, tokenizer_template, expected):
+    from veomni.models.transformers.minimax_m3_vl.processing_minimax_m3_vl import _adopt_tokenizer_chat_template
+
+    processor = SimpleNamespace(
+        chat_template=processor_template, tokenizer=SimpleNamespace(chat_template=tokenizer_template)
+    )
+    _adopt_tokenizer_chat_template(processor)
+
+    assert processor.chat_template == expected
 
 
 @pytest.mark.parametrize(

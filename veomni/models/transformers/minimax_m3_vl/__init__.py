@@ -13,7 +13,7 @@
 # limitations under the License.
 from ....utils.device import IS_NPU_AVAILABLE
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
-from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
 
 _MINIMAX_M3_TRANSFORMERS_REQUIREMENT = (
@@ -43,6 +43,22 @@ def register_minimax_m3_vl_vision_config():
     from .configuration_minimax_m3_vl import MiniMaxM3VLVisionConfig
 
     return MiniMaxM3VLVisionConfig
+
+
+# ``get_model_processor`` keys this registry on the class name ``AutoProcessor``
+# resolved from the checkpoint. Public MiniMax M3 checkpoints ship their own
+# ``processing_minimax.py`` (``MiniMaxVLProcessor``) alongside the upstream class
+# name, and which one wins depends on the checkpoint's ``auto_map``; register
+# both so VeOmni's processor is used either way.
+@MODEL_PROCESSOR_REGISTRY.register("MiniMaxVLProcessor")
+@MODEL_PROCESSOR_REGISTRY.register("MiniMaxM3VLProcessor")
+def register_minimax_m3_vl_processor():
+    if not is_transformers_version_greater_or_equal_to("5.12.0"):
+        raise RuntimeError(_MINIMAX_M3_TRANSFORMERS_REQUIREMENT)
+
+    from .processing_minimax_m3_vl import MiniMaxM3VLProcessor
+
+    return MiniMaxM3VLProcessor
 
 
 @MODELING_REGISTRY.register("minimax_m3_vl")

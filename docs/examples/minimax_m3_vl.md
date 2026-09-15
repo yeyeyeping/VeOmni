@@ -35,6 +35,7 @@ The public checkpoint can be referenced through either Hugging Face or ModelScop
 
 - `configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml`
 - `veomni/models/transformers/minimax_m3_vl/configuration_minimax_m3_vl.py`
+- `veomni/models/transformers/minimax_m3_vl/processing_minimax_m3_vl.py`
 - `veomni/models/transformers/minimax_m3_vl/minimax_m3_vl_gpu_patch_gen_config.py`
 - `veomni/models/transformers/minimax_m3_vl/minimax_m3_vl_npu_patch_gen_config.py`
 - `veomni/models/transformers/minimax_m3_vl/generated/patched_modeling_minimax_m3_vl_gpu.py`
@@ -50,6 +51,7 @@ The `minimax_m3_vl` data transform reuses VeOmni's multimodal fetch and collate 
 - `processor.image_processor(..., return_tensors="pt")` emits `pixel_values` and `image_grid_thw`.
 - `processor.video_processor(..., return_metadata=True)` emits `pixel_values_videos`, `video_grid_thw`, and metadata used to expand MiniMax video timestamp tokens.
 - `processor.apply_chat_template(..., tokenize=False)` applies the checkpoint's native MiniMax conversation protocol; VeOmni tokenizes the rendered string and masks the generation header, non-assistant turns, and visual placeholders in the labels.
+- `MODEL_PROCESSOR_REGISTRY` maps both `MiniMaxM3VLProcessor` (upstream) and `MiniMaxVLProcessor` (the class in the checkpoint's bundled `processing_minimax.py`) to `veomni/models/transformers/minimax_m3_vl/processing_minimax_m3_vl.py`, so training always runs the transformers>=5.12 implementation the generated modeling and the parity test are written against, whatever the checkpoint's `auto_map` resolves to. That class also restores the chat template from the tokenizer when the checkpoint exposes none at processor level -- the bundled `MiniMaxVLProcessor.__init__` drops `**kwargs` and so loses the `chat_template.jinja` that `from_pretrained` passes through it, which otherwise surfaces as *"this processor does not have a chat template"* on the first sample.
 - `MainCollator` packs `pixel_values`, `pixel_values_videos`, `image_grid_thw`, and `video_grid_thw` through the existing VLM collate rules.
 - The MiniMax generated model exposes `get_metadata_collate_func()`, which converts packed `image_grid_thw` / `video_grid_thw` into `multimodal_metadata` grid lists on CPU. The vision tower consumes those lists to avoid calling `grid_thw.tolist()` inside the CUDA/NPU forward path.
 
