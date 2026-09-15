@@ -30,111 +30,53 @@ from ....utils import logging
 logger = logging.get_logger(__name__)
 
 
-def _adopt_tokenizer_chat_template(processor) -> None:
-    """Fall back to the tokenizer's chat template when the processor has none.
-
-    ``ProcessorMixin.from_pretrained`` parses ``chat_template.jinja`` and hands
-    it to the constructor as a ``chat_template`` kwarg, so a processor class
-    whose ``__init__`` drops ``**kwargs`` silently loses it -- the bundled
-    ``MiniMaxVLProcessor`` does exactly that. Checkpoints that keep the template
-    in ``tokenizer_config.json`` instead of ``chat_template.jinja`` end up in the
-    same state, because that file is only read by the tokenizer. Either way
-    ``encode_messages`` dies on the first sample with "this processor does not
-    have a chat template", even though the checkpoint ships one.
-
-    The tokenizer parses both of those sources and keeps what it finds, so reuse
-    its copy. Only fires when the processor carries no template of its own, so
-    an M3 checkpoint that ships a processor-level template that deliberately
-    differs from the tokenizer's is never overwritten.
-    """
-    if getattr(processor, "chat_template", None) is not None:
-        return
-
-    tokenizer_template = getattr(getattr(processor, "tokenizer", None), "chat_template", None)
-    if tokenizer_template is None:
-        return
-
-    processor.chat_template = tokenizer_template
-    logger.warning_rank0(
-        "[PROCESSOR] MiniMax M3 VL checkpoint exposes no processor-level chat template; reusing the "
-        "tokenizer's. VeOmni's M3 data transform renders conversations through "
-        "processor.apply_chat_template, which would otherwise refuse to run."
-    )
-
-
 class MiniMaxM3VLProcessor(HfMiniMaxM3VLProcessor):
-    """Upstream M3 processor plus VeOmni's chat-template recovery.
+    """MiniMax M3 VL processor built purely from the transformers-native classes.
 
     VeOmni pins MiniMax M3 to the transformers>=5.12 implementation -- that is
-    what the generated modeling and the HF parity test are written against -- so
-    this subclass also serves to keep the checkpoint's bundled processor code
-    out of the training path.
+    what the generated modeling and the HF parity test are written against -- and
+    the checkpoint's bundled ``processing_minimax.py`` is unusable regardless: its
+    ``MiniMaxVLProcessor.__init__`` drops ``**kwargs`` and so loses the
+    ``chat_template.jinja`` that ``from_pretrained`` passes through, and its
+    ``preprocessor_config.json`` declares the image/video processors *only* via a
+    ``trust_remote_code`` ``auto_map``.
+
+    So this class never runs the bundled code and never goes through
+    ``AutoProcessor`` / ``ProcessorMixin.from_pretrained``. It builds the tokenizer
+    and the native image/video processors by their concrete class -- each of which
+    reads all of its parameters from the checkpoint's own config files -- and takes
+    the chat template straight from the tokenizer, which is the one component that
+    parses both ``chat_template.jinja`` and a ``tokenizer_config.json`` template.
     """
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        try:
-            # Force ``trust_remote_code=False`` so a checkpoint that only offers
-            # its sub-processors as remote code fails here immediately and
-            # deterministically, instead of blocking on transformers' interactive
-            # "run custom code? [y/N]" prompt in a TTY. VeOmni never wants the
-            # bundled processor code, so this loses nothing.
-            standard_kwargs = {**kwargs, "trust_remote_code": False}
-            processor = super().from_pretrained(pretrained_model_name_or_path, **standard_kwargs)
-        except Exception as exc:
-            # The public MiniMaxAI/MiniMax-M3 checkpoint declares its image and
-            # video processors *only* through a remote ``auto_map`` (its
-            # ``preprocessor_config.json`` leaves ``image_processor_type`` /
-            # ``video_processor_type`` unset), so ``ProcessorMixin.from_pretrained``
-            # resolves them via ``AutoImageProcessor`` / ``AutoVideoProcessor`` and
-            # demands ``trust_remote_code=True``. ``get_model_processor`` strips
-            # that flag before it re-loads a registered processor, so the resolve
-            # raises -- and the loader's outer ``except`` then masks it as a
-            # misleading "no processor_config.json".
-            #
-            # VeOmni pins M3 to the transformers>=5.12 native classes anyway (the
-            # generated modeling and the HF parity test are written against them),
-            # so build those sub-processors by name, which needs no remote code.
-            logger.warning_rank0(
-                f"[PROCESSOR] MiniMax M3 VL processor could not load through the standard path "
-                f"({type(exc).__name__}: {exc}); rebuilding from the transformers native "
-                "image/video processors. This is expected for the public checkpoint, whose "
-                "sub-processors are declared only via a trust_remote_code auto_map."
-            )
-            processor = cls._from_pretrained_native(pretrained_model_name_or_path, **kwargs)
-        _adopt_tokenizer_chat_template(processor)
-        return processor
-
-    @classmethod
-    def _from_pretrained_native(cls, pretrained_model_name_or_path, **kwargs):
-        """Construct the processor from the native transformers sub-processors.
-
-        Loads the image and video processors by their concrete class instead of
-        through the Auto* registry, so the checkpoint's remote ``auto_map`` never
-        triggers a ``trust_remote_code`` requirement. ``chat_template`` is read
-        from ``chat_template.jinja`` when present; otherwise
-        ``_adopt_tokenizer_chat_template`` fills it from the tokenizer.
-        """
-        from transformers import MiniMaxM3VLImageProcessor, MiniMaxM3VLVideoProcessor
-        from transformers.utils import CHAT_TEMPLATE_FILE, cached_file
-
-        # ``trust_remote_code`` only ever gated the sub-processor resolution we
-        # are bypassing; the native classes take no such argument.
+        # ``trust_remote_code`` only ever gated the Auto* sub-processor resolution
+        # we deliberately bypass; the concrete native classes take no such flag.
         kwargs.pop("trust_remote_code", None)
 
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
-        image_processor = MiniMaxM3VLImageProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        video_processor = MiniMaxM3VLVideoProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        from transformers import MiniMaxM3VLImageProcessor, MiniMaxM3VLVideoProcessor
 
-        chat_template = None
-        template_file = cached_file(
-            pretrained_model_name_or_path,
-            CHAT_TEMPLATE_FILE,
-            _raise_exceptions_for_missing_entries=False,
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=False, **kwargs)
+        image_processor = MiniMaxM3VLImageProcessor.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=False, **kwargs
         )
-        if template_file is not None:
-            with open(template_file, encoding="utf-8") as reader:
-                chat_template = reader.read()
+        video_processor = MiniMaxM3VLVideoProcessor.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=False, **kwargs
+        )
+
+        # The tokenizer already parses the checkpoint's chat template from
+        # whichever file carries it (``chat_template.jinja`` on the public
+        # checkpoint, or a ``tokenizer_config.json`` entry), so it is the single
+        # authoritative source. The M3 data transform renders conversations
+        # through ``processor.apply_chat_template``, which needs it on the
+        # processor.
+        chat_template = tokenizer.chat_template
+        if chat_template is None:
+            logger.warning_rank0(
+                "[PROCESSOR] MiniMax M3 VL checkpoint ships no chat template on its tokenizer; "
+                "processor.apply_chat_template will refuse to run until one is provided."
+            )
 
         return cls(
             image_processor=image_processor,
