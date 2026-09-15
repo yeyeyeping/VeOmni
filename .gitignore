@@ -172,3 +172,7 @@ nsysoutput/
 
 # Agents worksspace should not be tracked by the primary repo.
 .agents_workspace/
+
+# Local MiniMax M3 checkpoint and scratch audit notes (not part of the repo)
+MiniMax-M3/
+m3_audit_report.md
