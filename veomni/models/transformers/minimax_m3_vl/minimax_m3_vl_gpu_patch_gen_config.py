@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for MiniMax M3 VL transformers>=5.12.0 code generation.
+Patch configuration for MiniMax M3 VL transformers>=5.16.0 code generation.
 
 The VeOmni integration keeps the upstream MiniMax M3 VL modeling body from
 transformers, then adds VeOmni hooks for parallel plans, VLM collator metadata,
@@ -58,7 +58,7 @@ config = PatchConfig(
     source_module="transformers.models.minimax_m3_vl.modeling_minimax_m3_vl",
     target_file="patched_modeling_minimax_m3_vl_gpu.py",
     description="MiniMax M3 VL with VeOmni parallel-plan hooks",
-    transformers_version="5.12.0",
+    transformers_version="5.16.0",
 )
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.ops.dispatch", names=["OpSlot"])
@@ -282,9 +282,8 @@ def _eager_bsnd_attention_forward(
 ) -> torch.Tensor:
     """Run reference attention using the post-Ulysses local GQA ratio."""
     local_num_key_value_groups = query.shape[1] // key.shape[1]
-    if local_num_key_value_groups > 1:
-        key = torch.repeat_interleave(key, local_num_key_value_groups, dim=1)
-        value = torch.repeat_interleave(value, local_num_key_value_groups, dim=1)
+    key = repeat_kv(key, local_num_key_value_groups)
+    value = repeat_kv(value, local_num_key_value_groups)
 
     attention_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
     attention_weights = attention_weights + attention_mask
@@ -365,19 +364,20 @@ def minimax_m3_vl_indexer_forward_patched(
     if pad:
         scores = F.pad(scores, (0, pad), value=float("-inf"))
     scores = scores.view(batch, self.num_heads, q_len, num_key_blocks, self.block_size)
-    block_scores = scores.amax(dim=-1).amax(dim=1)
+    block_scores = scores.amax(dim=-1)
 
     q_block = position_ids // self.block_size
     if self.local_blocks > 0:
         local = torch.arange(self.local_blocks, device=idx_q.device)
         local_idx = (q_block[..., None] - local.view(1, 1, -1)).clamp(min=0)
+        local_idx = local_idx.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
         block_scores.scatter_(-1, local_idx, float("inf"))
 
     topk = min(self.topk_blocks, num_key_blocks)
     topk_scores, topk_indices = block_scores.topk(topk, dim=-1)
     block_indices = topk_indices.masked_fill(topk_scores == float("-inf"), -1)
     if packed_padding_mask is not None:
-        block_indices = block_indices.masked_fill(packed_padding_mask[..., None], -1)
+        block_indices = block_indices.masked_fill(packed_padding_mask[:, None, :, None], -1)
     return block_indices
 
 
@@ -386,6 +386,8 @@ def minimax_m3_vl_indexer_forward_patched(
 # 1. accept a structural BSND padding mask with True=padding
 # 2. compose block selection with token-level causality so future tokens in a
 #    partially selected block remain inaccessible on the dense reference path
+# 3. expand the per-KV-group selection only onto the query heads this rank
+#    owns, so the mask matches the post-Ulysses local head slice
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLIndexer.build_block_mask",
@@ -400,15 +402,24 @@ def minimax_m3_vl_indexer_build_block_mask_patched(
     device,
     position_ids,
     padding_mask=None,
+    query_head_indices=None,
 ):
-    batch, q_len, _ = block_indices.shape
+    batch, n_idx_heads, q_len, _ = block_indices.shape
     num_key_blocks = -(-key_length // self.block_size)
 
     safe = block_indices.masked_fill(block_indices < 0, num_key_blocks)
-    bias = block_indices.new_full((batch, q_len, num_key_blocks + 1), float("-inf"), dtype=dtype)
+    bias = block_indices.new_full((batch, n_idx_heads, q_len, num_key_blocks + 1), float("-inf"), dtype=dtype)
     bias.scatter_(-1, safe, 0.0)
     bias = bias[..., :num_key_blocks]
-    block_keep = (bias == 0.0).repeat_interleave(self.block_size, dim=-1)[..., :key_length].unsqueeze(1)
+    block_keep = (bias == 0.0).repeat_interleave(self.block_size, dim=-1)[..., :key_length]
+
+    # --- Patch.3 ---
+    heads_per_index_head = self.config.num_attention_heads // n_idx_heads
+    if query_head_indices is None:
+        block_keep = block_keep.repeat_interleave(heads_per_index_head, dim=1)
+    else:
+        block_keep = block_keep.index_select(1, query_head_indices // heads_per_index_head)
+    # --- Patch.3 ---
 
     # --- Patch.1 ---
     if padding_mask is not None:
@@ -550,6 +561,13 @@ def minimax_m3_vl_attention_forward_patched(
     if self.indexer is None:
         reference_mask = _build_bsnd_causal_mask(packed_padding_mask, query_states.dtype)
     else:
+        # Ulysses scatters query heads contiguously, so this rank owns
+        # global heads [rank * local_heads, (rank + 1) * local_heads).
+        query_head_indices = None
+        if parallel_state.ulysses_enabled:
+            local_num_heads = query_states.shape[1]
+            head_start = parallel_state.ulysses_rank * local_num_heads
+            query_head_indices = torch.arange(head_start, head_start + local_num_heads, device=query_states.device)
         reference_mask = self.indexer.build_block_mask(
             block_indices,
             attention_mask=None,
@@ -558,6 +576,7 @@ def minimax_m3_vl_attention_forward_patched(
             device=query_states.device,
             position_ids=position_ids,
             padding_mask=packed_padding_mask,
+            query_head_indices=query_head_indices,
         )
 
     # --- Patch.4 ---
@@ -583,33 +602,25 @@ def minimax_m3_vl_attention_forward_patched(
 
 # ================================================================
 # Patch: MiniMaxM3VL3DRotaryEmbedding.forward
-# 1. accept CPU-precomputed grid_thw_list from the collator so the vision
-#    forward does not call `.tolist()` on a CUDA tensor in the hot path
-# 2. keep the upstream tensor fallback for external callers that bypass
-#    VeOmni's MainCollator
+# 1. accept CPU-precomputed grid_thw_list from the collator and hand a CPU grid
+#    to `get_vision_position_ids`, so its `.tolist()` never syncs a CUDA tensor
+#    in the hot path; external callers without the list keep the upstream path
 # ================================================================
 @config.override_method(
     "MiniMaxM3VL3DRotaryEmbedding.forward",
     description="Consume collator-precomputed MiniMax vision grid lists when available",
 )
-def minimax_m3_vl_3d_rotary_embedding_forward_patched(self, grid_thw, device, dtype, grid_thw_list=None):
+def minimax_m3_vl_3d_rotary_embedding_forward_patched(self, grid_thw, device, dtype, kwargs=None, grid_thw_list=None):
     # --- Patch.1 ---
-    m = self.spatial_merge_size
-    coords = []
-    for t, h, w in _grid_thw_to_list(grid_thw, grid_thw_list):
-        hi = torch.arange(h).unsqueeze(1).expand(-1, w)
-        hi = hi.reshape(h // m, m, w // m, m).permute(0, 2, 1, 3).flatten()
-        wi = torch.arange(w).unsqueeze(0).expand(h, -1)
-        wi = wi.reshape(h // m, m, w // m, m).permute(0, 2, 1, 3).flatten()
-        ti = torch.arange(t).repeat_interleave(h * w)
-        coords.append(torch.stack([ti, hi.repeat(t), wi.repeat(t)], dim=-1))
+    if grid_thw_list is not None:
+        grid_thw = torch.tensor(grid_thw_list, dtype=torch.long)
     # --- Patch.1 ---
-    coords = torch.cat(coords).to(device=device, dtype=torch.float32)
-
+    coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
+    coords = coords.to(device=device, dtype=torch.float32)
     inv_freq = 1.0 / (
         self.theta ** (torch.arange(0, self.axis_dim, 2, dtype=torch.float32, device=device) / self.axis_dim)
     )
-    freqs = torch.cat([coords[:, i : i + 1] * inv_freq for i in range(3)], dim=-1)
+    freqs = (coords.unsqueeze(-1) * inv_freq).reshape(coords.shape[0], -1)
     emb = torch.cat([freqs, freqs], dim=-1)
     return emb.cos().to(dtype), emb.sin().to(dtype)
 
@@ -626,9 +637,9 @@ def minimax_m3_vl_3d_rotary_embedding_forward_patched(self, grid_thw, device, dt
     "MiniMaxM3VLVisionModel.forward",
     description="Add MiniMax vision SP RoPE and varlen-attention metadata handling",
 )
-def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, image_grid_thw, **kwargs):
+def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, grid_thw, **kwargs):
     r"""
-    image_grid_thw (`torch.Tensor` of shape `(num_images, 3)`):
+    grid_thw (`torch.Tensor` of shape `(num_images, 3)`):
         The temporal, height and width of each image's feature grid, used to build the vision 3D RoPE.
     """
     vit_metadata = kwargs.pop("vit_metadata", None) or {}
@@ -637,13 +648,14 @@ def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, image_grid_th
     precomputed_max_seqlen = vit_metadata.get("max_seqlen")
 
     embeds = self.embeddings(pixel_values).to(self.pre_layrnorm.weight.dtype)
-    grid_thw_list = _grid_thw_to_list(image_grid_thw, precomputed_grid_thw_list)
+    grid_thw_list = _grid_thw_to_list(grid_thw, precomputed_grid_thw_list)
     total_seq_len = sum(t * h * w for t, h, w in grid_thw_list)
 
     cos, sin = self.rotary_emb(
-        image_grid_thw,
+        grid_thw,
         device=embeds.device,
         dtype=embeds.dtype,
+        kwargs=kwargs,
         grid_thw_list=grid_thw_list,
     )
 
@@ -679,7 +691,7 @@ def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, image_grid_th
     if precomputed_cu_seqlens is not None:
         cu_seqlens = precomputed_cu_seqlens.to(
             embeds.device,
-            dtype=image_grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
             non_blocking=True,
         )
     else:
@@ -694,7 +706,7 @@ def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, image_grid_th
         cu_seqlens = torch.tensor(
             cu_seqlens_list,
             device=embeds.device,
-            dtype=image_grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
 
     if precomputed_max_seqlen is not None:
@@ -760,7 +772,7 @@ def minimax_m3_vl_vision_dummy_forward_patched(self):
         "cu_seqlens": torch.tensor([0, num_patches], dtype=torch.int32, device="cpu"),
         "max_seqlen": num_patches,
     }
-    return self(pixel_values=pixel_values, image_grid_thw=grid_thw, vit_metadata=vit_metadata)
+    return self(pixel_values=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
     # --- Patch.1 ---
 
 

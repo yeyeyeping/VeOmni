@@ -353,8 +353,8 @@ def test_minimax_m3_vl_transform_uses_real_chat_template_replacements(monkeypatc
 
 
 @pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.12.0"),
-    reason="MiniMax M3 VL video processor requires transformers>=5.12.0",
+    not is_transformers_version_greater_or_equal_to("5.16.0"),
+    reason="MiniMax M3 VL video processor requires transformers>=5.16.0",
 )
 def test_minimax_m3_vl_transform_uses_veomni_video_fetch_with_real_processor(monkeypatch):
     """Exercise MiniMax with VeOmni's default pre-decoded-frame video path."""
@@ -389,8 +389,8 @@ def test_minimax_m3_vl_transform_uses_veomni_video_fetch_with_real_processor(mon
 
 
 @pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.12.0"),
-    reason="MiniMax M3 VL video processor requires transformers>=5.12.0",
+    not is_transformers_version_greater_or_equal_to("5.16.0"),
+    reason="MiniMax M3 VL video processor requires transformers>=5.16.0",
 )
 @pytest.mark.parametrize("container_kind", ["path", "bytes"])
 def test_minimax_m3_vl_transform_uses_video_container_with_real_processor(monkeypatch, tmp_path, container_kind):
@@ -499,8 +499,8 @@ def eager_loss_mapping():
 
 
 @pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.12.0"),
-    reason="MiniMax M3 VL generated modeling requires transformers>=5.12.0",
+    not is_transformers_version_greater_or_equal_to("5.16.0"),
+    reason="MiniMax M3 VL generated modeling requires transformers>=5.16.0",
 )
 @pytest.mark.usefixtures("eager_loss_mapping")
 def test_minimax_m3_vl_transform_to_collator_to_generated_model_backward(monkeypatch):

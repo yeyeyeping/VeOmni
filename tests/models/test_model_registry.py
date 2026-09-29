@@ -27,8 +27,8 @@ def test_minimax_m3_text_config_preserves_partial_rotary_factor():
 
 
 @pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.12.0"),
-    reason="MiniMax M3 VL generated modeling requires transformers>=5.12.0.",
+    not is_transformers_version_greater_or_equal_to("5.16.0"),
+    reason="MiniMax M3 VL generated modeling requires transformers>=5.16.0.",
 )
 def test_minimax_m3_text_rope_uses_only_rotary_dim_channels():
     from veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu import (
@@ -49,8 +49,8 @@ def test_minimax_m3_vl_processor_is_registered(processor_class_name):
 
 
 @pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.12.0"),
-    reason="MiniMax M3 VL processor requires transformers>=5.12.0.",
+    not is_transformers_version_greater_or_equal_to("5.16.0"),
+    reason="MiniMax M3 VL processor requires transformers>=5.16.0.",
 )
 @pytest.mark.parametrize("processor_class_name", ["MiniMaxM3VLProcessor", "MiniMaxVLProcessor"])
 def test_minimax_m3_vl_processor_registry_resolves_to_veomni_class(processor_class_name):
@@ -60,8 +60,8 @@ def test_minimax_m3_vl_processor_registry_resolves_to_veomni_class(processor_cla
 
 
 @pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.12.0"),
-    reason="MiniMax M3 VL processor requires transformers>=5.12.0.",
+    not is_transformers_version_greater_or_equal_to("5.16.0"),
+    reason="MiniMax M3 VL processor requires transformers>=5.16.0.",
 )
 def test_minimax_m3_vl_processor_builds_from_native_subprocessors(monkeypatch):
     # VeOmni pins M3 to the transformers-native classes and the public checkpoint

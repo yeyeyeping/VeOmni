@@ -25,8 +25,8 @@ _FREEZE_VIT_VLM_CASES = [
     pytest.param(
         "./tests/toy_config/minimax_m3_vl_toy/config.json",
         marks=pytest.mark.skipif(
-            not is_transformers_version_greater_or_equal_to("5.12.0"),
-            reason="MiniMax M3 VL modeling requires transformers>=5.12.0",
+            not is_transformers_version_greater_or_equal_to("5.16.0"),
+            reason="MiniMax M3 VL modeling requires transformers>=5.16.0",
         ),
         id="minimax_m3_vl",
     ),

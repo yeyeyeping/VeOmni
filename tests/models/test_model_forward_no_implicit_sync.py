@@ -414,8 +414,8 @@ _MM_METADATA_WIRED_CASES: set[str] = {
 
 
 def _skip_if_transformers_model_unavailable(case: Case) -> None:
-    if case.case_id == "minimax_m3_vl-fa2" and not is_transformers_version_greater_or_equal_to("5.12.0"):
-        pytest.skip("MiniMax M3 VL modeling requires transformers>=5.12.0.")
+    if case.case_id == "minimax_m3_vl-fa2" and not is_transformers_version_greater_or_equal_to("5.16.0"):
+        pytest.skip("MiniMax M3 VL modeling requires transformers>=5.16.0.")
 
 
 def _make_gate_config(case: Case):

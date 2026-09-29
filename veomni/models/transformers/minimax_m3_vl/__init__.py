@@ -17,7 +17,7 @@ from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_
 
 
 _MINIMAX_M3_TRANSFORMERS_REQUIREMENT = (
-    "MiniMax M3 VL modeling requires a local environment with transformers>=5.12.0, "
+    "MiniMax M3 VL modeling requires a local environment with transformers>=5.16.0, "
     "because earlier transformers releases do not ship transformers.models.minimax_m3_vl. "
     "VeOmni keeps the global transformers-stable pin unchanged; use the MiniMax example "
     "environment documented in docs/examples/minimax_m3_vl.md when training this model."
@@ -53,7 +53,7 @@ def register_minimax_m3_vl_vision_config():
 @MODEL_PROCESSOR_REGISTRY.register("MiniMaxVLProcessor")
 @MODEL_PROCESSOR_REGISTRY.register("MiniMaxM3VLProcessor")
 def register_minimax_m3_vl_processor():
-    if not is_transformers_version_greater_or_equal_to("5.12.0"):
+    if not is_transformers_version_greater_or_equal_to("5.16.0"):
         raise RuntimeError(_MINIMAX_M3_TRANSFORMERS_REQUIREMENT)
 
     from .processing_minimax_m3_vl import MiniMaxM3VLProcessor
@@ -68,7 +68,7 @@ def register_minimax_m3_vl_modeling(architecture: str):
         create_minimax_m3_vl_checkpoint_tensor_converter,
     )
 
-    if not is_transformers_version_greater_or_equal_to("5.12.0"):
+    if not is_transformers_version_greater_or_equal_to("5.16.0"):
         raise RuntimeError(_MINIMAX_M3_TRANSFORMERS_REQUIREMENT)
 
     if IS_NPU_AVAILABLE:

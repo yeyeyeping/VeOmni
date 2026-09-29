@@ -24,8 +24,8 @@ MODEL_ID = os.environ.get("MINIMAX_M3_VL_MODEL_ID")
 
 
 @pytest.mark.skipif(
-    not MODEL_ID or not is_transformers_version_greater_or_equal_to("5.12.0"),
-    reason="Set MINIMAX_M3_VL_MODEL_ID and install transformers>=5.12.0.",
+    not MODEL_ID or not is_transformers_version_greater_or_equal_to("5.16.0"),
+    reason="Set MINIMAX_M3_VL_MODEL_ID and install transformers>=5.16.0.",
 )
 def test_process_sample_minimax_m3_vl_matches_hf_processor(monkeypatch, tmp_path):
     transformers = pytest.importorskip("transformers")

@@ -29,8 +29,8 @@ _MODELING_MODULES = (
 )
 
 pytestmark = pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.12.0"),
-    reason="MiniMax M3 VL generated modeling requires transformers>=5.12.0.",
+    not is_transformers_version_greater_or_equal_to("5.16.0"),
+    reason="MiniMax M3 VL generated modeling requires transformers>=5.16.0.",
 )
 
 
@@ -69,6 +69,7 @@ def test_minimax_m3_vl_for_causal_lm_unpacks_veomni_loss_contract(module_name):
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=1,
+        index_n_heads=1,
         head_dim=4,
         rotary_dim=4,
         num_local_experts=2,
@@ -116,6 +117,7 @@ def test_minimax_m3_vl_rejects_incompatible_router_aux_loss(module_name):
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=1,
+        index_n_heads=1,
         head_dim=4,
         rotary_dim=4,
         num_local_experts=2,
@@ -149,6 +151,7 @@ def test_minimax_m3_vl_text_model_keeps_decoder_packed_and_unpacks_only_attentio
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=1,
+        index_n_heads=1,
         head_dim=4,
         rotary_dim=4,
         num_local_experts=2,
@@ -293,6 +296,7 @@ def test_minimax_m3_vl_text_model_single_sequence_preserves_packed_shape(module_
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=1,
+        index_n_heads=1,
         head_dim=4,
         rotary_dim=4,
         num_local_experts=2,
@@ -377,6 +381,7 @@ def test_minimax_m3_vl_full_attention_packed_matches_separate_samples(module_nam
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=1,
+        index_n_heads=1,
         head_dim=4,
         rotary_dim=4,
         num_local_experts=2,
@@ -434,6 +439,7 @@ def test_minimax_m3_vl_packed_layout_is_prepared_once_per_model_forward(module_n
         num_hidden_layers=2,
         num_attention_heads=2,
         num_key_value_heads=1,
+        index_n_heads=1,
         head_dim=4,
         rotary_dim=4,
         num_local_experts=2,
@@ -480,6 +486,7 @@ def test_minimax_m3_vl_language_sp_communicates_before_unpack_and_restores_packe
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=1,
+        index_n_heads=1,
         head_dim=4,
         rotary_dim=4,
         num_local_experts=2,
@@ -494,6 +501,7 @@ def test_minimax_m3_vl_language_sp_communicates_before_unpack_and_restores_packe
     parallel_state = SimpleNamespace(
         ulysses_enabled=True,
         ulysses_size=2,
+        ulysses_rank=0,
         ulysses_group=group,
         cp_enabled=False,
     )
@@ -552,6 +560,68 @@ def test_minimax_m3_vl_language_sp_communicates_before_unpack_and_restores_packe
     assert calls[2][1][1] == 2
     assert calls[3][1][1] == 4
     assert all(call[-1] is group or call[0] == "main_prepare" for call in calls)
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_block_mask_follows_upstream_per_kv_group_and_ulysses_head_slices(module_name):
+    modeling = importlib.import_module(module_name)
+    upstream = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    config = modeling.MiniMaxM3VLTextConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=6,
+        dense_intermediate_size=12,
+        shared_intermediate_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        index_n_heads=2,
+        index_head_dim=4,
+        index_block_size=2,
+        index_topk_blocks=2,
+        index_local_blocks=1,
+        head_dim=4,
+        rotary_dim=4,
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        layer_types=["minimax_m3_sparse"],
+        mlp_layer_types=["dense"],
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    torch.manual_seed(0)
+    indexer = modeling.MiniMaxM3VLIndexer(config, layer_idx=0)
+    reference = upstream.MiniMaxM3VLIndexer(config, layer_idx=0)
+    reference.load_state_dict(indexer.state_dict())
+
+    sequence_length = 8
+    hidden_states = torch.randn(1, sequence_length, config.hidden_size)
+    position_ids = torch.arange(sequence_length).unsqueeze(0)
+    position_embeddings = modeling.MiniMaxM3VLRotaryEmbedding(config)(hidden_states, position_ids)
+
+    with torch.no_grad():
+        block_indices = indexer(hidden_states, position_embeddings, None, position_ids)
+        reference_indices = reference(hidden_states, position_embeddings, None, position_ids)
+    assert block_indices.shape == (1, config.index_n_heads, sequence_length, config.index_topk_blocks)
+    torch.testing.assert_close(block_indices, reference_indices, rtol=0, atol=0)
+
+    mask_args = (None, sequence_length, torch.float32, hidden_states.device, position_ids)
+    full_mask = indexer.build_block_mask(block_indices, *mask_args)
+    torch.testing.assert_close(full_mask, reference.build_block_mask(reference_indices, *mask_args), rtol=0, atol=0)
+    assert full_mask.shape == (1, config.num_attention_heads, sequence_length, sequence_length)
+
+    # Each Ulysses rank owns a contiguous query-head slice and must see exactly
+    # that slice of the per-KV-group mask, including when ulysses_size > kv heads.
+    for ulysses_size in (2, 4):
+        local_num_heads = config.num_attention_heads // ulysses_size
+        for rank in range(ulysses_size):
+            head_start = rank * local_num_heads
+            local_mask = indexer.build_block_mask(
+                block_indices,
+                *mask_args,
+                query_head_indices=torch.arange(head_start, head_start + local_num_heads),
+            )
+            torch.testing.assert_close(local_mask, full_mask[:, head_start : head_start + local_num_heads])
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
@@ -633,7 +703,7 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
     pixel_values = torch.randn(8, config.num_channels * config.temporal_patch_size * config.patch_size**2)
     output = vision_model(
         pixel_values=pixel_values,
-        image_grid_thw=grid_thw,
+        grid_thw=grid_thw,
         vit_metadata=vit_metadata,
     )
 

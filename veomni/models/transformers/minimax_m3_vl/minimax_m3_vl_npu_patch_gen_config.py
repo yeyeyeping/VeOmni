@@ -57,7 +57,7 @@ config = PatchConfig(
     source_module="transformers.models.minimax_m3_vl.modeling_minimax_m3_vl",
     target_file="patched_modeling_minimax_m3_vl_npu.py",
     description="MiniMax M3 VL with VeOmni parallel-plan hooks for NPU runtime selection",
-    transformers_version="5.12.0",
+    transformers_version="5.16.0",
 )
 
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
