@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from veomni.ops.kernel_registry import KERNEL_REGISTRY
@@ -53,3 +56,18 @@ def test_swiglu_oai_clamp_backward_masks_saturated_gate_and_up_values():
 
     torch.testing.assert_close(actual_grad_gate, expected_grad_gate)
     torch.testing.assert_close(actual_grad_up, expected_grad_up)
+
+
+def test_swiglu_oai_matches_minimax_eager_gate_bitwise_in_bf16():
+    """Every bf16 op rounds, so the fused activation must use the eager op order exactly."""
+    modeling = pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    limit, alpha = 7.0, 1.702
+    experts = modeling.MiniMaxM3VLExperts.__new__(modeling.MiniMaxM3VLExperts)
+    experts.__dict__.update(vars(SimpleNamespace(swiglu_limit=limit, swiglu_alpha=alpha)))
+    torch.manual_seed(0)
+    gate_up = (4 * torch.randn(64, 2 * 256)).to(torch.bfloat16)
+
+    gate, up = gate_up.chunk(2, dim=-1)
+    output = swiglu_oai(gate.clamp(max=limit), up.clamp(min=-limit, max=limit), alpha)
+
+    torch.testing.assert_close(output, experts._apply_gate(gate_up), rtol=0, atol=0)
