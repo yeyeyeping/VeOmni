@@ -26,7 +26,6 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     MiniMaxM3VLCausalLMOutputWithLogProbs,
     PatchedMiniMaxM3VLExperts,
     PatchedMiniMaxM3VLPreTrainedModel,
-    _build_bsnd_causal_mask,
     _grid_thw_to_list,
     _minimax_m3_indexer_project,
     _validate_minimax_m3_ep,
@@ -37,7 +36,6 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     minimax_m3_vl_get_metadata_collate_func_patched,
     minimax_m3_vl_get_parallel_plan_patched,
     minimax_m3_vl_get_position_id_func_patched,
-    minimax_m3_vl_indexer_build_block_mask_patched,
     minimax_m3_vl_model_forward_patched,
     minimax_m3_vl_rmsnorm_forward_patched,
     minimax_m3_vl_sparse_for_conditional_generation_forward_patched,
@@ -88,7 +86,6 @@ veomni_msa_attention = OpSlot("minimax_sparse_attention", "attention")
 """
 )
 config.add_helper(_grid_thw_to_list)
-config.add_helper(_build_bsnd_causal_mask)
 config.add_helper(_minimax_m3_indexer_project)
 config.add_helper(_validate_minimax_m3_ep)
 config.add_helper(collate_multimodal_metadata)
@@ -132,11 +129,6 @@ config.override_method(
     description="Add MiniMax VLM metadata fast path and FSDP dummy vision branch",
 )
 config.override_method(
-    "MiniMaxM3VLIndexer.build_block_mask",
-    replacement=minimax_m3_vl_indexer_build_block_mask_patched,
-    description="Compose MiniMax block selection with BSND padding and causality",
-)
-config.override_method(
     "MiniMaxM3VLAttention.forward",
     replacement=minimax_m3_vl_attention_forward_patched,
     description="Run packed MiniMax language attention through the TND sparse attention operators",
@@ -144,7 +136,7 @@ config.override_method(
 config.override_method(
     "MiniMaxM3VLTextModel.forward",
     replacement=minimax_m3_vl_text_model_forward_patched,
-    description="Keep decoder states packed and reject KV cache during packed training",
+    description="Accept only packed inputs and reject padded batches, KV cache and CP",
 )
 config.override_method(
     "MiniMaxM3VLForCausalLM.forward",

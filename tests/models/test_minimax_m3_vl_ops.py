@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import importlib
 from types import SimpleNamespace
 
@@ -46,6 +47,16 @@ class _RecordingSlot:
         self.args = args
         self.kwargs = kwargs
         return self.output
+
+
+def _upstream_text_model(model):
+    """Unpatched Transformers text model with the same weights, run with eager attention as the parity reference."""
+    upstream = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    config = copy.deepcopy(model.config)
+    config._attn_implementation = "eager"
+    reference = upstream.MiniMaxM3VLTextModel(config).eval()
+    reference.load_state_dict(model.state_dict())
+    return reference
 
 
 class _RecordingVisionLayer(torch.nn.Module):
@@ -192,17 +203,18 @@ def test_minimax_m3_vl_text_model_keeps_decoder_and_attention_packed(module_name
     second_hidden_states = torch.randn(1, 3, config.hidden_size)
     packed_hidden_states = torch.cat((first_hidden_states, second_hidden_states), dim=1)
     packed_position_ids = torch.tensor([[0, 1, 0, 1, 2]])
+    reference = _upstream_text_model(model)
 
     with torch.no_grad():
         expected = torch.cat(
             (
-                model(
+                reference(
                     inputs_embeds=first_hidden_states,
                     attention_mask=torch.ones(1, 2, dtype=torch.long),
                     position_ids=torch.arange(2).unsqueeze(0),
                     use_cache=False,
                 ).last_hidden_state,
-                model(
+                reference(
                     inputs_embeds=second_hidden_states,
                     attention_mask=torch.ones(1, 3, dtype=torch.long),
                     position_ids=torch.arange(3).unsqueeze(0),
@@ -258,13 +270,13 @@ def test_minimax_m3_vl_text_model_keeps_decoder_and_attention_packed(module_name
 
     first_grad_input = first_hidden_states.detach().clone().requires_grad_(True)
     second_grad_input = second_hidden_states.detach().clone().requires_grad_(True)
-    first_grad_output = model(
+    first_grad_output = reference(
         inputs_embeds=first_grad_input,
         attention_mask=torch.ones(1, 2, dtype=torch.long),
         position_ids=torch.arange(2).unsqueeze(0),
         use_cache=False,
     ).last_hidden_state
-    second_grad_output = model(
+    second_grad_output = reference(
         inputs_embeds=second_grad_input,
         attention_mask=torch.ones(1, 3, dtype=torch.long),
         position_ids=torch.arange(3).unsqueeze(0),
@@ -277,10 +289,7 @@ def test_minimax_m3_vl_text_model_keeps_decoder_and_attention_packed(module_name
     torch.testing.assert_close(packed_grad, torch.cat((first_grad, second_grad), dim=1))
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_text_model_single_sequence_preserves_packed_shape(module_name):
-    """A single packed sample stays packed across every decoder layer."""
-    modeling = importlib.import_module(module_name)
+def _single_layer_sparse_text_model(modeling):
     config = modeling.MiniMaxM3VLTextConfig(
         vocab_size=32,
         hidden_size=8,
@@ -291,6 +300,8 @@ def test_minimax_m3_vl_text_model_single_sequence_preserves_packed_shape(module_
         num_attention_heads=2,
         num_key_value_heads=1,
         index_n_heads=1,
+        index_block_size=2,
+        index_topk_blocks=2,
         head_dim=4,
         rotary_dim=4,
         num_local_experts=2,
@@ -300,43 +311,73 @@ def test_minimax_m3_vl_text_model_single_sequence_preserves_packed_shape(module_
         bos_token_id=1,
         eos_token_id=2,
     )
-    model = modeling.MiniMaxM3VLTextModel(config)
-    model.eval()
-    decoder_inputs = []
+    return modeling.MiniMaxM3VLTextModel(config).eval()
 
-    def record_decoder_input(_, args, kwargs):
-        decoder_inputs.append({"shape": args[0].shape})
 
-    hook = model.layers[0].register_forward_pre_hook(record_decoder_input, with_kwargs=True)
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_text_model_describes_unpacked_single_sequence_as_one_segment(module_name):
+    """Without varlen kwargs a lone unpadded sequence runs as a one-segment pack and matches upstream."""
+    modeling = importlib.import_module(module_name)
+    model = _single_layer_sparse_text_model(modeling)
+    decoder_kwargs = []
+    hook = model.layers[0].register_forward_pre_hook(
+        lambda _, __, kwargs: decoder_kwargs.append(kwargs), with_kwargs=True
+    )
 
-    single_hidden_states = torch.randn(1, 5, config.hidden_size)
-    single_position_ids = torch.arange(5).unsqueeze(0)
+    hidden_states = torch.randn(1, 7, model.config.hidden_size)
+    position_ids = torch.arange(7).unsqueeze(0)
     with torch.no_grad():
-        output = model(
-            inputs_embeds=single_hidden_states,
-            attention_mask=torch.ones(1, 5, dtype=torch.long),
-            position_ids=single_position_ids,
-            cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
-            cu_seq_lens_k=torch.tensor([0, 5], dtype=torch.int32),
-            max_length_q=5,
-            max_length_k=5,
+        output = model(inputs_embeds=hidden_states, attention_mask=torch.ones(1, 7, dtype=torch.long))
+        packed = model(
+            inputs_embeds=hidden_states,
+            position_ids=position_ids,
+            cu_seq_lens_q=torch.tensor([0, 7], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 7], dtype=torch.int32),
+            max_length_q=7,
+            max_length_k=7,
+        )
+        expected = _upstream_text_model(model)(
+            inputs_embeds=hidden_states,
+            attention_mask=torch.ones(1, 7, dtype=torch.long),
+            position_ids=position_ids,
             use_cache=False,
         )
     hook.remove()
 
-    assert decoder_inputs[0]["shape"] == (1, 5, config.hidden_size)
-    assert output.last_hidden_state.shape == (1, 5, config.hidden_size)
+    assert decoder_kwargs[0]["cu_seq_lens_q"].tolist() == [0, 7]
+    assert decoder_kwargs[0]["max_length_q"] == 7
+    assert decoder_kwargs[0]["attention_mask"] is None
+    assert output.past_key_values is None
+    torch.testing.assert_close(output.last_hidden_state, packed.last_hidden_state, rtol=0, atol=0)
+    torch.testing.assert_close(output.last_hidden_state, expected.last_hidden_state)
 
-    # Single-sample packed output matches the no-FA-kwargs path (the fast path
-    # is a pure pass-through, so dropping cu_seq_lens_q must give the same result).
-    with torch.no_grad():
-        reference = model(
-            inputs_embeds=single_hidden_states,
-            attention_mask=torch.ones(1, 5, dtype=torch.long),
-            position_ids=single_position_ids,
-            use_cache=False,
-        )
-    torch.testing.assert_close(output.last_hidden_state, reference.last_hidden_state)
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+@pytest.mark.parametrize(
+    ("forward_kwargs", "message"),
+    [
+        ({"inputs_embeds": torch.randn(2, 4, 8)}, "padded batches are not supported"),
+        ({"inputs_embeds": torch.randn(1, 4, 8), "past_key_values": object()}, "does not support KV cache"),
+    ],
+    ids=["padded_batch", "kv_cache"],
+)
+def test_minimax_m3_vl_text_model_rejects_inputs_it_cannot_pack(module_name, forward_kwargs, message):
+    modeling = importlib.import_module(module_name)
+    model = _single_layer_sparse_text_model(modeling)
+
+    with pytest.raises(ValueError, match=message):
+        model(**forward_kwargs)
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_text_model_rejects_unpacked_input_under_sequence_parallelism(module_name, monkeypatch):
+    """A local SP shard cannot describe the global sequence, so the collator's metadata is mandatory."""
+    modeling = importlib.import_module(module_name)
+    model = _single_layer_sparse_text_model(modeling)
+    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False, sp_enabled=True))
+
+    with pytest.raises(ValueError, match="requires packed inputs"):
+        model(inputs_embeds=torch.randn(1, 4, model.config.hidden_size))
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
@@ -362,19 +403,20 @@ def test_minimax_m3_vl_full_attention_packed_matches_separate_samples(module_nam
         eos_token_id=2,
     )
     model = modeling.MiniMaxM3VLTextModel(config).eval()
+    reference = _upstream_text_model(model)
     first = torch.randn(1, 2, config.hidden_size)
     second = torch.randn(1, 3, config.hidden_size)
 
     with torch.no_grad():
         expected = torch.cat(
             (
-                model(
+                reference(
                     inputs_embeds=first,
                     attention_mask=torch.ones(1, 2, dtype=torch.long),
                     position_ids=torch.arange(2).unsqueeze(0),
                     use_cache=False,
                 ).last_hidden_state,
-                model(
+                reference(
                     inputs_embeds=second,
                     attention_mask=torch.ones(1, 3, dtype=torch.long),
                     position_ids=torch.arange(3).unsqueeze(0),
@@ -492,55 +534,6 @@ def test_minimax_m3_vl_language_sp_splits_index_heads_like_kv_and_restores_packe
     assert calls[2][1] == (1, 2, 1, config.index_head_dim)
     assert calls[3][1][1] == 4
     assert calls[0][2] is group and calls[1][2] is group and calls[2][3] is group and calls[3][2] is group
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_block_mask_follows_upstream_per_kv_group(module_name):
-    modeling = importlib.import_module(module_name)
-    upstream = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
-    config = modeling.MiniMaxM3VLTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=6,
-        dense_intermediate_size=12,
-        shared_intermediate_size=4,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        index_n_heads=2,
-        index_head_dim=4,
-        index_block_size=2,
-        index_topk_blocks=2,
-        index_local_blocks=1,
-        head_dim=4,
-        rotary_dim=4,
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        layer_types=["minimax_m3_sparse"],
-        mlp_layer_types=["dense"],
-        bos_token_id=1,
-        eos_token_id=2,
-    )
-    torch.manual_seed(0)
-    indexer = modeling.MiniMaxM3VLIndexer(config, layer_idx=0)
-    reference = upstream.MiniMaxM3VLIndexer(config, layer_idx=0)
-    reference.load_state_dict(indexer.state_dict())
-
-    sequence_length = 8
-    hidden_states = torch.randn(1, sequence_length, config.hidden_size)
-    position_ids = torch.arange(sequence_length).unsqueeze(0)
-    position_embeddings = modeling.MiniMaxM3VLRotaryEmbedding(config)(hidden_states, position_ids)
-
-    with torch.no_grad():
-        block_indices = indexer(hidden_states, position_embeddings, None, position_ids)
-        reference_indices = reference(hidden_states, position_embeddings, None, position_ids)
-    assert block_indices.shape == (1, config.index_n_heads, sequence_length, config.index_topk_blocks)
-    torch.testing.assert_close(block_indices, reference_indices, rtol=0, atol=0)
-
-    mask_args = (None, sequence_length, torch.float32, hidden_states.device, position_ids)
-    full_mask = indexer.build_block_mask(block_indices, *mask_args)
-    torch.testing.assert_close(full_mask, reference.build_block_mask(reference_indices, *mask_args), rtol=0, atol=0)
-    assert full_mask.shape == (1, config.num_attention_heads, sequence_length, sequence_length)
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
