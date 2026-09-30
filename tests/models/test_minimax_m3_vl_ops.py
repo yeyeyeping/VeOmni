@@ -886,10 +886,13 @@ def test_minimax_m3_vl_rms_norm_dispatches_weight_and_eps(module_name, monkeypat
     slot = _RecordingSlot(output)
     monkeypatch.setattr(modeling, "veomni_rms_norm", slot)
 
-    norm = modeling.MiniMaxM3VLRMSNorm(8, eps=1e-5)
-    hidden_states = torch.randn_like(output)
+    norm = modeling.MiniMaxM3VLRMSNorm(8, eps=1e-5).to(torch.bfloat16)
+    norm.weight.data.copy_(torch.linspace(-0.01, 0.01, 8))
+    hidden_states = torch.randn_like(output, dtype=torch.bfloat16)
 
     assert norm(hidden_states) is output
     assert slot.args[0] is hidden_states
-    assert slot.args[1] is norm.weight
+    # The kernel adds the ``1 +`` offset itself; it must see a fp32 weight.
+    assert slot.args[1].dtype == torch.float32
+    assert torch.equal(slot.args[1], norm.weight.float())
     assert slot.args[2] == norm.eps

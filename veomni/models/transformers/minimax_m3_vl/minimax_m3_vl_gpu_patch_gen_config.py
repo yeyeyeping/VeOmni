@@ -138,7 +138,11 @@ class PatchedMiniMaxM3VLPreTrainedModel(PreTrainedModel):
 )
 def minimax_m3_vl_rmsnorm_forward_patched(self, x):
     if veomni_rms_norm.use_non_eager_impl:
-        return veomni_rms_norm(x, self.weight, self.eps)
+        # The zero-initialised weight stays near 0, so ``1 + weight`` lands near
+        # 1.0 where bf16 ticks are 2**-7 apart. Hand the kernel a fp32 weight so
+        # the offset is added in fp32 as in eager; adding it in bf16 would snap
+        # most channels onto a few gammas.
+        return veomni_rms_norm(x, self.weight.float(), self.eps)
 
     output = self._norm(x.float())
     output = output * (1.0 + self.weight.float())
