@@ -128,7 +128,12 @@ def _block_causal_keep(
 
     positions = torch.arange(seq_len, device=block_indices.device)
     causal_keep = positions[None, :] <= positions[:, None]
-    return block_keep & ~padding[:, None, None, :] & causal_keep[None, None]
+    keep = block_keep & ~padding[:, None, None, :] & causal_keep[None, None]
+    # Padded query rows select no block. Left fully masked, the dtype-min mask
+    # overflows to -inf when the float32 softmax runs on float64 inputs, and the
+    # resulting NaN rows leak into K/V gradients through a zero upstream grad.
+    # Let them attend everywhere instead: `_pack` drops their outputs.
+    return keep | padding[:, None, :, None]
 
 
 def _dense_attention(

@@ -163,9 +163,14 @@ def test_indexer_matches_upstream_per_sample():
     assert torch.equal(_canonical_block_indices(block_indices).long(), expected)
 
 
+# float64 guards padded query rows: a fully masked row turns into NaN once the
+# float32 softmax sees the float64 dtype-min mask, and leaks into K/V gradients.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"])
 @pytest.mark.parametrize("sparse", [True, False], ids=["block_sparse", "dense_causal"])
-def test_attention_matches_upstream_per_sample_forward_and_backward(sparse):
+def test_attention_matches_upstream_per_sample_forward_and_backward(sparse, dtype):
     indexer, samples = _per_sample_inputs()
+    for sample in samples:
+        sample.q, sample.k, sample.v = (getattr(sample, name).to(dtype) for name in ("q", "k", "v"))
     packed_q, packed_k, packed_v = (
         torch.cat([getattr(sample, name) for sample in samples]).requires_grad_(True) for name in ("q", "k", "v")
     )
@@ -202,6 +207,7 @@ def test_attention_matches_upstream_per_sample_forward_and_backward(sparse):
 
     torch.testing.assert_close(output, torch.cat(expected_outputs))
     for packed_grad, grads in zip(packed_grads, expected_grads):
+        assert torch.isfinite(packed_grad).all()
         torch.testing.assert_close(packed_grad, torch.cat(grads))
 
 
