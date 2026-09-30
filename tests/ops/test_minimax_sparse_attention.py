@@ -25,6 +25,7 @@ from veomni.ops.kernels.minimax_sparse_attention import (
     minimax_sparse_attention_eager,
     minimax_sparse_indexer_eager,
 )
+from veomni.ops.kernels.minimax_sparse_attention.eager import _pack, _packed_to_padded_indices, _unpack
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
@@ -232,6 +233,19 @@ def test_indexer_output_feeds_attention_with_wider_topk_slots():
         scale=_HEAD_DIM**-0.5,
     )
     assert torch.isfinite(output).all()
+
+
+def test_padded_layout_round_trips_sp_padding_segment():
+    packed = torch.arange(14, dtype=torch.float32).view(7, 2)
+
+    indices, padding = _packed_to_padded_indices(_cu_seqlens([2, 3, 2]), 3, 7, packed.device)
+    padded = _unpack(packed, indices, padding, fill=-1)
+
+    assert indices.tolist() == [0, 1, 3, 4, 5, 6, 7]
+    assert padding.tolist() == [[False, False, True], [False, False, False], [False, False, True]]
+    assert padded.shape == (3, 3, 2)
+    assert (padded[padding] == -1).all()
+    assert torch.equal(_pack(padded, indices), packed)
 
 
 def test_rejects_device_tensor_max_seqlen():

@@ -74,7 +74,11 @@ config.add_import(
 )
 config.add_import(
     "veomni.ops.kernels.attention.ulysses",
-    names=["prepare_ulysses_qkv", "restore_ulysses_output"],
+    names=["gather_seq_scatter_kv_heads", "prepare_ulysses_qkv", "restore_ulysses_output"],
+)
+config.add_import(
+    "veomni.ops.kernels.minimax_sparse_attention",
+    names=["minimax_sparse_attention_eager", "minimax_sparse_indexer_eager"],
 )
 config.add_import("veomni.models.transformers.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
@@ -197,69 +201,6 @@ def _grid_thw_to_list(grid_thw, grid_thw_list):
 
 
 @config.add_helper
-def _prepare_packed_layout(
-    cu_seq_lens: torch.Tensor,
-    max_sequence_length: int,
-    total_length: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the reusable packed-to-BSND map and structural padding mask.
-
-    ``cu_seq_lens`` already contains every token transported by sequence
-    parallelism. In particular, the collator coalesces the SP tail padding into
-    one synthetic sequence, so this helper deliberately does not distinguish it
-    from a real sequence. ``padding_mask`` marks only the right-padding slots
-    introduced while expanding the ragged packed stream to ``[B, Smax]``.
-    """
-    if not isinstance(max_sequence_length, int):
-        raise TypeError(
-            "MiniMax M3 VL packed max_length_q must be a Python int to avoid a device-to-host sync, "
-            f"got {type(max_sequence_length).__name__}."
-        )
-
-    num_sequences = cu_seq_lens.numel() - 1
-    # NPU keeps FlashAttention metadata on CPU, whereas the scatter indices must
-    # live next to the tensors they index. This is a device copy, never a host
-    # scalar read.
-    device_cu_seq_lens = cu_seq_lens.to(device=device, dtype=torch.long, non_blocking=True)
-    sequence_lengths = device_cu_seq_lens.diff()
-
-    token_indices = torch.arange(total_length, device=device)
-    sequence_indices = torch.repeat_interleave(
-        torch.arange(num_sequences, device=device),
-        sequence_lengths,
-        output_size=total_length,
-    )
-    sequence_positions = token_indices - device_cu_seq_lens[sequence_indices]
-    packed_to_padded_indices = sequence_indices * max_sequence_length + sequence_positions
-
-    padding_mask = torch.arange(max_sequence_length, device=device).unsqueeze(0) >= sequence_lengths.unsqueeze(1)
-    return packed_to_padded_indices, padding_mask
-
-
-@config.add_helper
-def _unpack_to_bsnd(
-    packed_tensor: torch.Tensor,
-    packed_to_padded_indices: torch.Tensor,
-    padding_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Scatter ``[1, T, ...]`` packed data into right-padded ``[B, Smax, ...]`` data."""
-    batch_size, max_sequence_length = padding_mask.shape
-    trailing_shape = packed_tensor.shape[2:]
-    padded_flat = packed_tensor.new_zeros(batch_size * max_sequence_length, *trailing_shape)
-    padded_flat.index_copy_(0, packed_to_padded_indices, packed_tensor.squeeze(0))
-    return padded_flat.view(batch_size, max_sequence_length, *trailing_shape)
-
-
-@config.add_helper
-def _pack_from_bsnd(padded_tensor: torch.Tensor, packed_to_padded_indices: torch.Tensor) -> torch.Tensor:
-    """Gather ``[B, Smax, ...]`` data back into its original ``[1, T, ...]`` packed order."""
-    trailing_shape = padded_tensor.shape[2:]
-    padded_flat = padded_tensor.reshape(-1, *trailing_shape)
-    return padded_flat.index_select(0, packed_to_padded_indices).unsqueeze(0)
-
-
-@config.add_helper
 def _build_bsnd_causal_mask(padding_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Build the dense reference mask for right-padded BSND self-attention."""
     sequence_length = padding_mask.shape[1]
@@ -271,114 +212,24 @@ def _build_bsnd_causal_mask(padding_mask: torch.Tensor, dtype: torch.dtype) -> t
 
 
 @config.add_helper
-def _eager_bsnd_attention_forward(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor,
-    scaling: float,
-    dropout: float,
-    training: bool,
-) -> torch.Tensor:
-    """Run reference attention using the post-Ulysses local GQA ratio."""
-    local_num_key_value_groups = query.shape[1] // key.shape[1]
-    key = repeat_kv(key, local_num_key_value_groups)
-    value = repeat_kv(value, local_num_key_value_groups)
+def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
+    """Return the indexer's normed, rotated ``[B, S, G, D]`` queries and ``[B, S, 1, D]`` keys.
 
-    attention_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
-    attention_weights = attention_weights + attention_mask
-    attention_weights = F.softmax(attention_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attention_weights = F.dropout(attention_weights, p=dropout, training=training)
-    return torch.matmul(attention_weights, value).transpose(1, 2).contiguous()
-
-
-# ================================================================
-# Patch: MiniMaxM3VLIndexer.forward
-# 1. keep projection and RoPE on the local packed stream, then gather only the
-#    small index Q/K tensors under Ulysses instead of the full hidden states
-# 2. reuse the model-level packed layout to restore BSND and derive the
-#    per-row arange position IDs required by block selection
-# 3. mask only structural BSND padding; the collator's SP tail remains an
-#    independent synthetic sequence carried through the packed transport
-# ================================================================
-@config.override_method(
-    "MiniMaxM3VLIndexer.forward",
-    description="Run the MiniMax indexer on temporary BSND views of packed training inputs",
-)
-def minimax_m3_vl_indexer_forward_patched(
-    self,
-    hidden_states,
-    position_embeddings,
-    past_key_values,
-    position_ids=None,
-    packed_to_padded_indices=None,
-    packed_padding_mask=None,
-):
+    This is the projection half of ``MiniMaxM3VLIndexer.forward``. On the packed
+    training path, block selection runs in the MiniMax sparse attention
+    operator after the Ulysses exchange instead.
+    """
     batch, q_len, _ = hidden_states.shape
-    idx_q = self.q_proj(hidden_states).view(batch, q_len, -1, self.head_dim)
-    idx_q = self.q_norm(idx_q).transpose(1, 2)
-    idx_k = self.k_proj(hidden_states).view(batch, q_len, 1, self.head_dim)
-    idx_k = self.k_norm(idx_k).transpose(1, 2)
+    index_query = indexer.q_norm(indexer.q_proj(hidden_states).view(batch, q_len, -1, indexer.head_dim))
+    index_key = indexer.k_norm(indexer.k_proj(hidden_states).view(batch, q_len, 1, indexer.head_dim))
     cos, sin = position_embeddings
-    idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos[..., : self.head_dim], sin[..., : self.head_dim])
-
-    # --- Patch.1 ---
-    if packed_to_padded_indices is not None:
-        idx_q = idx_q.transpose(1, 2)
-        idx_k = idx_k.transpose(1, 2)
-        parallel_state = get_parallel_state()
-        if parallel_state.ulysses_enabled:
-            idx_q = gather_outputs(idx_q, gather_dim=1, group=parallel_state.ulysses_group)
-            idx_k = gather_outputs(idx_k, gather_dim=1, group=parallel_state.ulysses_group)
-        # --- Patch.1 ---
-
-        # --- Patch.2 ---
-        idx_q = _unpack_to_bsnd(idx_q, packed_to_padded_indices, packed_padding_mask).transpose(1, 2)
-        idx_k = _unpack_to_bsnd(idx_k, packed_to_padded_indices, packed_padding_mask).transpose(1, 2)
-        batch, _, q_len, _ = idx_q.shape
-        position_ids = torch.arange(q_len, device=idx_q.device).unsqueeze(0).expand(batch, -1)
-        # --- Patch.2 ---
-    else:
-        if past_key_values is not None:
-            idx_k = past_key_values.layers[self.layer_idx].update_index(idx_k)
-        if position_ids is None:
-            position_ids = torch.arange(
-                idx_k.shape[2] - idx_q.shape[2], idx_k.shape[2], device=idx_q.device
-            ).unsqueeze(0)
-        position_ids = (position_ids if position_ids.ndim > 1 else position_ids.unsqueeze(0)).expand(
-            idx_q.shape[0], -1
-        )
-
-    k_len = idx_k.shape[2]
-    num_key_blocks = -(-k_len // self.block_size)
-    pad = num_key_blocks * self.block_size - k_len
-
-    scores = torch.matmul(idx_q.float(), idx_k.float().transpose(-1, -2))
-    # --- Patch.3 ---
-    if packed_padding_mask is not None:
-        scores = scores.masked_fill(packed_padding_mask[:, None, None, :], float("-inf"))
-    # --- Patch.3 ---
-    k_positions = torch.arange(k_len, device=idx_q.device)
-    token_future = k_positions[None, None, None, :] > position_ids[:, None, :, None]
-    scores = scores.masked_fill(token_future, float("-inf"))
-    if pad:
-        scores = F.pad(scores, (0, pad), value=float("-inf"))
-    scores = scores.view(batch, self.num_heads, q_len, num_key_blocks, self.block_size)
-    block_scores = scores.amax(dim=-1)
-
-    q_block = position_ids // self.block_size
-    if self.local_blocks > 0:
-        local = torch.arange(self.local_blocks, device=idx_q.device)
-        local_idx = (q_block[..., None] - local.view(1, 1, -1)).clamp(min=0)
-        local_idx = local_idx.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-        block_scores.scatter_(-1, local_idx, float("inf"))
-
-    topk = min(self.topk_blocks, num_key_blocks)
-    topk_scores, topk_indices = block_scores.topk(topk, dim=-1)
-    block_indices = topk_indices.masked_fill(topk_scores == float("-inf"), -1)
-    if packed_padding_mask is not None:
-        block_indices = block_indices.masked_fill(packed_padding_mask[:, None, :, None], -1)
-    return block_indices
+    return apply_rotary_pos_emb(
+        index_query,
+        index_key,
+        cos[..., : indexer.head_dim],
+        sin[..., : indexer.head_dim],
+        unsqueeze_dim=2,
+    )
 
 
 # ================================================================
@@ -386,8 +237,6 @@ def minimax_m3_vl_indexer_forward_patched(
 # 1. accept a structural BSND padding mask with True=padding
 # 2. compose block selection with token-level causality so future tokens in a
 #    partially selected block remain inaccessible on the dense reference path
-# 3. expand the per-KV-group selection only onto the query heads this rank
-#    owns, so the mask matches the post-Ulysses local head slice
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLIndexer.build_block_mask",
@@ -402,7 +251,6 @@ def minimax_m3_vl_indexer_build_block_mask_patched(
     device,
     position_ids,
     padding_mask=None,
-    query_head_indices=None,
 ):
     batch, n_idx_heads, q_len, _ = block_indices.shape
     num_key_blocks = -(-key_length // self.block_size)
@@ -413,13 +261,7 @@ def minimax_m3_vl_indexer_build_block_mask_patched(
     bias = bias[..., :num_key_blocks]
     block_keep = (bias == 0.0).repeat_interleave(self.block_size, dim=-1)[..., :key_length]
 
-    # --- Patch.3 ---
-    heads_per_index_head = self.config.num_attention_heads // n_idx_heads
-    if query_head_indices is None:
-        block_keep = block_keep.repeat_interleave(heads_per_index_head, dim=1)
-    else:
-        block_keep = block_keep.index_select(1, query_head_indices // heads_per_index_head)
-    # --- Patch.3 ---
+    block_keep = block_keep.repeat_interleave(self.config.num_attention_heads // n_idx_heads, dim=1)
 
     # --- Patch.1 ---
     if padding_mask is not None:
@@ -442,16 +284,16 @@ def minimax_m3_vl_indexer_build_block_mask_patched(
 # Patch: MiniMaxM3VLAttention.forward
 # 1. keep decoder inputs/outputs packed and apply the precomputed RoPE before
 #    any sequence-parallel communication
-# 2. let the indexer gather only its small projections, while main Q/K/V use
-#    Ulysses head/sequence all-to-all
-# 3. temporarily restore BSND only around the MiniMax reference attention,
-#    then repack before the inverse Ulysses exchange
+# 2. under Ulysses, exchange main Q/K/V and the per-KV-group index Q with the
+#    same head/sequence all-to-all, and all-gather the single-head index K
+# 3. run block selection and attention through the TND MiniMax sparse
+#    attention operators; any padded layout they need stays inside them
 # 4. keep language attention independent from the generic ViT-controlled
 #    ``attn_implementation`` configuration
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLAttention.forward",
-    description="Run MiniMax language attention on temporary BSND views while decoder states stay packed",
+    description="Run packed MiniMax language attention through the TND sparse attention operators",
 )
 def minimax_m3_vl_attention_forward_patched(
     self,
@@ -459,8 +301,6 @@ def minimax_m3_vl_attention_forward_patched(
     position_embeddings,
     attention_mask,
     past_key_values=None,
-    packed_to_padded_indices=None,
-    packed_padding_mask=None,
     **kwargs,
 ):
     input_shape = hidden_states.shape[:-1]
@@ -475,7 +315,8 @@ def minimax_m3_vl_attention_forward_patched(
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     # --- Patch.1 ---
 
-    if packed_to_padded_indices is None:
+    cu_seqlens = kwargs.get("cu_seq_lens_q")
+    if cu_seqlens is None:
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -527,19 +368,13 @@ def minimax_m3_vl_attention_forward_patched(
         return self.o_proj(attn_output), attn_weights
 
     # --- Patch.2 ---
-    block_indices = None
-    if self.indexer is not None:
-        block_indices = self.indexer(
-            hidden_states,
-            position_embeddings,
-            past_key_values=None,
-            packed_to_padded_indices=packed_to_padded_indices,
-            packed_padding_mask=packed_padding_mask,
-        )
-
     query_states = query_states.transpose(1, 2)
     key_states = key_states.transpose(1, 2)
     value_states = value_states.transpose(1, 2)
+    index_query = index_key = None
+    if self.indexer is not None:
+        index_query, index_key = _minimax_m3_indexer_project(self.indexer, hidden_states, position_embeddings)
+
     parallel_state = get_parallel_state()
     if parallel_state.ulysses_enabled:
         query_states, key_states, value_states, _ = prepare_ulysses_qkv(
@@ -549,49 +384,41 @@ def minimax_m3_vl_attention_forward_patched(
             group=parallel_state.ulysses_group,
             ulysses_size=parallel_state.ulysses_size,
         )
+        if index_query is not None:
+            index_query = gather_seq_scatter_kv_heads(
+                index_query,
+                group=parallel_state.ulysses_group,
+                ulysses_size=parallel_state.ulysses_size,
+            )
+            index_key = gather_outputs(index_key, gather_dim=1, group=parallel_state.ulysses_group)
     # --- Patch.2 ---
 
     # --- Patch.3 ---
-    query_states = _unpack_to_bsnd(query_states, packed_to_padded_indices, packed_padding_mask).transpose(1, 2)
-    key_states = _unpack_to_bsnd(key_states, packed_to_padded_indices, packed_padding_mask).transpose(1, 2)
-    value_states = _unpack_to_bsnd(value_states, packed_to_padded_indices, packed_padding_mask).transpose(1, 2)
-
-    batch_size, _, sequence_length, _ = query_states.shape
-    position_ids = torch.arange(sequence_length, device=query_states.device).unsqueeze(0).expand(batch_size, -1)
-    if self.indexer is None:
-        reference_mask = _build_bsnd_causal_mask(packed_padding_mask, query_states.dtype)
-    else:
-        # Ulysses scatters query heads contiguously, so this rank owns
-        # global heads [rank * local_heads, (rank + 1) * local_heads).
-        query_head_indices = None
-        if parallel_state.ulysses_enabled:
-            local_num_heads = query_states.shape[1]
-            head_start = parallel_state.ulysses_rank * local_num_heads
-            query_head_indices = torch.arange(head_start, head_start + local_num_heads, device=query_states.device)
-        reference_mask = self.indexer.build_block_mask(
-            block_indices,
-            attention_mask=None,
-            key_length=key_states.shape[2],
-            dtype=query_states.dtype,
-            device=query_states.device,
-            position_ids=position_ids,
-            padding_mask=packed_padding_mask,
-            query_head_indices=query_head_indices,
+    # Training packs samples with identical query/key boundaries.
+    max_seqlen = kwargs["max_length_q"]
+    block_indices = None
+    if self.indexer is not None:
+        block_indices = minimax_sparse_indexer_eager(
+            index_query[0],
+            index_key[0],
+            cu_seqlens,
+            max_seqlen,
+            block_size=self.indexer.block_size,
+            topk_blocks=self.indexer.topk_blocks,
+            local_blocks=self.indexer.local_blocks,
         )
+    attn_output = minimax_sparse_attention_eager(
+        query_states[0],
+        key_states[0],
+        value_states[0],
+        block_indices,
+        cu_seqlens,
+        max_seqlen,
+        block_size=self.indexer.block_size if self.indexer is not None else None,
+        scale=self.scaling,
+        dropout_p=0.0 if not self.training else self.attention_dropout,
+    ).unsqueeze(0)
 
-    # --- Patch.4 ---
-    attn_output = _eager_bsnd_attention_forward(
-        query_states,
-        key_states,
-        value_states,
-        reference_mask,
-        scaling=self.scaling,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        training=self.training,
-    )
-    # --- Patch.4 ---
-
-    attn_output = _pack_from_bsnd(attn_output, packed_to_padded_indices)
     if parallel_state.ulysses_enabled:
         attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)
     # --- Patch.3 ---
@@ -967,18 +794,17 @@ def minimax_m3_vl_model_forward_patched(
 
 # ================================================================
 # Patch: MiniMaxM3VLTextModel.forward
-# 1. keep every decoder layer in VeOmni's local packed layout and derive the
-#    packed-to-BSND map once per model forward for all attention layers to reuse
-# 2. generate RoPE once from the local packed position IDs; attention and the
-#    indexer apply it before their respective Ulysses communications
-# 3. consume global varlen metadata here so it cannot leak into the fixed
-#    MiniMax language-attention implementation
-# 4. reject router-logit capture because MiniMax's routing semantics are not
+# 1. reject router-logit capture because MiniMax's routing semantics are not
 #    compatible with the upstream Switch-style auxiliary loss
+# 2. keep every decoder layer in VeOmni's local packed layout; packed training
+#    is cache-free and Ulysses-only, and the varlen kwargs flow unchanged to
+#    the attention layers, which own the packed attention layout
+# 3. generate RoPE once from the local packed position IDs; attention and the
+#    indexer apply it before their respective Ulysses communications
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLTextModel.forward",
-    description="Keep decoder states packed and share a temporary BSND attention layout",
+    description="Keep decoder states packed and reject KV cache during packed training",
 )
 def minimax_m3_vl_text_model_forward_patched(
     self,
@@ -993,44 +819,29 @@ def minimax_m3_vl_text_model_forward_patched(
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-    # --- Patch.4 ---
+    # --- Patch.1 ---
     output_router_logits = kwargs.pop("output_router_logits", None)
     if output_router_logits or self.config.output_router_logits:
         raise ValueError(
             "MiniMax M3 router auxiliary loss is disabled: the upstream Switch-style loss does not match "
             "MiniMax M3's sigmoid routing with e_score_correction_bias."
         )
-    # --- Patch.4 ---
+    # --- Patch.1 ---
 
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
 
-    # --- Patch.1 ---
-    packed_cu_seq_lens = kwargs.pop("cu_seq_lens_q", None)
-    packed_to_padded_indices = None
-    packed_padding_mask = None
-    if packed_cu_seq_lens is not None:
-        kwargs.pop("cu_seq_lens_k", None)
-        max_sequence_length = kwargs.pop("max_length_q", None)
-        kwargs.pop("max_length_k", None)
-        kwargs.pop("tail_padding_length", None)
+    # --- Patch.2 ---
+    packed = kwargs.get("cu_seq_lens_q") is not None
+    if packed:
         if past_key_values is not None:
             raise ValueError("MiniMax packed training does not support KV cache.")
         # The config default may still request cache during training. Packed
         # training has no decode state, so keep this path explicitly cache-free.
         use_cache = False
-
-        parallel_state = get_parallel_state()
-        if parallel_state.cp_enabled:
+        if get_parallel_state().cp_enabled:
             raise ValueError("MiniMax M3 VL language attention supports Ulysses only; set cp_size=1.")
-        total_length = inputs_embeds.shape[1] * parallel_state.ulysses_size
-        packed_to_padded_indices, packed_padding_mask = _prepare_packed_layout(
-            packed_cu_seq_lens,
-            max_sequence_length,
-            total_length,
-            inputs_embeds.device,
-        )
-    # --- Patch.1 ---
+    # --- Patch.2 ---
 
     if use_cache and past_key_values is None:
         past_key_values = DynamicCache(config=self.config)
@@ -1042,7 +853,7 @@ def minimax_m3_vl_text_model_forward_patched(
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
         position_ids = position_ids.unsqueeze(0)
 
-    if packed_to_padded_indices is not None:
+    if packed:
         causal_mask = None
     elif isinstance(attention_mask, dict):
         causal_mask = next(iter(attention_mask.values()))
@@ -1055,11 +866,10 @@ def minimax_m3_vl_text_model_forward_patched(
             position_ids=position_ids,
         )
 
-    # --- Patch.2 ---
-    position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
-    # --- Patch.2 ---
-
     # --- Patch.3 ---
+    position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+    # --- Patch.3 ---
+
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
         hidden_states = decoder_layer(
             hidden_states,
@@ -1068,11 +878,8 @@ def minimax_m3_vl_text_model_forward_patched(
             past_key_values=past_key_values,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
-            packed_to_padded_indices=packed_to_padded_indices,
-            packed_padding_mask=packed_padding_mask,
             **kwargs,
         )
-    # --- Patch.3 ---
 
     hidden_states = self.norm(hidden_states)
 
