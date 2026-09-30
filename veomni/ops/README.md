@@ -20,6 +20,7 @@ veomni/ops/
 │   ├── deepseek_v4/        TileLang sparse attention/indexer + precision helpers
 │   ├── load_balancing_loss/  eager + triton fused kernel
 │   ├── mhc/                TileKernels mHC pre/post/head adapters
+│   ├── minimax_sparse_attention/  MiniMax M3 TND block-sparse indexer/attention (eager)
 │   ├── rms_norm/           Liger / NPU / triton batch-invariant
 │   ├── rotary/             Liger / NPU / deterministic / Wan Triton
 │   ├── swiglu/             Liger SwiGLU MLP
