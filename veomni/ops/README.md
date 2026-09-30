@@ -54,6 +54,7 @@ depending on when and where the kernel is bound:
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
+| MiniMax sparse attention | `minimax_sparse_attention_implementation` (added with the first kernel backend) | build-time `OpSlot` | `eager` | `eager` (TND reference, `indexer` + `attention` variants) |
 | mHC | `mhc_implementation` | build-time `OpSlot` | `eager` | `tilelang` (DeepSeek V4, SM90+; provided by `tile-kernels`) |
 | Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `fused_triton` (group-gemm, SM70+), `fused_quack` (CUTLASS/CuTe, SM90+), `fused_npu` (Ascend). Mismatches raise instead of falling back. |
 

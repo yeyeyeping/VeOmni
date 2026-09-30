@@ -87,6 +87,8 @@ config.add_post_import_block(
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_moe_experts_forward = OpSlot("moe_experts", "swiglu_oai")
+veomni_msa_indexer = OpSlot("minimax_sparse_attention", "indexer")
+veomni_msa_attention = OpSlot("minimax_sparse_attention", "attention")
 """
 )
 
@@ -287,7 +289,8 @@ def minimax_m3_vl_indexer_build_block_mask_patched(
 # 2. under Ulysses, exchange main Q/K/V and the per-KV-group index Q with the
 #    same head/sequence all-to-all, and all-gather the single-head index K
 # 3. run block selection and attention through the TND MiniMax sparse
-#    attention operators; any padded layout they need stays inside them
+#    attention operators (``minimax_sparse_attention`` OpSlots, eager by
+#    default); any padded layout they need stays inside them
 # 4. keep language attention independent from the generic ViT-controlled
 #    ``attn_implementation`` configuration
 # ================================================================
@@ -396,9 +399,11 @@ def minimax_m3_vl_attention_forward_patched(
     # --- Patch.3 ---
     # Training packs samples with identical query/key boundaries.
     max_seqlen = kwargs["max_length_q"]
+    msa_indexer = veomni_msa_indexer if veomni_msa_indexer.use_non_eager_impl else minimax_sparse_indexer_eager
+    msa_attention = veomni_msa_attention if veomni_msa_attention.use_non_eager_impl else minimax_sparse_attention_eager
     block_indices = None
     if self.indexer is not None:
-        block_indices = minimax_sparse_indexer_eager(
+        block_indices = msa_indexer(
             index_query[0],
             index_key[0],
             cu_seqlens,
@@ -407,7 +412,7 @@ def minimax_m3_vl_attention_forward_patched(
             topk_blocks=self.indexer.topk_blocks,
             local_blocks=self.indexer.local_blocks,
         )
-    attn_output = minimax_sparse_attention_eager(
+    attn_output = msa_attention(
         query_states[0],
         key_states[0],
         value_states[0],

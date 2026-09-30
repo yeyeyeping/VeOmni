@@ -40,9 +40,11 @@ class _RecordingSlot:
     def __init__(self, output):
         self.output = output
         self.args = None
+        self.kwargs = None
 
-    def __call__(self, *args):
+    def __call__(self, *args, **kwargs):
         self.args = args
+        self.kwargs = kwargs
         return self.output
 
 
@@ -674,6 +676,78 @@ def test_minimax_m3_vl_declares_swiglu_oai_moe_slot(module_name):
     assert isinstance(modeling.veomni_moe_experts_forward, OpSlot)
     assert modeling.veomni_moe_experts_forward.op_name == "moe_experts"
     assert modeling.veomni_moe_experts_forward.variant == "swiglu_oai"
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_declares_sparse_attention_slots(module_name):
+    modeling = importlib.import_module(module_name)
+
+    for slot, variant in ((modeling.veomni_msa_indexer, "indexer"), (modeling.veomni_msa_attention, "attention")):
+        assert isinstance(slot, OpSlot)
+        assert slot.op_name == "minimax_sparse_attention"
+        assert slot.variant == variant
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_packed_attention_dispatches_bound_sparse_attention_kernels(module_name, monkeypatch):
+    modeling = importlib.import_module(module_name)
+    config = modeling.MiniMaxM3VLTextConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=6,
+        dense_intermediate_size=12,
+        shared_intermediate_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        index_n_heads=1,
+        head_dim=4,
+        rotary_dim=4,
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        layer_types=["minimax_m3_sparse"],
+        mlp_layer_types=["dense"],
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    model = modeling.MiniMaxM3VLTextModel(config).eval()
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+    block_indices = torch.full((5, 1, config.index_topk_blocks), -1, dtype=torch.int32)
+    indexer_slot = _RecordingSlot(block_indices)
+    attention_slot = _RecordingSlot(torch.zeros(5, config.num_attention_heads, config.head_dim))
+    monkeypatch.setattr(modeling, "veomni_msa_indexer", indexer_slot)
+    monkeypatch.setattr(modeling, "veomni_msa_attention", attention_slot)
+
+    with torch.no_grad():
+        model(
+            inputs_embeds=torch.randn(1, 5, config.hidden_size),
+            position_ids=torch.tensor([[0, 1, 0, 1, 2]]),
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=3,
+            max_length_k=3,
+            use_cache=False,
+        )
+
+    index_query, index_key, indexer_cu_seqlens, indexer_max_seqlen = indexer_slot.args
+    assert index_query.shape == (5, config.index_n_heads, config.index_head_dim)
+    assert index_key.shape == (5, 1, config.index_head_dim)
+    assert indexer_cu_seqlens is cu_seqlens and indexer_max_seqlen == 3
+    assert indexer_slot.kwargs == {
+        "block_size": config.index_block_size,
+        "topk_blocks": config.index_topk_blocks,
+        "local_blocks": config.index_local_blocks,
+    }
+    query, key, value, attention_block_indices, attention_cu_seqlens, attention_max_seqlen = attention_slot.args
+    assert query.shape == (5, config.num_attention_heads, config.head_dim)
+    assert key.shape == value.shape == (5, config.num_key_value_heads, config.head_dim)
+    assert attention_block_indices is block_indices
+    assert attention_cu_seqlens is cu_seqlens and attention_max_seqlen == 3
+    assert attention_slot.kwargs == {
+        "block_size": config.index_block_size,
+        "scale": config.head_dim**-0.5,
+        "dropout_p": 0.0,
+    }
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)

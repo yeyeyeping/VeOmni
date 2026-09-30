@@ -65,7 +65,7 @@
 
  from collections.abc import Callable
  from dataclasses import dataclass
-@@ -24,30 +50,148 @@
+@@ -24,30 +50,150 @@
  import torch
  import torch.nn as nn
  import torch.nn.functional as F
@@ -133,6 +133,8 @@
 +veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 +veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 +veomni_moe_experts_forward = OpSlot("moe_experts", "swiglu_oai")
++veomni_msa_indexer = OpSlot("minimax_sparse_attention", "indexer")
++veomni_msa_attention = OpSlot("minimax_sparse_attention", "attention")
 +
 +
 +# ======================================================================
@@ -237,7 +239,7 @@
 
 
  class MiniMaxM3VLSparseCacheLayer(DynamicLayer):
-@@ -139,6 +283,12 @@
+@@ -139,6 +285,12 @@
              self.idx_keys = self.idx_keys.index_select(0, beam_idx.to(self.idx_keys.device))
 
 
@@ -250,7 +252,7 @@
  class MiniMaxM3VLRMSNorm(nn.Module):
      """Gemma-style RMSNorm: normalizes in fp32 and scales by `weight + 1`."""
 
-@@ -151,9 +301,10 @@
+@@ -151,9 +303,10 @@
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
      def forward(self, x):
@@ -263,7 +265,7 @@
          output = output * (1.0 + self.weight.float())
          return output.type_as(x)
 
-@@ -179,11 +330,16 @@
+@@ -179,11 +332,16 @@
          return self.down_proj((up + 1.0) * glu)
 
 
@@ -284,7 +286,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -194,25 +350,23 @@
+@@ -194,25 +352,23 @@
          self.swiglu_alpha = config.swiglu_alpha
          self.swiglu_limit = config.swiglu_limit
 
@@ -315,7 +317,7 @@
          gate, up = gate_up.chunk(2, dim=-1)
          gate = gate.clamp(max=self.swiglu_limit)
          up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-@@ -405,6 +559,12 @@
+@@ -405,6 +561,12 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -328,7 +330,7 @@
  class MiniMaxM3VLAttention(nn.Module):
      """
      M3 attention: per-head Gemma QK-norm + partial RoPE, optionally sparse indexer selection which require position IDs.
-@@ -429,14 +589,25 @@
+@@ -429,14 +591,26 @@
              MiniMaxM3VLIndexer(config, layer_idx) if config.layer_types[layer_idx] == "minimax_m3_sparse" else None
          )
 
@@ -339,7 +341,8 @@
 +    # 2. under Ulysses, exchange main Q/K/V and the per-KV-group index Q with the
 +    #    same head/sequence all-to-all, and all-gather the single-head index K
 +    # 3. run block selection and attention through the TND MiniMax sparse
-+    #    attention operators; any padded layout they need stays inside them
++    #    attention operators (``minimax_sparse_attention`` OpSlots, eager by
++    #    default); any padded layout they need stays inside them
 +    # 4. keep language attention independent from the generic ViT-controlled
 +    #    ``attn_implementation`` configuration
 +    # ================================================================
@@ -360,7 +363,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -444,27 +615,35 @@
+@@ -444,27 +618,35 @@
          key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
@@ -413,7 +416,7 @@
                  attention_mask = self.indexer.build_block_mask(
                      block_indices,
                      attention_mask,
-@@ -472,21 +651,91 @@
+@@ -472,21 +654,95 @@
                      query_states.dtype,
                      query_states.device,
                      position_ids,
@@ -479,9 +482,13 @@
 +        # --- Patch.3 ---
 +        # Training packs samples with identical query/key boundaries.
 +        max_seqlen = kwargs["max_length_q"]
++        msa_indexer = veomni_msa_indexer if veomni_msa_indexer.use_non_eager_impl else minimax_sparse_indexer_eager
++        msa_attention = (
++            veomni_msa_attention if veomni_msa_attention.use_non_eager_impl else minimax_sparse_attention_eager
++        )
 +        block_indices = None
 +        if self.indexer is not None:
-+            block_indices = minimax_sparse_indexer_eager(
++            block_indices = msa_indexer(
 +                index_query[0],
 +                index_key[0],
 +                cu_seqlens,
@@ -490,7 +497,7 @@
 +                topk_blocks=self.indexer.topk_blocks,
 +                local_blocks=self.indexer.local_blocks,
 +            )
-+        attn_output = minimax_sparse_attention_eager(
++        attn_output = msa_attention(
 +            query_states[0],
 +            key_states[0],
 +            value_states[0],
@@ -518,7 +525,7 @@
 
 
  class MiniMaxM3VLIndexer(nn.Module):
-@@ -596,43 +845,48 @@
+@@ -596,43 +852,48 @@
          topk_scores, topk_indices = block_scores.topk(topk, dim=-1)  # [B, H_idx, S_q, topk]
          return topk_indices.masked_fill(topk_scores == float("-inf"), -1)
 
@@ -591,7 +598,7 @@
 
 
  class MiniMaxM3VLDecoderLayer(GradientCheckpointingLayer):
-@@ -677,26 +931,38 @@
+@@ -677,26 +938,38 @@
          return hidden_states
 
 
@@ -634,7 +641,7 @@
 
      @torch.no_grad()
      def _init_weights(self, module):
-@@ -712,6 +978,12 @@
+@@ -712,6 +985,12 @@
              init.zeros_(module.weight)
 
 
@@ -647,7 +654,7 @@
  @auto_docstring
  class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
      config: MiniMaxM3VLTextConfig
-@@ -730,6 +1002,16 @@
+@@ -730,6 +1009,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -664,7 +671,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -738,26 +1020,51 @@
+@@ -738,26 +1027,51 @@
          input_ids: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
@@ -722,7 +729,7 @@
              causal_mask = next(iter(attention_mask.values()))
          else:
              causal_mask = create_causal_mask(
-@@ -768,11 +1075,10 @@
+@@ -768,11 +1082,10 @@
                  position_ids=position_ids,
              )
 
@@ -737,7 +744,7 @@
          for decoder_layer in self.layers[: self.config.num_hidden_layers]:
              hidden_states = decoder_layer(
                  hidden_states,
-@@ -792,73 +1098,10 @@
+@@ -792,73 +1105,10 @@
          )
 
 
@@ -815,7 +822,7 @@
 
 
  @auto_docstring
-@@ -881,89 +1124,104 @@
+@@ -881,89 +1131,104 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -974,7 +981,7 @@
 
 
  class MiniMaxM3VLVisionEmbeddings(nn.Module):
-@@ -990,6 +1248,12 @@
+@@ -990,6 +1255,12 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -987,7 +994,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,13 +1283,17 @@
+@@ -1019,13 +1290,17 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -1012,7 +1019,7 @@
          coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
-@@ -1156,6 +1424,12 @@
+@@ -1156,6 +1431,12 @@
          return hidden_states
 
 
@@ -1025,7 +1032,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1452,151 @@
+@@ -1178,23 +1459,151 @@
          )
          self.post_init()
 
@@ -1183,7 +1190,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1680,26 @@
+@@ -1278,6 +1687,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1210,7 +1217,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1772,114 @@
+@@ -1350,46 +1779,114 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1342,7 +1349,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,6 +1916,12 @@
+@@ -1426,6 +1923,12 @@
          return vision_outputs
 
 
@@ -1355,7 +1362,7 @@
  @auto_docstring(custom_intro="MiniMax M3 VL full model with LM head (text + vision).")
  class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3VLPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -1448,48 +1944,25 @@
+@@ -1448,48 +1951,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1422,7 +1429,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1977,42 @@
+@@ -1504,15 +1984,42 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1470,7 +1477,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1523,6 +2023,18 @@
+@@ -1523,6 +2030,18 @@
      @auto_docstring
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)

@@ -33,6 +33,13 @@ implementation without touching the model:
 ``T`` is the full packed token count seen by this rank after the Ulysses
 all-to-all, and ``cu_seqlens`` describes every packed sequence, including the
 synthetic SP tail-padding sequence appended by the collator.
+
+MiniMax generated modeling declares ``OpSlot("minimax_sparse_attention",
+"indexer")`` and ``OpSlot("minimax_sparse_attention", "attention")`` and falls
+back to the eager functions below when a slot is bound to ``eager`` (the only
+implementation today). A kernel backend registers a ``KernelSpec`` for both
+variants plus a ``minimax_sparse_attention_implementation`` config field; the
+model code does not change.
 """
 
 from .eager import minimax_sparse_attention_eager, minimax_sparse_indexer_eager

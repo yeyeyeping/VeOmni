@@ -83,6 +83,8 @@ config.add_post_import_block(
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_moe_experts_forward = OpSlot("moe_experts", "swiglu_oai")
+veomni_msa_indexer = OpSlot("minimax_sparse_attention", "indexer")
+veomni_msa_attention = OpSlot("minimax_sparse_attention", "attention")
 """
 )
 config.add_helper(_grid_thw_to_list)
