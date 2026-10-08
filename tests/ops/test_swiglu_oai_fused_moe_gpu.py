@@ -34,9 +34,9 @@ def _eager_swiglu_oai_moe(
         gate, up = F.linear(hidden_states[token_idx], gate_up_proj[expert_idx]).chunk(2, dim=-1)
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
-        activated = (up + 1.0) * gate * torch.sigmoid(alpha * gate)
-        activated = activated * routing_weights[token_idx, top_k_pos, None]
-        current = F.linear(activated, down_proj[expert_idx])
+        # Same op order as MiniMaxM3VLExperts._apply_gate / forward.
+        activated = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+        current = F.linear(activated, down_proj[expert_idx]) * routing_weights[token_idx, top_k_pos, None]
         output.index_add_(0, token_idx, current.to(output.dtype))
     return output
 

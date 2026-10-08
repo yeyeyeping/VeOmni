@@ -36,9 +36,10 @@ def _eager_moe(hidden, routing, selected, gate_up, down, *, limit=None, alpha=No
         if alpha is None:
             activated = F.silu(gate) * up
         else:
-            activated = (up + 1.0) * gate * torch.sigmoid(alpha * gate)
-        activated = activated * routing[token_idx, top_k_pos, None]
-        output.index_add_(0, token_idx, F.linear(activated, down[expert_idx]).to(output.dtype))
+            # Same op order as MiniMaxM3VLExperts._apply_gate.
+            activated = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+        current = F.linear(activated, down[expert_idx]) * routing[token_idx, top_k_pos, None]
+        output.index_add_(0, token_idx, current.to(output.dtype))
     return output
 
 
@@ -78,29 +79,18 @@ def test_npu_fused_moe_matches_eager_forward_backward(limit, alpha, monkeypatch)
         )
 
     fused_hidden, fused_routing, fused_gate_up, fused_down = _leaves()
-    if alpha is None:
-        fused_output = npu_group_gemm.npu_fused_moe_forward(
-            gate_up.shape[0],
-            fused_routing,
-            selected,
-            fused_hidden,
-            None,
-            None,
-            fused_down,
-            fused_gate_up,
-            swiglu_limit=limit,
-        )
-    else:
-        fused_output = npu_group_gemm.npu_swiglu_oai_fused_moe_forward(
-            gate_up.shape[0],
-            fused_routing,
-            selected,
-            fused_hidden,
-            fused_down,
-            fused_gate_up,
-            limit,
-            alpha,
-        )
+    fused_output = npu_group_gemm.npu_fused_moe_forward(
+        gate_up.shape[0],
+        fused_routing,
+        selected,
+        fused_hidden,
+        None,
+        None,
+        fused_down,
+        fused_gate_up,
+        swiglu_limit=limit,
+        swiglu_alpha=alpha,
+    )
     grad_output = torch.randn_like(fused_output)
     fused_grads = torch.autograd.grad(
         fused_output, (fused_hidden, fused_routing, fused_gate_up, fused_down), grad_output

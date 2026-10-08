@@ -59,19 +59,16 @@ def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
     return _clamped_swiglu(x, swiglu_limit)
 
 
-def _swiglu_oai(x: torch.Tensor, swiglu_limit: float, swiglu_alpha: float) -> torch.Tensor:
-    gate, up = x.chunk(2, dim=-1)
-    gate = gate.clamp(max=swiglu_limit)
-    up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-    return swiglu_oai(gate, up, swiglu_alpha)
-
-
 def _apply_moe_activation(x: torch.Tensor, swiglu_limit: float | None, swiglu_alpha: float | None) -> torch.Tensor:
+    """Standard (optionally clamped) SwiGLU, or SwiGLU-OAI when ``swiglu_alpha`` is set."""
     if swiglu_alpha is None:
         return _swiglu(x, swiglu_limit)
     if swiglu_limit is None:
         raise ValueError("SwiGLU-OAI requires swiglu_limit to be set.")
-    return _swiglu_oai(x, swiglu_limit, swiglu_alpha)
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.clamp(max=swiglu_limit)
+    up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    return swiglu_oai(gate, up, swiglu_alpha)
 
 
 def _npu_fused_moe_forward(
@@ -269,7 +266,9 @@ def npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
 ):
+    """NPU fused MoE forward; ``swiglu_alpha`` selects the SwiGLU-OAI activation."""
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(
             num_experts,
@@ -282,6 +281,7 @@ def npu_fused_moe_forward(
             fc1_1_2_weight,
             ep_group=get_parallel_state().ep_group,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
         )
     else:
         final_hidden_states = _npu_fused_moe_forward(
@@ -294,43 +294,6 @@ def npu_fused_moe_forward(
             fc2_weight,
             fc1_1_2_weight,
             swiglu_limit=swiglu_limit,
-        )
-    return final_hidden_states
-
-
-def npu_swiglu_oai_fused_moe_forward(
-    num_experts: int,
-    routing_weights: torch.Tensor,
-    selected_experts: torch.Tensor,
-    hidden_states: torch.Tensor,
-    fc2_weight: torch.Tensor,
-    fc1_1_2_weight: torch.Tensor,
-    swiglu_limit: float,
-    swiglu_alpha: float,
-) -> torch.Tensor:
-    if get_parallel_state().ep_enabled:
-        return npu_ep_fused_moe_forward(
-            num_experts,
-            routing_weights,
-            selected_experts,
-            hidden_states,
-            None,
-            None,
-            fc2_weight,
-            fc1_1_2_weight,
-            ep_group=get_parallel_state().ep_group,
-            swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
         )
-    return _npu_fused_moe_forward(
-        num_experts,
-        routing_weights,
-        selected_experts,
-        hidden_states,
-        None,
-        None,
-        fc2_weight,
-        fc1_1_2_weight,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-    )
+    return final_hidden_states
