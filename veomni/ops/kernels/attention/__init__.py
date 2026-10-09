@@ -316,6 +316,7 @@ def flash_attention_forward(
             value,
             group=cp_state.cp_group,
             cp_size=cp_state.cp_size,
+            ulysses_size=cp_state.ulysses_size,
             device_type=cp_state.device_type,
             cu_seqlens=kwargs.get("cu_seq_lens_q"),
             attention_mask=attention_mask,
