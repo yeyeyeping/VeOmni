@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Eager reference implementation of the MiniMax M3 sparse attention operators.
+"""MiniMax M3 eager indexer with NPU fused attention and a CPU reference.
 
 The math is the Transformers ``MiniMaxM3VLIndexer`` / ``build_block_mask`` /
 ``eager_attention_forward`` reference, run on a temporary right-padded
 ``[B, Smax, ...]`` view of the packed input. The unpack/pack round trip exists
 only because the reference math is batched; it never leaves this module.
+NPU attention consumes the full boolean mask through ``npu_fusion_attention``;
+GPU attention is intentionally unsupported in this private training fork.
 """
 
 import torch
@@ -145,7 +147,23 @@ def _dense_attention(
     scale: float,
     dropout_p: float,
 ) -> torch.Tensor:
-    """Upstream eager attention on ``[B, H, S, D]`` with local GQA; returns ``[B, S, Hq, D]``."""
+    """NPU fused attention or CPU reference on BNSD inputs; returns ``[B, S, Hq, D]``."""
+    if query.device.type == "npu":
+        import torch_npu
+
+        output = torch_npu.npu_fusion_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            head_num=query.shape[1],
+            input_layout="BNSD",
+            atten_mask=(~keep).contiguous(),
+            sparse_mode=1,
+            scale=scale,
+            keep_prob=1.0 - dropout_p,
+        )[0]
+        return output.transpose(1, 2).contiguous()
+
     num_groups = query.shape[1] // key.shape[1]
     key = key.repeat_interleave(num_groups, dim=1)
     value = value.repeat_interleave(num_groups, dim=1)
@@ -205,6 +223,9 @@ def minimax_sparse_attention_eager(
     dropout_p: float = 0.0,
 ) -> torch.Tensor:
     """Causal (block-sparse when ``block_indices`` is given) attention on TND tensors; see the package docstring."""
+    if q.device.type not in ("npu", "cpu"):
+        raise NotImplementedError("MiniMax attention training supports NPU only; CPU is kept as a test reference.")
+
     num_query_heads, num_groups = q.shape[1], k.shape[1]
     if num_query_heads % num_groups != 0:
         raise ValueError(f"Query heads ({num_query_heads}) must be divisible by KV heads ({num_groups}).")

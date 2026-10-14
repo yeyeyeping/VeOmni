@@ -26,7 +26,7 @@ from veomni.ops.kernels.minimax_sparse_attention import (
     minimax_sparse_indexer_eager,
 )
 from veomni.ops.kernels.minimax_sparse_attention.eager import _pack, _packed_to_padded_indices, _unpack
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+from veomni.utils.import_utils import is_torch_npu_available, is_transformers_version_greater_or_equal_to
 
 
 pytestmark = pytest.mark.skipif(
@@ -271,3 +271,50 @@ def test_rejects_block_indices_not_grouped_by_kv_head():
         minimax_sparse_attention_eager(
             q, k, k, block_indices, _cu_seqlens([4]), 4, block_size=_BLOCK_SIZE, scale=_HEAD_DIM**-0.5
         )
+
+
+def test_rejects_gpu_attention_before_allocating_mask():
+    q = SimpleNamespace(device=torch.device("cuda"))
+    with pytest.raises(NotImplementedError, match="NPU only"):
+        minimax_sparse_attention_eager(q, None, None, None, None, 4, block_size=None, scale=1.0)
+
+
+@pytest.mark.skipif(not is_torch_npu_available(), reason="Requires Ascend NPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("sparse", [True, False], ids=["block_sparse", "dense_causal"])
+def test_npu_attention_matches_cpu_forward_and_backward(dtype, sparse):
+    torch.manual_seed(42)
+    lengths = (5, 1, 9, 3)
+    total_length, head_dim = sum(lengths), 64
+    cu_seqlens = _cu_seqlens(lengths)
+    cpu_inputs = [
+        torch.randn(total_length, heads, head_dim).to(dtype).float().requires_grad_()
+        for heads in (_NUM_QUERY_HEADS, _NUM_GROUPS, _NUM_GROUPS)
+    ]
+    npu_inputs = [tensor.detach().to(device="npu", dtype=dtype).requires_grad_() for tensor in cpu_inputs]
+    block_indices = None
+    if sparse:
+        block_indices = minimax_sparse_indexer_eager(
+            cpu_inputs[1].detach(),
+            cpu_inputs[1][:, :1].detach(),
+            cu_seqlens,
+            max(lengths),
+            block_size=_BLOCK_SIZE,
+            topk_blocks=_TOPK_BLOCKS,
+            local_blocks=_LOCAL_BLOCKS,
+        )
+    kwargs = dict(block_size=_BLOCK_SIZE, scale=head_dim**-0.5)
+    expected = minimax_sparse_attention_eager(*cpu_inputs, block_indices, cu_seqlens, max(lengths), **kwargs)
+    actual = minimax_sparse_attention_eager(
+        *npu_inputs,
+        block_indices.to("npu") if sparse else None,
+        cu_seqlens,
+        max(lengths),
+        **kwargs,
+    )
+    grad_output = torch.randn_like(expected).to(dtype).float()
+    expected_grads = torch.autograd.grad(expected, cpu_inputs, grad_output)
+    actual_grads = torch.autograd.grad(actual, npu_inputs, grad_output.to(device="npu", dtype=dtype))
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    for result, reference in zip((actual, *actual_grads), (expected, *expected_grads)):
+        torch.testing.assert_close(result.float().cpu(), reference, atol=tolerance, rtol=tolerance)

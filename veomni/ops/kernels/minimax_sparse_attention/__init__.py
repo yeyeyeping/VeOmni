@@ -16,7 +16,10 @@
 
 The operator boundary follows the block-sparse kernel rather than the
 Transformers reference code, so a kernel backend can replace the eager
-implementation without touching the model:
+implementation without touching the model. In this private fork, the existing
+``eager`` entrypoint uses NPU fused attention with a full mask; CPU retains the
+eager reference and GPU attention raises ``NotImplementedError``. The indexer
+remains eager on all devices, and no new configuration is required:
 
 ``indexer(index_q, index_k, cu_seqlens, max_seqlen, *, block_size, topk_blocks, local_blocks)``
     ``index_q`` is ``[T, G, D]`` and ``index_k`` is ``[T, 1, D]`` (MQA), both
