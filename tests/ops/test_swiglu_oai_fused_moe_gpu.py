@@ -77,15 +77,17 @@ def test_triton_swiglu_oai_moe_matches_eager_forward_backward(monkeypatch):
         torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1).to(dtype).requires_grad_(True)
     )
 
-    fused_output = group_gemm.group_gemm_swiglu_oai_fused_moe_forward(
+    fused_output = group_gemm.group_gemm_fused_moe_forward(
         num_experts,
         routing_weights,
         selected_experts,
         hidden,
-        down,
-        gate_up,
-        limit,
-        alpha,
+        fc1_1_weight=None,
+        fc1_2_weight=None,
+        fc2_weight=down,
+        fc1_1_2_weight=gate_up,
+        swiglu_limit=limit,
+        swiglu_alpha=alpha,
     )
     grad_output = torch.randn_like(fused_output)
     fused_grads = torch.autograd.grad(fused_output, (hidden, routing_weights, gate_up, down), grad_output)
@@ -154,15 +156,17 @@ def _ep_forward_backward_worker():
         routing = torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1).to(dtype).requires_grad_(True)
         grad_output = torch.randn_like(hidden)
 
-        fused_output = group_gemm.group_gemm_swiglu_oai_fused_moe_forward(
+        fused_output = group_gemm.group_gemm_fused_moe_forward(
             num_experts,
             routing,
             selected,
             hidden,
-            local_down,
-            local_gate_up,
-            limit,
-            alpha,
+            fc1_1_weight=None,
+            fc1_2_weight=None,
+            fc2_weight=local_down,
+            fc1_1_2_weight=local_gate_up,
+            swiglu_limit=limit,
+            swiglu_alpha=alpha,
         )
         fused_grads = torch.autograd.grad(
             fused_output,

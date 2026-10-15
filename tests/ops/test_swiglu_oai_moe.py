@@ -4,7 +4,12 @@ import pytest
 import torch
 
 from veomni.ops.kernel_registry import KERNEL_REGISTRY
-from veomni.ops.kernels.moe.activation import swiglu_oai, swiglu_oai_backward
+from veomni.ops.kernels.moe.activation import (
+    swiglu_activation,
+    swiglu_activation_backward,
+    swiglu_oai,
+    swiglu_oai_backward,
+)
 
 
 def test_swiglu_oai_moe_variant_registers_gpu_and_npu_backends():
@@ -71,3 +76,29 @@ def test_swiglu_oai_matches_minimax_eager_gate_bitwise_in_bf16():
     output = swiglu_oai(gate.clamp(max=limit), up.clamp(min=-limit, max=limit), alpha)
 
     torch.testing.assert_close(output, experts._apply_gate(gate_up), rtol=0, atol=0)
+
+
+def test_swiglu_activation_without_alpha_is_bitwise_the_standard_swiglu():
+    """``swiglu_alpha=None`` must keep every existing fused-MoE model's exact bf16 op order."""
+    torch.manual_seed(0)
+    gate, up, grad = (torch.randn(64, 32).to(torch.bfloat16) for _ in range(3))
+
+    activation = swiglu_activation(gate, up, None)
+    grad_gate, grad_up = swiglu_activation_backward(grad, gate, up, None)
+
+    silu_gate = torch.ops.aten.silu(gate)
+    assert torch.equal(activation, silu_gate * up)
+    assert torch.equal(grad_gate, torch.ops.aten.silu_backward(grad * up, gate))
+    assert torch.equal(grad_up, silu_gate * grad)
+
+
+def test_swiglu_activation_with_alpha_is_swiglu_oai():
+    torch.manual_seed(0)
+    gate, up, grad = (torch.randn(64, 32) for _ in range(3))
+    alpha = 1.702
+
+    assert torch.equal(swiglu_activation(gate, up, alpha), swiglu_oai(gate, up, alpha))
+    for actual, expected in zip(
+        swiglu_activation_backward(grad, gate, up, alpha), swiglu_oai_backward(grad, gate, up, alpha)
+    ):
+        assert torch.equal(actual, expected)
