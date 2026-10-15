@@ -28,7 +28,6 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     PatchedMiniMaxM3VLPreTrainedModel,
     _grid_thw_to_list,
     _minimax_m3_indexer_project,
-    _validate_minimax_m3_ep,
     collate_multimodal_metadata,
     minimax_m3_vl_3d_rotary_embedding_forward_patched,
     minimax_m3_vl_attention_forward_patched,
@@ -87,7 +86,6 @@ veomni_msa_attention = OpSlot("minimax_sparse_attention", "attention")
 )
 config.add_helper(_grid_thw_to_list)
 config.add_helper(_minimax_m3_indexer_project)
-config.add_helper(_validate_minimax_m3_ep)
 config.add_helper(collate_multimodal_metadata)
 
 config.replace_class(

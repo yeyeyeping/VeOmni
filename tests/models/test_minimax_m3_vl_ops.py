@@ -798,30 +798,6 @@ def test_minimax_m3_vl_experts_preserve_swiglu_oai_eager_semantics(module_name, 
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_parallel_plan_rejects_eager_ep(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
-    config = SimpleNamespace(
-        num_local_experts=4,
-    )
-    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True, ep_size=2))
-
-    with pytest.raises(RuntimeError, match="requires.*fused_triton or fused_npu"):
-        modeling._validate_minimax_m3_ep(config)
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_parallel_plan_requires_expert_count_divisible_by_ep(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
-    config = SimpleNamespace(
-        num_local_experts=3,
-    )
-    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True, ep_size=2))
-
-    with pytest.raises(ValueError, match="num_experts=3.*ep_size=2"):
-        modeling._validate_minimax_m3_ep(config)
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_experts_dispatch_fused_ep(module_name, monkeypatch):
     modeling = importlib.import_module(module_name)
     config = SimpleNamespace(

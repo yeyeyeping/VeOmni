@@ -123,23 +123,6 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     )
 
 
-def _validate_minimax_m3_ep(text_config):
-    """Validate static MiniMax EP requirements once while building the parallel plan."""
-    parallel_state = get_parallel_state()
-    if not parallel_state.ep_enabled:
-        return
-    if text_config.num_local_experts % parallel_state.ep_size != 0:
-        raise ValueError(
-            f"MiniMax M3 num_experts={text_config.num_local_experts} "
-            f"must be divisible by ep_size={parallel_state.ep_size}."
-        )
-    if not veomni_moe_experts_forward.use_non_eager_impl:
-        raise RuntimeError(
-            "MiniMax M3 expert parallelism requires "
-            "model.ops_implementation.moe_implementation=fused_triton or fused_npu."
-        )
-
-
 def collate_multimodal_metadata(batch, sp_pad):
     """Derive MiniMax ViT metadata on CPU inside the VeOmni collator.
 
@@ -1156,7 +1139,6 @@ class MiniMaxM3VLForCausalLM(MiniMaxM3VLPreTrainedModel, GenerationMixin):
     def get_parallel_plan(self):
         from ..parallel_plan import get_text_parallel_plan
 
-        _validate_minimax_m3_ep(self.config)
         return get_text_parallel_plan()
 
 
@@ -1963,7 +1945,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3VLPreTrainedModel, Genera
     def get_parallel_plan(self):
         from ..parallel_plan import get_vlm_parallel_plan
 
-        _validate_minimax_m3_ep(self.config.text_config)
         return get_vlm_parallel_plan()
 
     def get_position_id_func(self):

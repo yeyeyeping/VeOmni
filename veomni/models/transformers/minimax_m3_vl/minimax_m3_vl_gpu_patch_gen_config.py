@@ -546,24 +546,6 @@ class PatchedMiniMaxM3VLExperts(nn.Module):
         return (up + 1.0) * glu
 
 
-@config.add_helper
-def _validate_minimax_m3_ep(text_config):
-    """Validate static MiniMax EP requirements once while building the parallel plan."""
-    parallel_state = get_parallel_state()
-    if not parallel_state.ep_enabled:
-        return
-    if text_config.num_local_experts % parallel_state.ep_size != 0:
-        raise ValueError(
-            f"MiniMax M3 num_experts={text_config.num_local_experts} "
-            f"must be divisible by ep_size={parallel_state.ep_size}."
-        )
-    if not veomni_moe_experts_forward.use_non_eager_impl:
-        raise RuntimeError(
-            "MiniMax M3 expert parallelism requires "
-            "model.ops_implementation.moe_implementation=fused_triton or fused_npu."
-        )
-
-
 # ================================================================
 # Patch: MiniMaxM3VLModel.forward
 # 1. consume MiniMax multimodal_metadata and pass per-modality grid lists
@@ -984,7 +966,6 @@ class MiniMaxM3VLCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, MiniMaxM3
 def minimax_m3_vl_get_parallel_plan_patched(self):
     from ..parallel_plan import get_vlm_parallel_plan
 
-    _validate_minimax_m3_ep(self.config.text_config)
     return get_vlm_parallel_plan()
 
 
@@ -1011,5 +992,4 @@ def minimax_m3_vl_get_metadata_collate_func_patched(self):
 def minimax_m3_vl_text_get_parallel_plan_patched(self):
     from ..parallel_plan import get_text_parallel_plan
 
-    _validate_minimax_m3_ep(self.config)
     return get_text_parallel_plan()
