@@ -211,7 +211,7 @@ CASES = [
     # ViT layout with qwen2_5_vl.
     _logits_case("qwen2_5_omni-fa2"),
     # MiniMax M3 VL — full multimodal path with collator-precomputed vision
-    # grid lists. The model is available starting in transformers 5.12.
+    # grid lists. The model is available starting in transformers 5.16.
     Case(
         "minimax_m3_vl-fa2",
         _toy("minimax_m3_vl_toy"),
@@ -416,20 +416,6 @@ _MM_METADATA_WIRED_CASES: set[str] = {
 def _skip_if_transformers_model_unavailable(case: Case) -> None:
     if case.case_id == "minimax_m3_vl-fa2" and not is_transformers_version_greater_or_equal_to("5.16.0"):
         pytest.skip("MiniMax M3 VL modeling requires transformers>=5.16.0.")
-
-
-def _make_gate_config(case: Case):
-    config = _make_config(case)
-    if case.case_id == "minimax_m3_vl-fa2":
-        # The generic VLM fixture places the real MiniMax placeholder IDs in
-        # input_ids. Its tiny training toy keeps vocab_size=256 and normally
-        # uses inputs_embeds, so expand only this forward-gate config.
-        config.text_config.vocab_size = max(
-            config.text_config.vocab_size,
-            config.image_token_id + 1,
-            config.video_token_id + 1,
-        )
-    return config
 
 
 def _attach_multimodal_metadata(model, case: Case, fwd_kwargs: dict) -> None:
@@ -646,7 +632,7 @@ def test_no_implicit_sync_in_generated_forward(case):
 
     device = get_device_type()
     dtype = _DTYPE_MAP[case.dtype]
-    config = _make_gate_config(case)
+    config = _make_config(case)
     input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
 
     model = _build_veomni_model(case, config)
@@ -791,7 +777,7 @@ def test_multimodal_metadata_path_matches_fallback(case):
 
     device = get_device_type()
     dtype = _DTYPE_MAP[case.dtype]
-    config = _make_gate_config(case)
+    config = _make_config(case)
     input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
 
     model = _build_veomni_model(case, config)

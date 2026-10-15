@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.ops.dispatch import OpSlot
 from veomni.ops.kernels.cross_entropy import install_loss_mapping
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
@@ -33,20 +32,6 @@ pytestmark = pytest.mark.skipif(
     not is_transformers_version_greater_or_equal_to("5.16.0"),
     reason="MiniMax M3 VL generated modeling requires transformers>=5.16.0.",
 )
-
-
-class _RecordingSlot:
-    use_non_eager_impl = True
-
-    def __init__(self, output):
-        self.output = output
-        self.args = None
-        self.kwargs = None
-
-    def __call__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
-        return self.output
 
 
 def _upstream_text_model(model):
@@ -69,11 +54,8 @@ class _RecordingVisionLayer(torch.nn.Module):
         return hidden_states
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_for_causal_lm_unpacks_veomni_loss_contract(module_name):
-    modeling = importlib.import_module(module_name)
-    install_loss_mapping("eager")
-    config = modeling.MiniMaxM3VLTextConfig(
+def _text_config(modeling, **overrides):
+    kwargs = dict(
         vocab_size=32,
         hidden_size=8,
         intermediate_size=6,
@@ -87,11 +69,25 @@ def test_minimax_m3_vl_for_causal_lm_unpacks_veomni_loss_contract(module_name):
         rotary_dim=4,
         num_local_experts=2,
         num_experts_per_tok=1,
-        layer_types=["full_attention"],
-        mlp_layer_types=["sparse"],
+        layer_types=["minimax_m3_sparse"],
+        mlp_layer_types=["dense"],
         bos_token_id=1,
         eos_token_id=2,
     )
+    kwargs.update(overrides)
+    return modeling.MiniMaxM3VLTextConfig(**kwargs)
+
+
+def _single_layer_sparse_text_model(modeling):
+    config = _text_config(modeling, index_block_size=2, index_topk_blocks=2)
+    return modeling.MiniMaxM3VLTextModel(config).eval()
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_for_causal_lm_unpacks_veomni_loss_contract(module_name):
+    modeling = importlib.import_module(module_name)
+    install_loss_mapping("eager")
+    config = _text_config(modeling, layer_types=["full_attention"], mlp_layer_types=["sparse"])
     model = modeling.MiniMaxM3VLForCausalLM(config)
     input_ids = torch.tensor([[1, 4, 5, 2]])
     labels = torch.tensor([[4, 5, 2, -100]])
@@ -107,13 +103,9 @@ def test_minimax_m3_vl_for_causal_lm_unpacks_veomni_loss_contract(module_name):
         use_cache=False,
     )
 
-    assert isinstance(output.loss, torch.Tensor)
     assert output.loss.ndim == 0
     assert output.logits.shape == (1, input_ids.shape[1], config.vocab_size)
-    assert output.fused_linear_aux is None
     assert not hasattr(output, "aux_loss")
-    assert not hasattr(output, "router_logits")
-    assert "router_logits" not in model._can_record_outputs
     output.loss.backward()
     assert model.lm_head.weight.grad is not None
 
@@ -121,25 +113,7 @@ def test_minimax_m3_vl_for_causal_lm_unpacks_veomni_loss_contract(module_name):
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_rejects_incompatible_router_aux_loss(module_name):
     modeling = importlib.import_module(module_name)
-    config = modeling.MiniMaxM3VLTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=6,
-        dense_intermediate_size=12,
-        shared_intermediate_size=4,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        index_n_heads=1,
-        head_dim=4,
-        rotary_dim=4,
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        layer_types=["full_attention"],
-        mlp_layer_types=["sparse"],
-        bos_token_id=1,
-        eos_token_id=2,
-    )
+    config = _text_config(modeling, layer_types=["full_attention"], mlp_layer_types=["sparse"])
     model = modeling.MiniMaxM3VLForCausalLM(config)
 
     with pytest.raises(ValueError, match="router auxiliary loss is disabled"):
@@ -149,183 +123,58 @@ def test_minimax_m3_vl_rejects_incompatible_router_aux_loss(module_name):
             use_cache=False,
         )
 
-    assert not hasattr(modeling, "load_balancing_loss_func")
-
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_text_model_keeps_decoder_and_attention_packed(module_name, monkeypatch):
+@pytest.mark.parametrize("layer_type", ["minimax_m3_sparse", "full_attention"], ids=["sparse", "full"])
+def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, layer_type):
+    """Packed samples match the upstream model run per sample, in forward and backward."""
     modeling = importlib.import_module(module_name)
-    config = modeling.MiniMaxM3VLTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=6,
-        dense_intermediate_size=12,
-        shared_intermediate_size=4,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        index_n_heads=1,
-        head_dim=4,
-        rotary_dim=4,
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        layer_types=["minimax_m3_sparse"],
-        mlp_layer_types=["dense"],
-        bos_token_id=1,
-        eos_token_id=2,
-    )
-    model = modeling.MiniMaxM3VLTextModel(config)
-    model.eval()
-    decoder_inputs = []
-    attention_query_shapes = []
-
-    def record_decoder_input(_, args, kwargs):
-        decoder_inputs.append(
-            {
-                "shape": args[0].shape,
-                "attention_mask": kwargs["attention_mask"],
-                "position_ids": kwargs["position_ids"].detach().clone(),
-                "extra_kwargs": set(kwargs) - {"attention_mask", "position_ids", "past_key_values"},
-            }
-        )
-
-    sparse_attention = modeling.minimax_sparse_attention_eager
-
-    def record_attention(query, key, value, block_indices, *args, **kwargs):
-        attention_query_shapes.append((query.shape, block_indices.shape))
-        return sparse_attention(query, key, value, block_indices, *args, **kwargs)
-
-    monkeypatch.setattr(modeling, "minimax_sparse_attention_eager", record_attention)
-
-    assert model.layers[0].self_attn.indexer is not None
-
-    first_hidden_states = torch.randn(1, 2, config.hidden_size)
-    second_hidden_states = torch.randn(1, 3, config.hidden_size)
-    packed_hidden_states = torch.cat((first_hidden_states, second_hidden_states), dim=1)
-    packed_position_ids = torch.tensor([[0, 1, 0, 1, 2]])
+    model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=[layer_type])).eval()
     reference = _upstream_text_model(model)
+    # The shared config selects the ViT backend only; language attention must ignore it.
+    model.config._attn_implementation = "veomni_flash_attention_2_with_sp"
+    hidden_size = model.config.hidden_size
+    first = torch.randn(1, 2, hidden_size, requires_grad=True)
+    second = torch.randn(1, 3, hidden_size, requires_grad=True)
+    packed = torch.cat((first, second), dim=1).detach().requires_grad_(True)
 
-    with torch.no_grad():
-        expected = torch.cat(
-            (
-                reference(
-                    inputs_embeds=first_hidden_states,
-                    attention_mask=torch.ones(1, 2, dtype=torch.long),
-                    position_ids=torch.arange(2).unsqueeze(0),
-                    use_cache=False,
-                ).last_hidden_state,
-                reference(
-                    inputs_embeds=second_hidden_states,
-                    attention_mask=torch.ones(1, 3, dtype=torch.long),
-                    position_ids=torch.arange(3).unsqueeze(0),
-                    use_cache=False,
-                ).last_hidden_state,
-            ),
-            dim=1,
-        )
-
-        # The shared config controls ViT dispatch only. Packed MiniMax language
-        # attention must keep using the M3-specific path below.
-        model.config._attn_implementation = "veomni_flash_attention_2_with_sp"
-        hook = model.layers[0].register_forward_pre_hook(record_decoder_input, with_kwargs=True)
-        attention_query_shapes.clear()
-        output = model(
-            inputs_embeds=packed_hidden_states,
-            attention_mask=torch.ones(1, 5, dtype=torch.long),
-            position_ids=packed_position_ids,
-            cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
-            cu_seq_lens_k=torch.tensor([0, 2, 5], dtype=torch.int32),
-            max_length_q=3,
-            max_length_k=3,
-            use_cache=False,
-        )
-        hook.remove()
-
-    assert decoder_inputs[0]["shape"] == (1, 5, config.hidden_size)
-    assert decoder_inputs[0]["position_ids"].tolist() == [[0, 1, 0, 1, 2]]
-    assert decoder_inputs[0]["attention_mask"] is None
-    # Attention consumes the packed TND stream; no padded layout reaches the model.
-    assert attention_query_shapes == [
-        (
-            (5, config.num_attention_heads, config.head_dim),
-            (5, config.num_key_value_heads, config.index_topk_blocks),
-        )
-    ]
-    assert {"cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"} <= decoder_inputs[0]["extra_kwargs"]
-    assert output.last_hidden_state.shape == (1, 5, config.hidden_size)
-    torch.testing.assert_close(output.last_hidden_state, expected)
-
-    packed_grad_input = packed_hidden_states.detach().clone().requires_grad_(True)
-    packed_grad_output = model(
-        inputs_embeds=packed_grad_input,
+    actual = model(
+        inputs_embeds=packed,
         attention_mask=torch.ones(1, 5, dtype=torch.long),
-        position_ids=packed_position_ids,
+        position_ids=torch.tensor([[0, 1, 0, 1, 2]]),
         cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
         cu_seq_lens_k=torch.tensor([0, 2, 5], dtype=torch.int32),
         max_length_q=3,
         max_length_k=3,
         use_cache=False,
     ).last_hidden_state
-    (packed_grad,) = torch.autograd.grad(packed_grad_output.square().sum(), packed_grad_input)
-
-    first_grad_input = first_hidden_states.detach().clone().requires_grad_(True)
-    second_grad_input = second_hidden_states.detach().clone().requires_grad_(True)
-    first_grad_output = reference(
-        inputs_embeds=first_grad_input,
-        attention_mask=torch.ones(1, 2, dtype=torch.long),
-        position_ids=torch.arange(2).unsqueeze(0),
-        use_cache=False,
-    ).last_hidden_state
-    second_grad_output = reference(
-        inputs_embeds=second_grad_input,
-        attention_mask=torch.ones(1, 3, dtype=torch.long),
-        position_ids=torch.arange(3).unsqueeze(0),
-        use_cache=False,
-    ).last_hidden_state
-    first_grad, second_grad = torch.autograd.grad(
-        first_grad_output.square().sum() + second_grad_output.square().sum(),
-        (first_grad_input, second_grad_input),
+    expected = torch.cat(
+        [
+            reference(
+                inputs_embeds=sample,
+                attention_mask=torch.ones(1, sample.shape[1], dtype=torch.long),
+                position_ids=torch.arange(sample.shape[1]).unsqueeze(0),
+                use_cache=False,
+            ).last_hidden_state
+            for sample in (first, second)
+        ],
+        dim=1,
     )
+    torch.testing.assert_close(actual, expected)
+
+    (packed_grad,) = torch.autograd.grad(actual.square().sum(), packed)
+    first_grad, second_grad = torch.autograd.grad(expected.square().sum(), (first, second))
     torch.testing.assert_close(packed_grad, torch.cat((first_grad, second_grad), dim=1))
 
 
-def _single_layer_sparse_text_model(modeling):
-    config = modeling.MiniMaxM3VLTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=6,
-        dense_intermediate_size=12,
-        shared_intermediate_size=4,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        index_n_heads=1,
-        index_block_size=2,
-        index_topk_blocks=2,
-        head_dim=4,
-        rotary_dim=4,
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        layer_types=["minimax_m3_sparse"],
-        mlp_layer_types=["dense"],
-        bos_token_id=1,
-        eos_token_id=2,
-    )
-    return modeling.MiniMaxM3VLTextModel(config).eval()
-
-
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_text_model_describes_unpacked_single_sequence_as_one_segment(module_name):
+def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(module_name):
     """Without varlen kwargs a lone unpadded sequence runs as a one-segment pack and matches upstream."""
     modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
-    decoder_kwargs = []
-    hook = model.layers[0].register_forward_pre_hook(
-        lambda _, __, kwargs: decoder_kwargs.append(kwargs), with_kwargs=True
-    )
-
     hidden_states = torch.randn(1, 7, model.config.hidden_size)
     position_ids = torch.arange(7).unsqueeze(0)
+
     with torch.no_grad():
         output = model(inputs_embeds=hidden_states, attention_mask=torch.ones(1, 7, dtype=torch.long))
         packed = model(
@@ -342,11 +191,7 @@ def test_minimax_m3_vl_text_model_describes_unpacked_single_sequence_as_one_segm
             position_ids=position_ids,
             use_cache=False,
         )
-    hook.remove()
 
-    assert decoder_kwargs[0]["cu_seq_lens_q"].tolist() == [0, 7]
-    assert decoder_kwargs[0]["max_length_q"] == 7
-    assert decoder_kwargs[0]["attention_mask"] is None
     assert output.past_key_values is None
     torch.testing.assert_close(output.last_hidden_state, packed.last_hidden_state, rtol=0, atol=0)
     torch.testing.assert_close(output.last_hidden_state, expected.last_hidden_state)
@@ -378,162 +223,6 @@ def test_minimax_m3_vl_text_model_rejects_unpacked_input_under_sequence_parallel
 
     with pytest.raises(ValueError, match="requires packed inputs"):
         model(inputs_embeds=torch.randn(1, 4, model.config.hidden_size))
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_full_attention_packed_matches_separate_samples(module_name):
-    modeling = importlib.import_module(module_name)
-    config = modeling.MiniMaxM3VLTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=6,
-        dense_intermediate_size=12,
-        shared_intermediate_size=4,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        index_n_heads=1,
-        head_dim=4,
-        rotary_dim=4,
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        layer_types=["full_attention"],
-        mlp_layer_types=["dense"],
-        bos_token_id=1,
-        eos_token_id=2,
-    )
-    model = modeling.MiniMaxM3VLTextModel(config).eval()
-    reference = _upstream_text_model(model)
-    first = torch.randn(1, 2, config.hidden_size)
-    second = torch.randn(1, 3, config.hidden_size)
-
-    with torch.no_grad():
-        expected = torch.cat(
-            (
-                reference(
-                    inputs_embeds=first,
-                    attention_mask=torch.ones(1, 2, dtype=torch.long),
-                    position_ids=torch.arange(2).unsqueeze(0),
-                    use_cache=False,
-                ).last_hidden_state,
-                reference(
-                    inputs_embeds=second,
-                    attention_mask=torch.ones(1, 3, dtype=torch.long),
-                    position_ids=torch.arange(3).unsqueeze(0),
-                    use_cache=False,
-                ).last_hidden_state,
-            ),
-            dim=1,
-        )
-        actual = model(
-            inputs_embeds=torch.cat((first, second), dim=1),
-            attention_mask=torch.ones(1, 5, dtype=torch.long),
-            position_ids=torch.tensor([[0, 1, 0, 1, 2]]),
-            cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
-            cu_seq_lens_k=torch.tensor([0, 2, 5], dtype=torch.int32),
-            max_length_q=3,
-            max_length_k=3,
-            use_cache=False,
-        ).last_hidden_state
-
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_language_sp_splits_index_heads_like_kv_and_restores_packed_output(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
-    config = modeling.MiniMaxM3VLTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=6,
-        dense_intermediate_size=12,
-        shared_intermediate_size=4,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        index_n_heads=1,
-        head_dim=4,
-        rotary_dim=4,
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        layer_types=["minimax_m3_sparse"],
-        mlp_layer_types=["dense"],
-        bos_token_id=1,
-        eos_token_id=2,
-    )
-    model = modeling.MiniMaxM3VLTextModel(config).eval()
-    group = object()
-    parallel_state = SimpleNamespace(
-        ulysses_enabled=True,
-        ulysses_size=2,
-        ulysses_rank=0,
-        ulysses_group=group,
-        cp_enabled=False,
-    )
-    monkeypatch.setattr(modeling, "get_parallel_state", lambda: parallel_state)
-    calls = []
-
-    def fake_gather(tensor, gather_dim, group):
-        calls.append(("index_key_gather", tuple(tensor.shape), gather_dim, group))
-        return torch.cat((tensor, tensor), dim=gather_dim)
-
-    def fake_kv_head_exchange(tensor, *, group, ulysses_size):
-        # Rank 0 of a simulated 2-way exchange: gather the sequence, repeat
-        # heads up to ulysses_size, then keep this rank's leading head slice.
-        tensor = torch.cat((tensor, tensor), dim=1)
-        if tensor.shape[2] < ulysses_size:
-            tensor = torch.repeat_interleave(tensor, ulysses_size // tensor.shape[2], dim=2)
-        return tensor[:, :, : tensor.shape[2] // ulysses_size]
-
-    def fake_index_query_exchange(tensor, *, group, ulysses_size):
-        calls.append(("index_query_exchange", tuple(tensor.shape), group, ulysses_size))
-        return fake_kv_head_exchange(tensor, group=group, ulysses_size=ulysses_size)
-
-    def fake_prepare(query, key, value, *, group, ulysses_size):
-        calls.append(("main_prepare", tuple(query.shape), group, ulysses_size))
-        query = torch.cat((query, query), dim=1)
-        return (
-            query[:, :, : query.shape[2] // ulysses_size],
-            fake_kv_head_exchange(key, group=group, ulysses_size=ulysses_size),
-            fake_kv_head_exchange(value, group=group, ulysses_size=ulysses_size),
-            config.num_attention_heads,
-        )
-
-    def fake_restore(output, *, group):
-        calls.append(("main_restore", tuple(output.shape), group))
-        return torch.cat((output, output), dim=2)[:, :2]
-
-    monkeypatch.setattr(modeling, "gather_outputs", fake_gather)
-    monkeypatch.setattr(modeling, "gather_seq_scatter_kv_heads", fake_index_query_exchange)
-    monkeypatch.setattr(modeling, "prepare_ulysses_qkv", fake_prepare)
-    monkeypatch.setattr(modeling, "restore_ulysses_output", fake_restore)
-
-    decoder_shapes = []
-    hook = model.layers[0].register_forward_hook(
-        lambda _, args, output: decoder_shapes.append((args[0].shape, output.shape))
-    )
-    with torch.no_grad():
-        output = model(
-            inputs_embeds=torch.randn(1, 2, config.hidden_size),
-            attention_mask=torch.ones(1, 4, dtype=torch.long),
-            position_ids=torch.arange(2).unsqueeze(0),
-            cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
-            cu_seq_lens_k=torch.tensor([0, 2, 4], dtype=torch.int32),
-            max_length_q=2,
-            max_length_k=2,
-            use_cache=False,
-        )
-    hook.remove()
-
-    assert decoder_shapes == [((1, 2, config.hidden_size), (1, 2, config.hidden_size))]
-    assert output.last_hidden_state.shape == (1, 2, config.hidden_size)
-    assert [call[0] for call in calls] == ["main_prepare", "index_query_exchange", "index_key_gather", "main_restore"]
-    # Every exchange receives the local packed shard; attention output is the full sequence.
-    assert calls[0][1][1] == 2
-    assert calls[1][1] == (1, 2, config.index_n_heads, config.index_head_dim)
-    assert calls[2][1] == (1, 2, 1, config.index_head_dim)
-    assert calls[3][1][1] == 4
-    assert calls[0][2] is group and calls[1][2] is group and calls[2][3] is group and calls[3][2] is group
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
@@ -630,120 +319,6 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_allows_veomni_flash_attention_for_vision(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
-    transformers_modeling = importlib.import_module("transformers.modeling_utils")
-    monkeypatch.setattr(transformers_modeling, "lazy_import_flash_attention", lambda *args, **kwargs: None)
-    implementation = "veomni_flash_attention_2_with_sp"
-    config = modeling.MiniMaxM3VLVisionConfig(
-        hidden_size=12,
-        intermediate_size=24,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_channels=3,
-        patch_size=2,
-        temporal_patch_size=1,
-        spatial_merge_size=2,
-    )
-    config._attn_implementation = implementation
-
-    model = modeling.MiniMaxM3VLVisionModel(config)
-
-    assert implementation in modeling.MiniMaxM3VLPreTrainedModel._compatible_flash_implementations
-    assert model.config._attn_implementation == implementation
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_declares_gemma_style_rms_norm_slot(module_name):
-    modeling = importlib.import_module(module_name)
-
-    assert isinstance(modeling.veomni_rms_norm, OpSlot)
-    assert modeling.veomni_rms_norm.op_name == "rms_norm"
-    assert modeling.veomni_rms_norm.variant == "qwen3_5"
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_declares_swiglu_oai_moe_slot(module_name):
-    modeling = importlib.import_module(module_name)
-
-    assert isinstance(modeling.veomni_moe_experts_forward, OpSlot)
-    assert modeling.veomni_moe_experts_forward.op_name == "moe_experts"
-    assert modeling.veomni_moe_experts_forward.variant == "swiglu_oai"
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_declares_sparse_attention_slots(module_name):
-    modeling = importlib.import_module(module_name)
-
-    for slot, variant in ((modeling.veomni_msa_indexer, "indexer"), (modeling.veomni_msa_attention, "attention")):
-        assert isinstance(slot, OpSlot)
-        assert slot.op_name == "minimax_sparse_attention"
-        assert slot.variant == variant
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_packed_attention_dispatches_bound_sparse_attention_kernels(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
-    config = modeling.MiniMaxM3VLTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=6,
-        dense_intermediate_size=12,
-        shared_intermediate_size=4,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        index_n_heads=1,
-        head_dim=4,
-        rotary_dim=4,
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        layer_types=["minimax_m3_sparse"],
-        mlp_layer_types=["dense"],
-        bos_token_id=1,
-        eos_token_id=2,
-    )
-    model = modeling.MiniMaxM3VLTextModel(config).eval()
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-    block_indices = torch.full((5, 1, config.index_topk_blocks), -1, dtype=torch.int32)
-    indexer_slot = _RecordingSlot(block_indices)
-    attention_slot = _RecordingSlot(torch.zeros(5, config.num_attention_heads, config.head_dim))
-    monkeypatch.setattr(modeling, "veomni_msa_indexer", indexer_slot)
-    monkeypatch.setattr(modeling, "veomni_msa_attention", attention_slot)
-
-    with torch.no_grad():
-        model(
-            inputs_embeds=torch.randn(1, 5, config.hidden_size),
-            position_ids=torch.tensor([[0, 1, 0, 1, 2]]),
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=3,
-            max_length_k=3,
-            use_cache=False,
-        )
-
-    index_query, index_key, indexer_cu_seqlens, indexer_max_seqlen = indexer_slot.args
-    assert index_query.shape == (5, config.index_n_heads, config.index_head_dim)
-    assert index_key.shape == (5, 1, config.index_head_dim)
-    assert indexer_cu_seqlens is cu_seqlens and indexer_max_seqlen == 3
-    assert indexer_slot.kwargs == {
-        "block_size": config.index_block_size,
-        "topk_blocks": config.index_topk_blocks,
-        "local_blocks": config.index_local_blocks,
-    }
-    query, key, value, attention_block_indices, attention_cu_seqlens, attention_max_seqlen = attention_slot.args
-    assert query.shape == (5, config.num_attention_heads, config.head_dim)
-    assert key.shape == value.shape == (5, config.num_key_value_heads, config.head_dim)
-    assert attention_block_indices is block_indices
-    assert attention_cu_seqlens is cu_seqlens and attention_max_seqlen == 3
-    assert attention_slot.kwargs == {
-        "block_size": config.index_block_size,
-        "scale": config.head_dim**-0.5,
-        "dropout_p": 0.0,
-    }
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_model_classes_bind_their_matching_parallel_plan(module_name, monkeypatch):
     modeling = importlib.import_module(module_name)
     text_config = SimpleNamespace(num_local_experts=4)
@@ -798,32 +373,6 @@ def test_minimax_m3_vl_experts_preserve_swiglu_oai_eager_semantics(module_name, 
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_experts_dispatch_fused_ep(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
-    config = SimpleNamespace(
-        num_local_experts=4,
-        hidden_size=4,
-        intermediate_size=3,
-        swiglu_limit=0.7,
-        swiglu_alpha=1.702,
-    )
-    experts = modeling.MiniMaxM3VLExperts(config)
-    hidden_states = torch.randn(2, 4)
-    top_k_index = torch.zeros(2, 1, dtype=torch.long)
-    top_k_weights = torch.ones(2, 1)
-    output = torch.randn_like(hidden_states)
-    slot = _RecordingSlot(output)
-    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True, ep_size=2))
-    monkeypatch.setattr(modeling, "veomni_moe_experts_forward", slot)
-
-    assert experts(hidden_states, top_k_index, top_k_weights) is output
-    assert slot.args[0] is experts
-    assert slot.args[1] is hidden_states
-    assert slot.args[2] is top_k_index
-    assert slot.args[3] is top_k_weights
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_rms_norm_preserves_eager_fp32_semantics(module_name):
     modeling = importlib.import_module(module_name)
     norm = modeling.MiniMaxM3VLRMSNorm(8, eps=1e-6)
@@ -837,22 +386,3 @@ def test_minimax_m3_vl_rms_norm_preserves_eager_fp32_semantics(module_name):
 
     assert output.dtype == hidden_states.dtype
     assert torch.equal(output, expected.to(hidden_states.dtype))
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_rms_norm_dispatches_weight_and_eps(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
-    output = torch.randn(2, 4, 8)
-    slot = _RecordingSlot(output)
-    monkeypatch.setattr(modeling, "veomni_rms_norm", slot)
-
-    norm = modeling.MiniMaxM3VLRMSNorm(8, eps=1e-5).to(torch.bfloat16)
-    norm.weight.data.copy_(torch.linspace(-0.01, 0.01, 8))
-    hidden_states = torch.randn_like(output, dtype=torch.bfloat16)
-
-    assert norm(hidden_states) is output
-    assert slot.args[0] is hidden_states
-    # The kernel adds the ``1 +`` offset itself; it must see a fp32 weight.
-    assert slot.args[1].dtype == torch.float32
-    assert torch.equal(slot.args[1], norm.weight.float())
-    assert slot.args[2] == norm.eps

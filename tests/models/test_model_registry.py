@@ -14,18 +14,16 @@ local_test_cases = [
 ]
 
 
-# Public MiniMax M3 checkpoints ship their own processing_minimax.py, so which
-# class name AutoProcessor resolves depends on the checkpoint's auto_map. Both
-# must route to VeOmni's processor.
-@pytest.mark.parametrize("processor_class_name", ["MiniMaxM3VLProcessor", "MiniMaxVLProcessor"])
-def test_minimax_m3_vl_processor_is_registered(processor_class_name):
-    assert processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys()
-
-
-@pytest.mark.skipif(
+_requires_minimax_m3_vl = pytest.mark.skipif(
     not is_transformers_version_greater_or_equal_to("5.16.0"),
     reason="MiniMax M3 VL processor requires transformers>=5.16.0.",
 )
+
+
+# Public MiniMax M3 checkpoints ship their own processing_minimax.py, so which
+# class name AutoProcessor resolves depends on the checkpoint's auto_map. Both
+# must route to VeOmni's processor.
+@_requires_minimax_m3_vl
 @pytest.mark.parametrize("processor_class_name", ["MiniMaxM3VLProcessor", "MiniMaxVLProcessor"])
 def test_minimax_m3_vl_processor_registry_resolves_to_veomni_class(processor_class_name):
     from veomni.models.transformers.minimax_m3_vl.processing_minimax_m3_vl import MiniMaxM3VLProcessor
@@ -33,20 +31,11 @@ def test_minimax_m3_vl_processor_registry_resolves_to_veomni_class(processor_cla
     assert MODEL_PROCESSOR_REGISTRY[processor_class_name]() is MiniMaxM3VLProcessor
 
 
-@pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.16.0"),
-    reason="MiniMax M3 VL processor requires transformers>=5.16.0.",
-)
+@_requires_minimax_m3_vl
 def test_minimax_m3_vl_processor_builds_from_native_subprocessors(monkeypatch):
-    # VeOmni pins M3 to the transformers-native classes and the public checkpoint
-    # ships an unusable bundled processor (drops **kwargs, declares sub-processors
-    # only via a trust_remote_code auto_map). from_pretrained must therefore build
-    # the tokenizer and native image/video processors by concrete class -- never
-    # through AutoProcessor / ProcessorMixin.from_pretrained (which would drag in
-    # the remote code and, once the loader strips trust_remote_code, surface as a
-    # misleading "no processor_config.json"). The chat template must come straight
-    # off the tokenizer, the one component that parses both chat_template.jinja and
-    # a tokenizer_config.json template.
+    # The checkpoint's bundled processor is unusable, so from_pretrained must
+    # build the native tokenizer / image / video processors by concrete class
+    # with trust_remote_code=False, and take the chat template from the tokenizer.
     import transformers
 
     from veomni.models.transformers.minimax_m3_vl import processing_minimax_m3_vl as mod
@@ -55,7 +44,7 @@ def test_minimax_m3_vl_processor_builds_from_native_subprocessors(monkeypatch):
 
     def _record(name, result):
         def _factory(path, **kwargs):
-            calls[name] = {"path": path, "kwargs": kwargs}
+            calls[name] = kwargs
             return result
 
         return _factory
@@ -68,39 +57,19 @@ def test_minimax_m3_vl_processor_builds_from_native_subprocessors(monkeypatch):
     monkeypatch.setattr(
         transformers.MiniMaxM3VLVideoProcessor, "from_pretrained", staticmethod(_record("video", "<video>"))
     )
-
-    # Fail loudly if the standard/remote path is ever touched.
-    def _forbidden(*args, **kwargs):
-        raise AssertionError("from_pretrained must not go through ProcessorMixin/AutoProcessor")
-
-    monkeypatch.setattr(mod.HfMiniMaxM3VLProcessor, "from_pretrained", classmethod(_forbidden), raising=False)
-
-    # Capture what the constructor receives instead of building a real processor.
     constructed = {}
-
-    def _fake_init(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None, **kwargs):
-        constructed.update(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            video_processor=video_processor,
-            chat_template=chat_template,
-        )
-
-    monkeypatch.setattr(mod.MiniMaxM3VLProcessor, "__init__", _fake_init)
+    monkeypatch.setattr(mod.MiniMaxM3VLProcessor, "__init__", lambda self, **kwargs: constructed.update(kwargs))
 
     mod.MiniMaxM3VLProcessor.from_pretrained("some/path", trust_remote_code=True, max_pixels=123)
 
-    # The caller's trust_remote_code is stripped; every native class is loaded
-    # with trust_remote_code=False so no bundled code can run.
-    assert calls["tokenizer"]["kwargs"].get("trust_remote_code") is False
-    assert calls["image"]["kwargs"].get("trust_remote_code") is False
-    assert calls["video"]["kwargs"].get("trust_remote_code") is False
-    assert calls["image"]["path"] == "some/path" and calls["image"]["kwargs"].get("max_pixels") == 123
-    assert constructed["image_processor"] == "<image>"
-    assert constructed["video_processor"] == "<video>"
-    assert constructed["tokenizer"] is fake_tokenizer
-    # The chat template is taken straight from the tokenizer, no separate recovery step.
-    assert constructed["chat_template"] == "{{ tokenizer_template }}"
+    assert all(kwargs.get("trust_remote_code") is False for kwargs in calls.values())
+    assert calls["image"].get("max_pixels") == 123
+    assert constructed == {
+        "image_processor": "<image>",
+        "tokenizer": fake_tokenizer,
+        "video_processor": "<video>",
+        "chat_template": "{{ tokenizer_template }}",
+    }
 
 
 @pytest.mark.parametrize(

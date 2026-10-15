@@ -44,7 +44,7 @@
     },
     "tie_word_embeddings": false,
     "use_cache": true,
-    "vocab_size": 256
+    "vocab_size": 200064
   },
   "tie_word_embeddings": false,
   "transformers_version": "5.12.0",
