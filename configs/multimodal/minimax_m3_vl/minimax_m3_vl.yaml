@@ -1,20 +1,18 @@
 model:
   model_path: MiniMaxAI/MiniMax-M3
   ops_implementation:
-    moe_implementation: eager
-    # This controls ViT attention. MiniMax language attention keeps its
-    # M3-specific reference implementation until a sparse kernel is integrated.
     attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+    cross_entropy_loss_implementation: eager
   optimizer:
     lr: 1.0e-5
     lr_decay_style: cosine
   accelerator:
-    ep_size: 1
-    ulysses_size: 1
-    cp_size: 1
-    init_device: meta
     gradient_checkpointing:
       enable_reentrant: false
+    init_device: meta
+    ulysses_size: 2
+    ep_size: 2
     fsdp_config:
       fsdp_mode: fsdp2
 
@@ -28,25 +26,21 @@ data:
     image_max_pixels: 602112
     video_max_pixels: 602112
     video_total_pixels: 2889523
-    max_frames: 16
+    max_frames: 4
     fps: 2.0
     use_audio_in_video: false
 
 train:
   wandb:
     enable: false
-    project: minimax_m3_vl
-    name: minimax_m3_vl
+    project: VeOmni
+    name: MiniMax-M3-vl-sft
   freeze_vit: false
-  num_train_epochs: 2
+  num_train_epochs: 1
   micro_batch_size: 1
-  global_batch_size: 32
+  global_batch_size: 4
   max_steps: 500
-  profile:
-    enable: true
-    start_step: 20
-    end_step: 21
-    record_shapes: true
   checkpoint:
-    output_dir: minimax_m3_vl_sft
+    output_dir: MiniMax-M3-vl-sft
     manager: dcp
+    save_hf_weights: false

@@ -9,7 +9,7 @@ GPU:
 ```bash
 uv run --no-default-groups --extra gpu --with transformers==5.16.0 \
   torchrun --nproc_per_node=8 tasks/train_vlm.py \
-  --config configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml
+  configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml
 ```
 
 NPU (use `npu_aarch64` instead on ARM hosts):
@@ -17,13 +17,15 @@ NPU (use `npu_aarch64` instead on ARM hosts):
 ```bash
 uv run --no-default-groups --extra npu --with transformers==5.16.0 \
   torchrun --nproc_per_node=8 tasks/train_vlm.py \
-  --config configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml
+  configs/multimodal/minimax_m3_vl/minimax_m3_vl_npu.yaml
 ```
 
-The `uv run` commands above are one-shot and do not activate a persistent environment. If you instead create and activate an accelerator environment with `transformers==5.16.0`, the device-independent helper runs the same training entry point:
+The `uv run` commands above are one-shot and do not activate a persistent environment. If you instead create and activate an accelerator environment with `transformers==5.16.0`, launch through the standard `train.sh`, which detects the device count:
 
 ```bash
-NUM_PROCESSES=8 scripts/multimodal/train_minimax_m3_vl.sh
+bash train.sh tasks/train_vlm.py configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml
+# NPU
+bash train.sh tasks/train_vlm.py configs/multimodal/minimax_m3_vl/minimax_m3_vl_npu.yaml
 ```
 
 The public checkpoint can be referenced through either Hugging Face or ModelScope:
@@ -33,7 +35,8 @@ The public checkpoint can be referenced through either Hugging Face or ModelScop
 
 ## Files
 
-- `configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml`
+- `configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml` (GPU)
+- `configs/multimodal/minimax_m3_vl/minimax_m3_vl_npu.yaml` (NPU)
 - `veomni/models/transformers/minimax_m3_vl/processing_minimax_m3_vl.py`
 - `veomni/models/transformers/minimax_m3_vl/minimax_m3_vl_gpu_patch_gen_config.py`
 - `veomni/models/transformers/minimax_m3_vl/minimax_m3_vl_npu_patch_gen_config.py`
@@ -41,7 +44,6 @@ The public checkpoint can be referenced through either Hugging Face or ModelScop
 - `veomni/models/transformers/minimax_m3_vl/generated/patched_modeling_minimax_m3_vl_npu.py`
 - `veomni/models/transformers/minimax_m3_vl/parallel_plan.py`
 - `veomni/models/transformers/minimax_m3_vl/checkpoint_tensor_converter.py`
-- `scripts/multimodal/train_minimax_m3_vl.sh`
 
 ## Data Path
 
