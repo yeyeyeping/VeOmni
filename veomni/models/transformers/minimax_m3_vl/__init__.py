@@ -24,23 +24,34 @@ _MINIMAX_M3_TRANSFORMERS_REQUIREMENT = (
 )
 
 
+# Registered so ``get_model_config`` swaps the checkpoint's ``auto_map`` remote
+# config class for the transformers-native one the generated modeling targets.
 @MODEL_CONFIG_REGISTRY.register("minimax_m3_vl")
 def register_minimax_m3_vl_config():
-    from .configuration_minimax_m3_vl import MiniMaxM3VLConfig
+    if not is_transformers_version_greater_or_equal_to("5.16.0"):
+        raise RuntimeError(_MINIMAX_M3_TRANSFORMERS_REQUIREMENT)
+
+    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLConfig
 
     return MiniMaxM3VLConfig
 
 
 @MODEL_CONFIG_REGISTRY.register("minimax_m3_vl_text")
 def register_minimax_m3_vl_text_config():
-    from .configuration_minimax_m3_vl import MiniMaxM3VLTextConfig
+    if not is_transformers_version_greater_or_equal_to("5.16.0"):
+        raise RuntimeError(_MINIMAX_M3_TRANSFORMERS_REQUIREMENT)
+
+    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLTextConfig
 
     return MiniMaxM3VLTextConfig
 
 
 @MODEL_CONFIG_REGISTRY.register("minimax_m3_vl_vision")
 def register_minimax_m3_vl_vision_config():
-    from .configuration_minimax_m3_vl import MiniMaxM3VLVisionConfig
+    if not is_transformers_version_greater_or_equal_to("5.16.0"):
+        raise RuntimeError(_MINIMAX_M3_TRANSFORMERS_REQUIREMENT)
+
+    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLVisionConfig
 
     return MiniMaxM3VLVisionConfig
 

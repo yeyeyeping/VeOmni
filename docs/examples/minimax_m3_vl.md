@@ -34,7 +34,6 @@ The public checkpoint can be referenced through either Hugging Face or ModelScop
 ## Files
 
 - `configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml`
-- `veomni/models/transformers/minimax_m3_vl/configuration_minimax_m3_vl.py`
 - `veomni/models/transformers/minimax_m3_vl/processing_minimax_m3_vl.py`
 - `veomni/models/transformers/minimax_m3_vl/minimax_m3_vl_gpu_patch_gen_config.py`
 - `veomni/models/transformers/minimax_m3_vl/minimax_m3_vl_npu_patch_gen_config.py`
