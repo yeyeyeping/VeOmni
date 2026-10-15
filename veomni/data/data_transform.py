@@ -70,13 +70,6 @@ def _prepare_vlm_media_inputs(
     return image_inputs, video_inputs, video_metadata
 
 
-def _build_vlm_placeholder_masks(
-    input_ids: torch.Tensor, image_token_id: int, video_token_id: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Precompute modality masks before model forward to avoid device-side token scans."""
-    return input_ids == image_token_id, input_ids == video_token_id
-
-
 def build_data_transform(transform_name: str, **kwargs) -> Callable:
     return partial(DATA_TRANSFORM_REGISTRY[transform_name], **kwargs)
 
@@ -364,9 +357,8 @@ def _process_sample_qwen_vl_base(
     attention_mask = tokenized_example["attention_mask"]
 
     # Masks and Token Types
-    image_mask, video_mask = _build_vlm_placeholder_masks(input_ids, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX)
-    tokenized_example["image_mask"] = image_mask
-    tokenized_example["video_mask"] = video_mask
+    tokenized_example["image_mask"] = input_ids == IMAGE_INPUT_INDEX
+    tokenized_example["video_mask"] = input_ids == VIDEO_INPUT_INDEX
 
     # Position IDs
     position_id_func_kwargs = {
@@ -460,9 +452,8 @@ def process_sample_minimax_m3_vl(
     }
 
     input_ids = tokenized_example["input_ids"]
-    image_mask, video_mask = _build_vlm_placeholder_masks(
-        input_ids, chat_template.image_token_id, chat_template.video_token_id
-    )
+    image_mask = input_ids == chat_template.image_token_id
+    video_mask = input_ids == chat_template.video_token_id
     tokenized_example["image_mask"] = image_mask
     tokenized_example["video_mask"] = video_mask
     tokenized_example["labels"][image_mask | video_mask] = IGNORE_INDEX

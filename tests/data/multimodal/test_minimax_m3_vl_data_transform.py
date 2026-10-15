@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from PIL import Image
+from transformers.video_utils import VideoMetadata
 
 from veomni.data.chat_template import MiniMaxM3VLChatTemplate
 from veomni.data.data_transform import process_sample_minimax_m3_vl
@@ -257,7 +258,7 @@ def test_minimax_chat_template_expands_media_without_processor_replacement_metho
         video_inputs={
             "video_grid_thw": torch.tensor([[2, 2, 2], [1, 4, 2]]),
         },
-        video_metadata=[{"fps": 2.0, "frames_indices": [0, 1, 2, 3]}, None],
+        video_metadata=[VideoMetadata(total_num_frames=4, fps=2.0, frames_indices=[0, 1, 2, 3]), None],
     )
 
     assert (encoded["input_ids"] == chat_template.image_token_id).sum().item() == 3
@@ -281,6 +282,35 @@ def test_minimax_chat_template_expands_video_without_metadata(video_metadata):
 
     assert (encoded["input_ids"] == chat_template.video_token_id).sum().item() == 2
     assert "seconds[>[" not in processor.tokenizer.last_encoded_text
+
+
+@pytest.mark.parametrize(
+    ("message", "media_kwargs", "modality"),
+    [
+        (["user", ("image", None)], {}, "image"),
+        (
+            ["user", ("image", None), ("image", None)],
+            {"image_inputs": {"image_grid_thw": torch.tensor([[1, 2, 2]])}},
+            "image",
+        ),
+        (["user", ("video", None)], {}, "video"),
+    ],
+    ids=["image-missing", "image-short", "video-missing"],
+)
+def test_minimax_chat_template_rejects_placeholders_without_processed_media(message, media_kwargs, modality):
+    processor = _ProcessorWithoutReplacementMethods()
+    chat_template = MiniMaxM3VLChatTemplate(processor)
+
+    with pytest.raises(ValueError, match=f"more {modality} placeholders"):
+        chat_template.encode_messages([message], processor=processor, **media_kwargs)
+
+
+def test_minimax_chat_template_rejects_conversation_starting_with_assistant():
+    processor = _ProcessorWithoutReplacementMethods()
+    chat_template = MiniMaxM3VLChatTemplate(processor)
+
+    with pytest.raises(ValueError, match="must not start with an assistant message"):
+        chat_template.encode_messages([["assistant", ("text", "Answer")]], processor=processor)
 
 
 class _RealMiniMaxVideoProcessorShim(_FakeNativeTemplateProcessor):
