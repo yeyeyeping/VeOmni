@@ -23,7 +23,7 @@ The public MiniMaxAI/MiniMax-M3 safetensors index uses an older layout:
     language_model.model.layers.{i}.self_attn.index_{q,k}_{proj,norm}.weight
     language_model.model.layers.{i}.block_sparse_moe.e_score_correction_bias
 
-The transformers>=5.12 modeling that VeOmni patchgen consumes expects:
+The transformers>=5.16 modeling that VeOmni patchgen consumes expects:
 
     model.language_model.layers.{i}.mlp.gate_up_proj.weight
     model.language_model.layers.{i}.mlp.experts.gate_up_proj
@@ -35,7 +35,7 @@ The transformers>=5.12 modeling that VeOmni patchgen consumes expects:
 This converter handles the language-tower rename/merge path and the vision
 projector split used by the public checkpoint. The public index stores the
 first vision projector MLP as `multi_modal_projector.linear_{1,2}` and the
-spatial merge MLP as `patch_merge_mlp.linear_{1,2}`; transformers>=5.12 folds
+spatial merge MLP as `patch_merge_mlp.linear_{1,2}`; transformers>=5.16 folds
 both into `model.multi_modal_projector`, naming the latter
 `merge_linear_{1,2}`.
 """

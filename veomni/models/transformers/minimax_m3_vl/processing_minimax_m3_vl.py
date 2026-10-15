@@ -33,8 +33,8 @@ logger = logging.get_logger(__name__)
 class MiniMaxM3VLProcessor(HfMiniMaxM3VLProcessor):
     """MiniMax M3 VL processor built purely from the transformers-native classes.
 
-    VeOmni pins MiniMax M3 to the transformers>=5.12 implementation -- that is
-    what the generated modeling and the HF parity test are written against -- and
+    VeOmni pins MiniMax M3 to the transformers>=5.16 implementation -- that is
+    what the generated modeling is written against -- and
     the checkpoint's bundled ``processing_minimax.py`` is unusable regardless: its
     ``MiniMaxVLProcessor.__init__`` drops ``**kwargs`` and so loses the
     ``chat_template.jinja`` that ``from_pretrained`` passes through, and its
