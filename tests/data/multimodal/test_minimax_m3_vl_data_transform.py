@@ -9,7 +9,7 @@ from PIL import Image
 from veomni.data.chat_template import MiniMaxM3VLChatTemplate
 from veomni.data.data_transform import process_sample_minimax_m3_vl
 from veomni.ops.kernels.cross_entropy import install_loss_mapping
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+from veomni.utils.import_utils import is_ffmpeg_available, is_transformers_version_greater_or_equal_to
 
 
 def _render_fake_minimax_chat_template(messages, *, add_generation_prompt):
@@ -395,6 +395,8 @@ def test_minimax_m3_vl_transform_uses_veomni_video_fetch_with_real_processor(mon
 @pytest.mark.parametrize("container_kind", ["path", "bytes"])
 def test_minimax_m3_vl_transform_uses_video_container_with_real_processor(monkeypatch, tmp_path, container_kind):
     """Exercise MiniMax with VeOmni's str/bytes video-container path."""
+    if not is_ffmpeg_available():
+        pytest.skip("torchcodec or ffmpeg is not available")
     pytest.importorskip("av")
     from veomni.data.multimodal.video_utils import save_video_tensors_to_file
 
