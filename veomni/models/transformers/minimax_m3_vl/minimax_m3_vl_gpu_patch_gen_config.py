@@ -210,7 +210,7 @@ def _grid_thw_to_list(grid_thw, grid_thw_list):
 def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     """Return the indexer's normed, rotated ``[B, S, G, D]`` queries and ``[B, S, 1, D]`` keys.
 
-    This is the projection half of ``MiniMaxM3VLIndexer.forward``. On the packed
+    This is the projection half of ``MiniMaxM3VLIndexer.forward``. On the
     training path, block selection runs in the MiniMax sparse attention
     operator after the Ulysses exchange instead.
     """
@@ -227,22 +227,85 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     )
 
 
+@config.add_helper
+def _minimax_m3_packed_to_rows(hidden_states, position_ids, cu_seqlens, max_seqlen, parallel_state):
+    """Lay a packed ``[1, T_local, D]`` stream out as right-padded ``[B, S_local, D]`` rows, one sample per row.
+
+    This is the only packed-to-BSND conversion of the language model: every
+    decoder layer then runs on the rows. Under Ulysses the local shard is
+    gathered first and each row is sliced along the sequence afterwards, so
+    the attention all-to-all reassembles whole rows. ``S`` is ``max_seqlen``
+    rounded up to the Ulysses size. Returns the rows, their position IDs and
+    the ``[T]`` packed-to-row index map consumed by ``_minimax_m3_rows_to_packed``.
+    """
+    if not isinstance(max_seqlen, int):
+        raise TypeError(
+            "MiniMax M3 max_length_q must be a Python int to avoid a device-to-host sync, "
+            f"got {type(max_seqlen).__name__}."
+        )
+    ulysses_group = parallel_state.ulysses_group if parallel_state.ulysses_enabled else None
+    if ulysses_group is not None:
+        hidden_states = gather_outputs(hidden_states, gather_dim=1, group=ulysses_group)
+        if position_ids is not None:
+            position_ids = gather_outputs(position_ids, gather_dim=1, group=ulysses_group)
+
+    row_multiple = parallel_state.ulysses_size if ulysses_group is not None else 1
+    row_length = -(-max_seqlen // row_multiple) * row_multiple
+    total_length = hidden_states.shape[1]
+    device = hidden_states.device
+    # NPU keeps varlen metadata on the host; this is a copy to the device, never
+    # a host read of device data.
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long, non_blocking=True)
+    num_rows = cu_seqlens.numel() - 1
+    row_of_token = torch.repeat_interleave(
+        torch.arange(num_rows, device=device), cu_seqlens.diff(), output_size=total_length
+    )
+    position_in_row = torch.arange(total_length, device=device) - cu_seqlens[row_of_token]
+    indices = row_of_token * row_length + position_in_row
+
+    rows = hidden_states.new_zeros(num_rows * row_length, hidden_states.shape[-1])
+    rows = rows.index_copy(0, indices, hidden_states[0]).view(num_rows, row_length, -1)
+    if position_ids is None:
+        row_position_ids = torch.arange(row_length, device=device).expand(num_rows, -1)
+    else:
+        row_position_ids = position_ids.new_zeros(num_rows * row_length).index_copy(0, indices, position_ids[0])
+        row_position_ids = row_position_ids.view(num_rows, row_length)
+    if ulysses_group is not None:
+        rows = slice_input_tensor(rows, dim=1, group=ulysses_group)
+        row_position_ids = slice_input_tensor(row_position_ids, dim=1, group=ulysses_group)
+    return rows, row_position_ids, indices
+
+
+@config.add_helper
+def _minimax_m3_rows_to_packed(rows, indices, parallel_state):
+    """Invert ``_minimax_m3_packed_to_rows``: return this rank's packed ``[1, T_local, D]`` shard."""
+    ulysses_group = parallel_state.ulysses_group if parallel_state.ulysses_enabled else None
+    if ulysses_group is not None:
+        rows = gather_outputs(rows, gather_dim=1, group=ulysses_group)
+    packed = rows.reshape(-1, rows.shape[-1]).index_select(0, indices).unsqueeze(0)
+    if ulysses_group is not None:
+        packed = slice_input_tensor(packed, dim=1, group=ulysses_group)
+    return packed
+
+
 # ================================================================
 # Patch: MiniMaxM3VLAttention.forward
-# 1. keep decoder inputs/outputs packed and apply the precomputed RoPE before
-#    any sequence-parallel communication
+# 1. keep decoder inputs/outputs in the right-padded [B, S_local, D] rows laid
+#    out once by the text model, and apply the precomputed RoPE in BSND before any sequence-parallel
+#    communication, so Q/K/V are never transposed to BNSD
 # 2. under Ulysses, exchange main Q/K/V and the per-KV-group index Q with the
 #    same head/sequence all-to-all, and all-gather the single-head index K
-# 3. run block selection and attention through the TND MiniMax sparse
+# 3. run block selection and attention through the BSND MiniMax sparse
 #    attention operators (``minimax_sparse_attention`` OpSlots, eager by
-#    default); any padded layout they need stays inside them
+#    default); right padding plus causality isolates samples, so no varlen
+#    metadata or layout conversion is involved
 # 4. keep language attention independent from the generic ViT-controlled
 #    ``attn_implementation`` configuration; attention masks and KV cache are
 #    rejected upstream in the text model, so this is the only path
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLAttention.forward",
-    description="Run packed MiniMax language attention through the TND sparse attention operators",
+    description="Run MiniMax language attention on right-padded rows through the BSND sparse attention operators",
 )
 def minimax_m3_vl_attention_forward_patched(
     self,
@@ -255,19 +318,16 @@ def minimax_m3_vl_attention_forward_patched(
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
+    value_states = self.v_proj(hidden_states).view(hidden_shape)
 
     # --- Patch.1 ---
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=2)
     # --- Patch.1 ---
 
     # --- Patch.2 ---
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
     index_query = index_key = None
     if self.indexer is not None:
         index_query, index_key = _minimax_m3_indexer_project(self.indexer, hidden_states, position_embeddings)
@@ -291,34 +351,26 @@ def minimax_m3_vl_attention_forward_patched(
     # --- Patch.2 ---
 
     # --- Patch.3 ---
-    # The text model guarantees packed varlen metadata; training packs samples
-    # with identical query/key boundaries.
-    cu_seqlens = kwargs["cu_seq_lens_q"]
-    max_seqlen = kwargs["max_length_q"]
     msa_indexer = veomni_msa_indexer if veomni_msa_indexer.use_non_eager_impl else minimax_sparse_indexer_eager
     msa_attention = veomni_msa_attention if veomni_msa_attention.use_non_eager_impl else minimax_sparse_attention_eager
     block_indices = None
     if self.indexer is not None:
         block_indices = msa_indexer(
-            index_query[0],
-            index_key[0],
-            cu_seqlens,
-            max_seqlen,
+            index_query,
+            index_key,
             block_size=self.indexer.block_size,
             topk_blocks=self.indexer.topk_blocks,
             local_blocks=self.indexer.local_blocks,
         )
     attn_output = msa_attention(
-        query_states[0],
-        key_states[0],
-        value_states[0],
+        query_states,
+        key_states,
+        value_states,
         block_indices,
-        cu_seqlens,
-        max_seqlen,
         block_size=self.indexer.block_size if self.indexer is not None else None,
         scale=self.scaling,
         dropout_p=0.0 if not self.training else self.attention_dropout,
-    ).unsqueeze(0)
+    )
 
     if parallel_state.ulysses_enabled:
         attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)
@@ -697,16 +749,19 @@ def minimax_m3_vl_model_forward_patched(
 # Patch: MiniMaxM3VLTextModel.forward
 # 1. reject router-logit capture because MiniMax's routing semantics are not
 #    compatible with the upstream Switch-style auxiliary loss
-# 2. accept only packed inputs so language attention has a single path: the
-#    collator's varlen kwargs flow unchanged to the attention layers, and a
-#    lone unpadded sequence without them is described as a one-segment pack;
-#    padded batches, KV cache and context parallelism are rejected
-# 3. generate RoPE once from the local packed position IDs; attention and the
-#    indexer apply it before their respective Ulysses communications
+# 2. accept only packed inputs, as produced by VeOmni's collator, or a lone
+#    unpadded sequence, which already is a single right-padded row; padded
+#    batches, KV cache and context parallelism are rejected
+# 3. lay the packed stream out once as right-padded [B, S_local, D] rows (one
+#    sample per row) so every decoder layer runs in BSND without per-layer
+#    layout conversion, and generate RoPE from the row position IDs; attention
+#    and the indexer apply it before their respective Ulysses communications
+# 4. restore the packed local shard after the last layer, so the model's
+#    input/output contract and everything downstream stay packed
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLTextModel.forward",
-    description="Accept only packed inputs and reject padded batches, KV cache and CP",
+    description="Convert packed inputs to right-padded BSND rows once for all decoder layers; reject padded batches, KV cache and CP",
 )
 def minimax_m3_vl_text_model_forward_patched(
     self,
@@ -739,33 +794,33 @@ def minimax_m3_vl_text_model_forward_patched(
     parallel_state = get_parallel_state()
     if parallel_state.cp_enabled:
         raise ValueError("MiniMax M3 VL language attention supports Ulysses only; set cp_size=1.")
-    if kwargs.get("cu_seq_lens_q") is None:
-        if parallel_state.sp_enabled or inputs_embeds.shape[0] != 1:
-            raise ValueError(
-                "MiniMax M3 VL language attention requires packed inputs with cu_seq_lens_q/max_length_q, as "
-                "produced by VeOmni's collator. Without them only a single unpadded sequence (batch size 1, no "
-                "sequence parallelism) is accepted; padded batches are not supported."
-            )
-        # A lone sequence is a one-segment pack. The attention mask is assumed
-        # all-ones as in VeOmni's collator: reading it would cost a device sync.
-        # Metadata is built on the host from shapes; the operators copy it to
-        # the device without blocking, as for NPU's host-side metadata.
-        sequence_length = inputs_embeds.shape[1]
-        cu_seq_lens = torch.tensor([0, sequence_length], dtype=torch.int32)
-        kwargs.update(
-            cu_seq_lens_q=cu_seq_lens,
-            cu_seq_lens_k=cu_seq_lens,
-            max_length_q=sequence_length,
-            max_length_k=sequence_length,
+    # Layers read none of the varlen kwargs: the row layout below replaces them.
+    cu_seqlens = kwargs.pop("cu_seq_lens_q", None)
+    max_seqlen = kwargs.pop("max_length_q", None)
+    kwargs.pop("cu_seq_lens_k", None)
+    kwargs.pop("max_length_k", None)
+    if inputs_embeds.shape[0] != 1 or (cu_seqlens is None and parallel_state.sp_enabled):
+        raise ValueError(
+            "MiniMax M3 VL language attention requires packed inputs with cu_seq_lens_q/max_length_q, as "
+            "produced by VeOmni's collator. Without them only a single unpadded sequence (batch size 1, no "
+            "sequence parallelism) is accepted; padded batches are not supported."
         )
+    if position_ids is not None and position_ids.dim() != 2:
+        raise ValueError(f"MiniMax M3 VL language model expects [1, T] position IDs, got {tuple(position_ids.shape)}.")
     # --- Patch.2 ---
 
-    hidden_states = inputs_embeds
-
-    if position_ids is None:
-        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
-
     # --- Patch.3 ---
+    # The attention mask is not read: it is all-ones in VeOmni's collator, and
+    # reading it would cost a device sync. A lone sequence is one row already.
+    hidden_states = inputs_embeds
+    row_indices = None
+    if cu_seqlens is not None:
+        hidden_states, position_ids, row_indices = _minimax_m3_packed_to_rows(
+            hidden_states, position_ids, cu_seqlens, max_seqlen, parallel_state
+        )
+    elif position_ids is None:
+        position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+
     position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
     # --- Patch.3 ---
 
@@ -779,6 +834,11 @@ def minimax_m3_vl_text_model_forward_patched(
             position_embeddings=position_embeddings,
             **kwargs,
         )
+
+    # --- Patch.4 ---
+    if row_indices is not None:
+        hidden_states = _minimax_m3_rows_to_packed(hidden_states, row_indices, parallel_state)
+    # --- Patch.4 ---
 
     hidden_states = self.norm(hidden_states)
 

@@ -12,71 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MiniMax M3 eager indexer with NPU fused attention and a CPU reference.
+"""MiniMax M3 eager indexer with NPU fused attention and a CPU reference, on BSND tensors.
 
 The math is the Transformers ``MiniMaxM3VLIndexer`` / ``build_block_mask`` /
-``eager_attention_forward`` reference, run on a temporary right-padded
-``[B, Smax, ...]`` view of the packed input. The unpack/pack round trip exists
-only because the reference math is batched; it never leaves this module.
-NPU attention consumes the full boolean mask through ``npu_fusion_attention``;
-GPU attention is intentionally unsupported in this private training fork.
+``eager_attention_forward`` reference. Inputs arrive as right-padded
+``[B, S, N, D]`` rows, one sample per row, so no layout conversion happens
+here: right padding sits after every real token, and causality alone keeps
+real queries away from padded keys. Padded query rows always see at least
+their own position (causal diagonal, local block), so they stay finite; their
+outputs are discarded by the loss.
+
+NPU attention runs ``npu_fusion_attention`` in ``BSND`` layout: dense causal
+layers use its built-in causal mode, block-sparse layers pass one boolean mask
+per KV group. GPU attention is intentionally unsupported in this private
+training fork.
 """
 
 import torch
 import torch.nn.functional as F
 
 
-def _packed_to_padded_indices(
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    total_length: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the ``[T]`` packed-to-flat-padded index map and the ``[B, Smax]`` padding mask (True=pad)."""
-    if not isinstance(max_seqlen, int):
-        raise TypeError(
-            "MiniMax sparse attention max_seqlen must be a Python int to avoid a device-to-host sync, "
-            f"got {type(max_seqlen).__name__}."
-        )
-
-    num_sequences = cu_seqlens.numel() - 1
-    # NPU keeps FlashAttention metadata on CPU, whereas the scatter indices must
-    # live next to the tensors they index. This is a device copy, never a host
-    # scalar read.
-    device_cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long, non_blocking=True)
-    sequence_lengths = device_cu_seqlens.diff()
-
-    token_indices = torch.arange(total_length, device=device)
-    sequence_indices = torch.repeat_interleave(
-        torch.arange(num_sequences, device=device),
-        sequence_lengths,
-        output_size=total_length,
-    )
-    sequence_positions = token_indices - device_cu_seqlens[sequence_indices]
-    indices = sequence_indices * max_seqlen + sequence_positions
-
-    padding = torch.arange(max_seqlen, device=device).unsqueeze(0) >= sequence_lengths.unsqueeze(1)
-    return indices, padding
+# torch_npu's compressed causal mode (sparse_mode=3) takes this fixed 2048x2048
+# upper-triangular mask regardless of sequence length; cache one per device.
+_NPU_CAUSAL_MASK_SIZE = 2048
+_NPU_CAUSAL_SPARSE_MODE = 3
+_NPU_FULL_MASK_SPARSE_MODE = 1
+_npu_causal_masks: dict[torch.device, torch.Tensor] = {}
 
 
-def _unpack(packed: torch.Tensor, indices: torch.Tensor, padding: torch.Tensor, fill: float = 0) -> torch.Tensor:
-    """Scatter ``[T, ...]`` packed data into right-padded ``[B, Smax, ...]`` data."""
-    batch_size, max_seqlen = padding.shape
-    trailing_shape = packed.shape[1:]
-    padded = packed.new_full((batch_size * max_seqlen, *trailing_shape), fill)
-    padded.index_copy_(0, indices, packed)
-    return padded.view(batch_size, max_seqlen, *trailing_shape)
-
-
-def _pack(padded: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """Gather ``[B, Smax, ...]`` data back into its ``[T, ...]`` packed order."""
-    return padded.reshape(-1, *padded.shape[2:]).index_select(0, indices)
+def _npu_causal_mask(device: torch.device) -> torch.Tensor:
+    mask = _npu_causal_masks.get(device)
+    if mask is None:
+        mask = torch.ones(_NPU_CAUSAL_MASK_SIZE, _NPU_CAUSAL_MASK_SIZE, dtype=torch.bool, device=device).triu(1)
+        _npu_causal_masks[device] = mask
+    return mask
 
 
 def _select_blocks(
     index_q: torch.Tensor,
     index_k: torch.Tensor,
-    padding: torch.Tensor,
     *,
     block_size: int,
     topk_blocks: int,
@@ -89,8 +63,7 @@ def _select_blocks(
     pad = num_key_blocks * block_size - seq_len
 
     scores = torch.matmul(index_q.float(), index_k.float().transpose(-1, -2))
-    scores = scores.masked_fill(padding[:, None, None, :], float("-inf"))
-    token_future = positions[None, None, None, :] > positions[None, None, :, None]
+    token_future = positions[None, :] > positions[:, None]
     scores = scores.masked_fill(token_future, float("-inf"))
     if pad:
         scores = F.pad(scores, (0, pad), value=float("-inf"))
@@ -104,18 +77,11 @@ def _select_blocks(
 
     topk = min(topk_blocks, num_key_blocks)
     topk_scores, topk_indices = block_scores.topk(topk, dim=-1)
-    block_indices = topk_indices.masked_fill(topk_scores == float("-inf"), -1)
-    return block_indices.masked_fill(padding[:, None, :, None], -1)
+    return topk_indices.masked_fill(topk_scores == float("-inf"), -1)
 
 
-def _block_causal_keep(
-    block_indices: torch.Tensor,
-    padding: torch.Tensor,
-    *,
-    num_query_heads: int,
-    block_size: int,
-) -> torch.Tensor:
-    """Expand ``[B, G, S, K]`` block indices into a ``[B, Hq, S, S]`` keep mask with padding and causality."""
+def _block_causal_drop(block_indices: torch.Tensor, *, block_size: int) -> torch.Tensor:
+    """Expand ``[B, G, S, K]`` block indices into a ``[B, G, S, S]`` mask, True where attention is dropped."""
     batch, num_groups, seq_len, _ = block_indices.shape
     num_key_blocks = -(-seq_len // block_size)
 
@@ -126,49 +92,80 @@ def _block_causal_keep(
     )
     selected.scatter_(-1, safe, True)
     block_keep = selected[..., :num_key_blocks].repeat_interleave(block_size, dim=-1)[..., :seq_len]
-    block_keep = block_keep.repeat_interleave(num_query_heads // num_groups, dim=1)
 
     positions = torch.arange(seq_len, device=block_indices.device)
-    causal_keep = positions[None, :] <= positions[:, None]
-    keep = block_keep & ~padding[:, None, None, :] & causal_keep[None, None]
-    # Padded query rows select no block. Left fully masked, the dtype-min mask
-    # overflows to -inf when the float32 softmax runs on float64 inputs, and the
-    # resulting NaN rows leak into K/V gradients through a zero upstream grad.
-    # Let them attend everywhere instead: `_pack` drops their outputs.
-    return keep | padding[:, None, :, None]
+    token_future = positions[None, :] > positions[:, None]
+    return ~block_keep | token_future
 
 
-def _dense_attention(
+def _npu_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    keep: torch.Tensor,
+    drop: torch.Tensor | None,
     *,
     scale: float,
     dropout_p: float,
 ) -> torch.Tensor:
-    """NPU fused attention or CPU reference on BNSD inputs; returns ``[B, S, Hq, D]``."""
-    if query.device.type == "npu":
-        import torch_npu
+    """``npu_fusion_attention`` on BSND; ``drop`` is ``None`` (causal) or a ``[B, G, S, S]`` block mask."""
+    import torch_npu
 
-        output = torch_npu.npu_fusion_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            head_num=query.shape[1],
-            input_layout="BNSD",
-            atten_mask=(~keep).contiguous(),
-            sparse_mode=1,
+    def fused(q, k, v, atten_mask, sparse_mode):
+        return torch_npu.npu_fusion_attention(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            head_num=q.shape[2],
+            input_layout="BSND",
+            atten_mask=atten_mask,
+            sparse_mode=sparse_mode,
             scale=scale,
             keep_prob=1.0 - dropout_p,
         )[0]
-        return output.transpose(1, 2).contiguous()
 
-    num_groups = query.shape[1] // key.shape[1]
-    key = key.repeat_interleave(num_groups, dim=1)
-    value = value.repeat_interleave(num_groups, dim=1)
-    attention_mask = torch.zeros(keep.shape, dtype=query.dtype, device=query.device).masked_fill(
-        ~keep, torch.finfo(query.dtype).min
+    if drop is None:
+        return fused(query, key, value, _npu_causal_mask(query.device), _NPU_CAUSAL_SPARSE_MODE)
+
+    # The fused kernel accepts a [B, 1, S, S] mask shared by all heads, not one
+    # per KV group. Running each group separately avoids repeating the S x S
+    # mask to every query head; under Ulysses a rank usually owns one group.
+    num_groups = key.shape[2]
+    group_size = query.shape[2] // num_groups
+    outputs = [
+        fused(
+            query[:, :, group * group_size : (group + 1) * group_size],
+            key[:, :, group : group + 1],
+            value[:, :, group : group + 1],
+            drop[:, group : group + 1].contiguous(),
+            _NPU_FULL_MASK_SPARSE_MODE,
+        )
+        for group in range(num_groups)
+    ]
+    return outputs[0] if num_groups == 1 else torch.cat(outputs, dim=2)
+
+
+def _reference_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    drop: torch.Tensor | None,
+    *,
+    scale: float,
+    dropout_p: float,
+) -> torch.Tensor:
+    """Upstream eager attention with local GQA on BSND; ``drop`` as in ``_npu_attention``."""
+    seq_len = query.shape[1]
+    group_size = query.shape[2] // key.shape[2]
+    query, key, value = (tensor.transpose(1, 2) for tensor in (query, key, value))
+    key = key.repeat_interleave(group_size, dim=1)
+    value = value.repeat_interleave(group_size, dim=1)
+    if drop is None:
+        positions = torch.arange(seq_len, device=query.device)
+        drop = (positions[None, :] > positions[:, None])[None, None]
+    else:
+        drop = drop.repeat_interleave(group_size, dim=1)
+    attention_mask = torch.zeros(drop.shape, dtype=query.dtype, device=query.device).masked_fill(
+        drop, torch.finfo(query.dtype).min
     )
 
     attention_weights = torch.matmul(query, key.transpose(2, 3)) * scale
@@ -176,38 +173,33 @@ def _dense_attention(
     attention_weights = F.softmax(attention_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     if dropout_p > 0:
         attention_weights = F.dropout(attention_weights, p=dropout_p, training=True)
-    return torch.matmul(attention_weights, value).transpose(1, 2).contiguous()
+    return torch.matmul(attention_weights, value).transpose(1, 2)
 
 
 def minimax_sparse_indexer_eager(
     index_q: torch.Tensor,
     index_k: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
     *,
     block_size: int,
     topk_blocks: int,
     local_blocks: int,
 ) -> torch.Tensor:
-    """Select ``[T, G, topk_blocks]`` int32 key blocks per query and KV group; see the package docstring."""
-    if index_k.shape[1] != 1:
-        raise ValueError(f"MiniMax sparse indexer expects a single index key head, got {index_k.shape[1]}.")
+    """Select ``[B, S, G, topk_blocks]`` int32 key blocks per query and KV group; see the package docstring."""
+    if index_k.shape[2] != 1:
+        raise ValueError(f"MiniMax sparse indexer expects a single index key head, got {index_k.shape[2]}.")
 
-    indices, padding = _packed_to_padded_indices(cu_seqlens, max_seqlen, index_q.shape[0], index_q.device)
-    padded_q = _unpack(index_q, indices, padding).transpose(1, 2)
-    padded_k = _unpack(index_k, indices, padding).transpose(1, 2)
     block_indices = _select_blocks(
-        padded_q,
-        padded_k,
-        padding,
+        index_q.transpose(1, 2),
+        index_k.transpose(1, 2),
         block_size=block_size,
         topk_blocks=topk_blocks,
         local_blocks=local_blocks,
     )
-    block_indices = _pack(block_indices.transpose(1, 2), indices)
     # Short sequences have fewer key blocks than slots; the extra slots are empty.
-    block_indices = F.pad(block_indices, (0, topk_blocks - block_indices.shape[-1]), value=-1)
-    return block_indices.to(torch.int32)
+    if block_indices.shape[-1] < topk_blocks:
+        block_indices = F.pad(block_indices, (0, topk_blocks - block_indices.shape[-1]), value=-1)
+    # The attention operator consumes [B, G, S, K]; hand over a view, not a copy.
+    return block_indices.to(torch.int32).transpose(1, 2)
 
 
 def minimax_sparse_attention_eager(
@@ -215,40 +207,26 @@ def minimax_sparse_attention_eager(
     k: torch.Tensor,
     v: torch.Tensor,
     block_indices: torch.Tensor | None,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
     *,
     block_size: int | None,
     scale: float,
     dropout_p: float = 0.0,
 ) -> torch.Tensor:
-    """Causal (block-sparse when ``block_indices`` is given) attention on TND tensors; see the package docstring."""
+    """Causal (block-sparse when ``block_indices`` is given) attention on BSND tensors; see the package docstring."""
     if q.device.type not in ("npu", "cpu"):
         raise NotImplementedError("MiniMax attention training supports NPU only; CPU is kept as a test reference.")
 
-    num_query_heads, num_groups = q.shape[1], k.shape[1]
+    num_query_heads, num_groups = q.shape[2], k.shape[2]
     if num_query_heads % num_groups != 0:
         raise ValueError(f"Query heads ({num_query_heads}) must be divisible by KV heads ({num_groups}).")
-    if block_indices is not None and block_indices.shape[1] != num_groups:
+    if block_indices is not None and block_indices.shape[2] != num_groups:
         raise ValueError(
-            f"MiniMax block_indices must have one selection per KV head ({num_groups}), got {block_indices.shape[1]}."
+            f"MiniMax block_indices must have one selection per KV head ({num_groups}), got {block_indices.shape[2]}."
         )
 
-    indices, padding = _packed_to_padded_indices(cu_seqlens, max_seqlen, q.shape[0], q.device)
-    padded_q, padded_k, padded_v = (_unpack(tensor, indices, padding).transpose(1, 2) for tensor in (q, k, v))
+    drop = None
+    if block_indices is not None:
+        drop = _block_causal_drop(block_indices.transpose(1, 2), block_size=block_size)
 
-    if block_indices is None:
-        positions = torch.arange(max_seqlen, device=q.device)
-        causal_keep = positions[None, :] <= positions[:, None]
-        keep = causal_keep[None, None] & ~padding[:, None, None, :]
-    else:
-        padded_block_indices = _unpack(block_indices, indices, padding, fill=-1).transpose(1, 2)
-        keep = _block_causal_keep(
-            padded_block_indices,
-            padding,
-            num_query_heads=num_query_heads,
-            block_size=block_size,
-        )
-
-    output = _dense_attention(padded_q, padded_k, padded_v, keep, scale=scale, dropout_p=dropout_p)
-    return _pack(output, indices)
+    attention = _npu_attention if q.device.type == "npu" else _reference_attention
+    return attention(q, k, v, drop, scale=scale, dropout_p=dropout_p)

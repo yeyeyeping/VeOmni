@@ -153,7 +153,7 @@ def test_minimax_m3_vl_rejects_incompatible_router_aux_loss(module_name):
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_text_model_keeps_decoder_and_attention_packed(module_name, monkeypatch):
+def test_minimax_m3_vl_text_model_runs_decoder_on_padded_rows_and_returns_packed(module_name, monkeypatch):
     modeling = importlib.import_module(module_name)
     config = modeling.MiniMaxM3VLTextConfig(
         vocab_size=32,
@@ -241,17 +241,19 @@ def test_minimax_m3_vl_text_model_keeps_decoder_and_attention_packed(module_name
         )
         hook.remove()
 
-    assert decoder_inputs[0]["shape"] == (1, 5, config.hidden_size)
-    assert decoder_inputs[0]["position_ids"].tolist() == [[0, 1, 0, 1, 2]]
+    # The packed input is laid out once as right-padded rows, one sample per
+    # row; decoder layers and attention see only the BSND rows.
+    assert decoder_inputs[0]["shape"] == (2, 3, config.hidden_size)
+    assert decoder_inputs[0]["position_ids"].tolist() == [[0, 1, 0], [0, 1, 2]]
     assert decoder_inputs[0]["attention_mask"] is None
-    # Attention consumes the packed TND stream; no padded layout reaches the model.
     assert attention_query_shapes == [
         (
-            (5, config.num_attention_heads, config.head_dim),
-            (5, config.num_key_value_heads, config.index_topk_blocks),
+            (2, 3, config.num_attention_heads, config.head_dim),
+            (2, 3, config.num_key_value_heads, config.index_topk_blocks),
         )
     ]
-    assert {"cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"} <= decoder_inputs[0]["extra_kwargs"]
+    assert not {"cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"} & decoder_inputs[0]["extra_kwargs"]
+    # The model output is packed again, so nothing downstream changes.
     assert output.last_hidden_state.shape == (1, 5, config.hidden_size)
     torch.testing.assert_close(output.last_hidden_state, expected)
 
@@ -316,7 +318,7 @@ def _single_layer_sparse_text_model(modeling):
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_text_model_describes_unpacked_single_sequence_as_one_segment(module_name):
-    """Without varlen kwargs a lone unpadded sequence runs as a one-segment pack and matches upstream."""
+    """A lone unpadded sequence already is one row; a one-segment pack must give the identical result."""
     modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
     decoder_kwargs = []
@@ -344,8 +346,7 @@ def test_minimax_m3_vl_text_model_describes_unpacked_single_sequence_as_one_segm
         )
     hook.remove()
 
-    assert decoder_kwargs[0]["cu_seq_lens_q"].tolist() == [0, 7]
-    assert decoder_kwargs[0]["max_length_q"] == 7
+    assert "cu_seq_lens_q" not in decoder_kwargs[0] and "cu_seq_lens_q" not in decoder_kwargs[1]
     assert decoder_kwargs[0]["attention_mask"] is None
     assert output.past_key_values is None
     torch.testing.assert_close(output.last_hidden_state, packed.last_hidden_state, rtol=0, atol=0)
@@ -440,7 +441,7 @@ def test_minimax_m3_vl_full_attention_packed_matches_separate_samples(module_nam
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_language_sp_splits_index_heads_like_kv_and_restores_packed_output(module_name, monkeypatch):
+def test_minimax_m3_vl_language_sp_converts_layout_once_and_restores_packed_output(module_name, monkeypatch):
     modeling = importlib.import_module(module_name)
     config = modeling.MiniMaxM3VLTextConfig(
         vocab_size=32,
@@ -473,13 +474,17 @@ def test_minimax_m3_vl_language_sp_splits_index_heads_like_kv_and_restores_packe
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: parallel_state)
     calls = []
 
+    # Rank 0 of a simulated 2-way group whose peer holds an identical shard:
+    # gathers duplicate along the sequence, slices keep the leading half.
     def fake_gather(tensor, gather_dim, group):
-        calls.append(("index_key_gather", tuple(tensor.shape), gather_dim, group))
+        calls.append(("gather", tuple(tensor.shape), gather_dim, group))
         return torch.cat((tensor, tensor), dim=gather_dim)
 
+    def fake_slice(tensor, dim, group):
+        calls.append(("slice", tuple(tensor.shape), dim, group))
+        return tensor.narrow(dim, 0, tensor.shape[dim] // 2)
+
     def fake_kv_head_exchange(tensor, *, group, ulysses_size):
-        # Rank 0 of a simulated 2-way exchange: gather the sequence, repeat
-        # heads up to ulysses_size, then keep this rank's leading head slice.
         tensor = torch.cat((tensor, tensor), dim=1)
         if tensor.shape[2] < ulysses_size:
             tensor = torch.repeat_interleave(tensor, ulysses_size // tensor.shape[2], dim=2)
@@ -501,9 +506,10 @@ def test_minimax_m3_vl_language_sp_splits_index_heads_like_kv_and_restores_packe
 
     def fake_restore(output, *, group):
         calls.append(("main_restore", tuple(output.shape), group))
-        return torch.cat((output, output), dim=2)[:, :2]
+        return torch.cat((output, output), dim=2)[:, : output.shape[1] // 2]
 
     monkeypatch.setattr(modeling, "gather_outputs", fake_gather)
+    monkeypatch.setattr(modeling, "slice_input_tensor", fake_slice)
     monkeypatch.setattr(modeling, "gather_seq_scatter_kv_heads", fake_index_query_exchange)
     monkeypatch.setattr(modeling, "prepare_ulysses_qkv", fake_prepare)
     monkeypatch.setattr(modeling, "restore_ulysses_output", fake_restore)
@@ -513,6 +519,7 @@ def test_minimax_m3_vl_language_sp_splits_index_heads_like_kv_and_restores_packe
         lambda _, args, output: decoder_shapes.append((args[0].shape, output.shape))
     )
     with torch.no_grad():
+        # Local shard of a 4-token pack holding two 2-token samples.
         output = model(
             inputs_embeds=torch.randn(1, 2, config.hidden_size),
             attention_mask=torch.ones(1, 4, dtype=torch.long),
@@ -525,15 +532,26 @@ def test_minimax_m3_vl_language_sp_splits_index_heads_like_kv_and_restores_packe
         )
     hook.remove()
 
-    assert decoder_shapes == [((1, 2, config.hidden_size), (1, 2, config.hidden_size))]
-    assert output.last_hidden_state.shape == (1, 2, config.hidden_size)
-    assert [call[0] for call in calls] == ["main_prepare", "index_query_exchange", "index_key_gather", "main_restore"]
-    # Every exchange receives the local packed shard; attention output is the full sequence.
-    assert calls[0][1][1] == 2
-    assert calls[1][1] == (1, 2, config.index_n_heads, config.index_head_dim)
-    assert calls[2][1] == (1, 2, 1, config.index_head_dim)
-    assert calls[3][1][1] == 4
-    assert calls[0][2] is group and calls[1][2] is group and calls[2][3] is group and calls[3][2] is group
+    hidden, head_dim, index_dim = config.hidden_size, config.head_dim, config.index_head_dim
+    # Each row of 2 positions is split across the 2 ranks: the layer sees [2 rows, 1 position].
+    assert decoder_shapes == [((2, 1, hidden), (2, 1, hidden))]
+    assert output.last_hidden_state.shape == (1, 2, hidden)
+    assert [call[:2] for call in calls] == [
+        # Entry: the only packed -> rows conversion of the forward.
+        ("gather", (1, 2, hidden)),
+        ("gather", (1, 2)),
+        ("slice", (2, 2, hidden)),
+        ("slice", (2, 2)),
+        # Attention on local row shards.
+        ("main_prepare", (2, 1, config.num_attention_heads, head_dim)),
+        ("index_query_exchange", (2, 1, config.index_n_heads, index_dim)),
+        ("gather", (2, 1, 1, index_dim)),
+        ("main_restore", (2, 2, config.num_attention_heads // 2, head_dim)),
+        # Exit: the only rows -> packed conversion of the forward.
+        ("gather", (2, 1, hidden)),
+        ("slice", (1, 4, hidden)),
+    ]
+    assert all(group in call for call in calls)
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
@@ -682,7 +700,7 @@ def test_minimax_m3_vl_declares_sparse_attention_slots(module_name):
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_packed_attention_dispatches_bound_sparse_attention_kernels(module_name, monkeypatch):
+def test_minimax_m3_vl_attention_dispatches_bound_sparse_attention_kernels(module_name, monkeypatch):
     modeling = importlib.import_module(module_name)
     config = modeling.MiniMaxM3VLTextConfig(
         vocab_size=32,
@@ -705,9 +723,9 @@ def test_minimax_m3_vl_packed_attention_dispatches_bound_sparse_attention_kernel
     )
     model = modeling.MiniMaxM3VLTextModel(config).eval()
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-    block_indices = torch.full((5, 1, config.index_topk_blocks), -1, dtype=torch.int32)
+    block_indices = torch.full((2, 3, 1, config.index_topk_blocks), -1, dtype=torch.int32)
     indexer_slot = _RecordingSlot(block_indices)
-    attention_slot = _RecordingSlot(torch.zeros(5, config.num_attention_heads, config.head_dim))
+    attention_slot = _RecordingSlot(torch.zeros(2, 3, config.num_attention_heads, config.head_dim))
     monkeypatch.setattr(modeling, "veomni_msa_indexer", indexer_slot)
     monkeypatch.setattr(modeling, "veomni_msa_attention", attention_slot)
 
@@ -722,20 +740,19 @@ def test_minimax_m3_vl_packed_attention_dispatches_bound_sparse_attention_kernel
             use_cache=False,
         )
 
-    index_query, index_key, indexer_cu_seqlens, indexer_max_seqlen = indexer_slot.args
-    assert index_query.shape == (5, config.index_n_heads, config.index_head_dim)
-    assert index_key.shape == (5, 1, config.index_head_dim)
-    assert indexer_cu_seqlens is cu_seqlens and indexer_max_seqlen == 3
+    # Kernels receive the two samples as right-padded [B=2, S=3] rows.
+    index_query, index_key = indexer_slot.args
+    assert index_query.shape == (2, 3, config.index_n_heads, config.index_head_dim)
+    assert index_key.shape == (2, 3, 1, config.index_head_dim)
     assert indexer_slot.kwargs == {
         "block_size": config.index_block_size,
         "topk_blocks": config.index_topk_blocks,
         "local_blocks": config.index_local_blocks,
     }
-    query, key, value, attention_block_indices, attention_cu_seqlens, attention_max_seqlen = attention_slot.args
-    assert query.shape == (5, config.num_attention_heads, config.head_dim)
-    assert key.shape == value.shape == (5, config.num_key_value_heads, config.head_dim)
+    query, key, value, attention_block_indices = attention_slot.args
+    assert query.shape == (2, 3, config.num_attention_heads, config.head_dim)
+    assert key.shape == value.shape == (2, 3, config.num_key_value_heads, config.head_dim)
     assert attention_block_indices is block_indices
-    assert attention_cu_seqlens is cu_seqlens and attention_max_seqlen == 3
     assert attention_slot.kwargs == {
         "block_size": config.index_block_size,
         "scale": config.head_dim**-0.5,

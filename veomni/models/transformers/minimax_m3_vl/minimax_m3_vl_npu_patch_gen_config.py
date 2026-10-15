@@ -28,6 +28,8 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     PatchedMiniMaxM3VLPreTrainedModel,
     _grid_thw_to_list,
     _minimax_m3_indexer_project,
+    _minimax_m3_packed_to_rows,
+    _minimax_m3_rows_to_packed,
     _validate_minimax_m3_ep,
     collate_multimodal_metadata,
     minimax_m3_vl_3d_rotary_embedding_forward_patched,
@@ -87,6 +89,8 @@ veomni_msa_attention = OpSlot("minimax_sparse_attention", "attention")
 )
 config.add_helper(_grid_thw_to_list)
 config.add_helper(_minimax_m3_indexer_project)
+config.add_helper(_minimax_m3_packed_to_rows)
+config.add_helper(_minimax_m3_rows_to_packed)
 config.add_helper(_validate_minimax_m3_ep)
 config.add_helper(collate_multimodal_metadata)
 
@@ -131,12 +135,12 @@ config.override_method(
 config.override_method(
     "MiniMaxM3VLAttention.forward",
     replacement=minimax_m3_vl_attention_forward_patched,
-    description="Run packed MiniMax language attention through the TND sparse attention operators",
+    description="Run MiniMax language attention on right-padded rows through the BSND sparse attention operators",
 )
 config.override_method(
     "MiniMaxM3VLTextModel.forward",
     replacement=minimax_m3_vl_text_model_forward_patched,
-    description="Accept only packed inputs and reject padded batches, KV cache and CP",
+    description="Convert packed inputs to right-padded BSND rows once for all decoder layers; reject padded batches, KV cache and CP",
 )
 config.override_method(
     "MiniMaxM3VLForCausalLM.forward",
