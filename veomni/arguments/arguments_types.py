@@ -1080,6 +1080,7 @@ class TrainingArguments:
 # alone do not capture per-model and per-hardware compatibility. The NPU
 # default-normalization step runs before this allow-list validation.
 _NPU_ALLOWED: Dict[str, frozenset] = {
+    "minimax_sparse_attention_implementation": frozenset({"npu_cann"}),
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
@@ -1090,6 +1091,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
+    "minimax_sparse_attention_implementation": frozenset({"npu_cann"}),
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
@@ -1258,6 +1260,15 @@ class OpsImplementationConfig:
             "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
             "delegates heavy GDN compute to torch.ops.npu.*). "
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
+        },
+    )
+    minimax_sparse_attention_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "MiniMax M3 language sparse attention backend. 'eager' uses the reference indexer "
+            "and NPU fused attention; 'npu_cann' uses AscendC index scores, Split-KV forward and "
+            "GBSAG backward (BF16, head_dim=128, block_size=128, no dropout or determinism). "
+            "Requires separately installed ops-transformer and Split-KV extensions on Ascend NPU."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(

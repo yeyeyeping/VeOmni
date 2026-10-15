@@ -67,6 +67,10 @@ This recipe covers config loading, generated modeling import, MiniMax processor-
 
 MiniMax's Gemma-style RMSNorm is wired to VeOmni's `rms_norm/qwen3_5` operator variant, selecting Liger on GPU and `torch_npu.npu_rms_norm` on NPU according to `model.ops_implementation.rms_norm_implementation`.
 
+Ascend users can select `model.ops_implementation.minimax_sparse_attention_implementation: npu_cann`
+for TND AscendC index scores, Split-KV forward and GBSAG backward without changing
+the model or collator. See [AscendC MSA setup, constraints and validation](minimax_m3_vl_msa_ascendc.md).
+
 MiniMax routed experts use the `moe_experts/swiglu_oai` operator variant. It preserves the model's clamped `(up + 1) * gate * sigmoid(alpha * gate)` activation while reusing VeOmni's standard EP token dispatch. Enable EP with `fused_triton` on GPU or `fused_npu` on NPU:
 
 ```yaml

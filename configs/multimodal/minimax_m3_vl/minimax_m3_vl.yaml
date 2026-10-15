@@ -2,9 +2,10 @@ model:
   model_path: MiniMaxAI/MiniMax-M3
   ops_implementation:
     moe_implementation: eager
-    # This controls ViT attention. MiniMax language attention keeps its
-    # M3-specific reference implementation until a sparse kernel is integrated.
+    # This controls ViT attention. Language MSA has a separate backend below.
     attn_implementation: flash_attention_2
+    # Set to npu_cann after installing the AscendC MSA extensions.
+    minimax_sparse_attention_implementation: eager
   optimizer:
     lr: 1.0e-5
     lr_decay_style: cosine
