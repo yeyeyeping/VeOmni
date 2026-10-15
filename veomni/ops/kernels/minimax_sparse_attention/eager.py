@@ -18,6 +18,10 @@ The math is the Transformers ``MiniMaxM3VLIndexer`` / ``build_block_mask`` /
 ``eager_attention_forward`` reference, run on a temporary right-padded
 ``[B, Smax, ...]`` view of the packed input. The unpack/pack round trip exists
 only because the reference math is batched; it never leaves this module.
+
+On Ascend NPU tensors the masked attention runs through
+``torch_npu.npu_fusion_attention`` with the same boolean keep mask; every other
+device uses the PyTorch reference.
 """
 
 import torch
@@ -106,6 +110,24 @@ def _select_blocks(
     return block_indices.masked_fill(padding[:, None, :, None], -1)
 
 
+def _expand_selected_blocks(
+    selected: torch.Tensor,
+    *,
+    block_size: int,
+    seq_len: int,
+    heads_per_group: int,
+    via_bfloat16: bool,
+) -> torch.Tensor:
+    """Expand ``[B, G, S, num_key_blocks]`` block flags to a ``[B, Hq, S, S]`` token-level keep mask."""
+    if via_bfloat16:
+        # Boolean ``repeat_interleave`` along the key axis is very slow on NPU; 0/1 are
+        # exact in bfloat16, so expanding there and casting back gives the same mask.
+        block_keep = selected.to(torch.bfloat16).repeat_interleave(block_size, dim=-1)[..., :seq_len].bool()
+    else:
+        block_keep = selected.repeat_interleave(block_size, dim=-1)[..., :seq_len]
+    return block_keep.repeat_interleave(heads_per_group, dim=1)
+
+
 def _block_causal_keep(
     block_indices: torch.Tensor,
     padding: torch.Tensor,
@@ -123,8 +145,13 @@ def _block_causal_keep(
         (batch, num_groups, seq_len, num_key_blocks + 1), dtype=torch.bool, device=block_indices.device
     )
     selected.scatter_(-1, safe, True)
-    block_keep = selected[..., :num_key_blocks].repeat_interleave(block_size, dim=-1)[..., :seq_len]
-    block_keep = block_keep.repeat_interleave(num_query_heads // num_groups, dim=1)
+    block_keep = _expand_selected_blocks(
+        selected[..., :num_key_blocks],
+        block_size=block_size,
+        seq_len=seq_len,
+        heads_per_group=num_query_heads // num_groups,
+        via_bfloat16=block_indices.device.type == "npu",
+    )
 
     positions = torch.arange(seq_len, device=block_indices.device)
     causal_keep = positions[None, :] <= positions[:, None]
@@ -145,7 +172,27 @@ def _dense_attention(
     scale: float,
     dropout_p: float,
 ) -> torch.Tensor:
-    """Upstream eager attention on ``[B, H, S, D]`` with local GQA; returns ``[B, S, Hq, D]``."""
+    """Masked attention on ``[B, H, S, D]`` with local GQA; returns ``[B, S, Hq, D]``.
+
+    NPU tensors use ``npu_fusion_attention`` (native GQA, ``True`` in ``atten_mask``
+    means masked); other devices run the upstream eager math.
+    """
+    if query.device.type == "npu":
+        import torch_npu
+
+        output = torch_npu.npu_fusion_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            head_num=query.shape[1],
+            input_layout="BNSD",
+            atten_mask=(~keep).contiguous(),
+            sparse_mode=1,
+            scale=scale,
+            keep_prob=1.0 - dropout_p,
+        )[0]
+        return output.transpose(1, 2).contiguous()
+
     num_groups = query.shape[1] // key.shape[1]
     key = key.repeat_interleave(num_groups, dim=1)
     value = value.repeat_interleave(num_groups, dim=1)
