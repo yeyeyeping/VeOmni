@@ -48,7 +48,7 @@ when the selected implementation runs.
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
+| `moe_experts` | `standard`, `gpt_oss`, `swiglu_oai` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant (`swiglu_oai`: `eager`, `fused_triton`, `fused_npu`) |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
@@ -56,6 +56,7 @@ when the selected implementation runs.
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA) |
+| `minimax_sparse_attention` | `indexer`, `attention` | `eager` (Ascend NPU tensors run the masked softmax through `torch_npu.npu_fusion_attention`) |
 
 DeepSeek-V4 `dsa_attention` takes the full-resolution and compressed KV
 separately, plus `position_ids` and the compressor's `CompressedCandidates`,
@@ -76,6 +77,17 @@ makes 16K-token training feasible. It raises on an attention mask and falls
 back to `eager` with a one-time warning for nonzero dropout. Its dK/dV backward
 uses KV-owned reduction over sorted reverse CSR tiles instead of floating-point
 atomic scatter, at the cost of sorting and a partial-gradient workspace.
+
+MiniMax M3 `minimax_sparse_attention` takes packed TND tensors with the
+standard varlen `cu_seqlens` / `max_seqlen` metadata. `indexer` selects
+`[T, G, topk]` key blocks per query and KV group (`-1` marks an unused slot);
+`attention` applies them with token-level causality inside each block, or runs
+dense causal attention when no selection is passed. It has no config field yet:
+the model resolves the default row, and a kernel backend adds its rows (and a
+`minimax_sparse_attention_implementation` field once there is a choice). MoE
+`swiglu_oai` keeps the merged gate/up layout and replaces SiLU with the clamped
+`(up + 1) * gate * sigmoid(alpha * gate)` activation on the standard fused
+Triton and NPU paths, including EP.
 
 The registry is the source of truth for the exact rows available in a given
 revision:
