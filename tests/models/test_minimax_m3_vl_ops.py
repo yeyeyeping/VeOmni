@@ -254,22 +254,36 @@ def _tiny_vision_model(modeling, attn_implementation):
     return vision_model
 
 
+_TWO_MEDIA = [[1, 2, 2], [1, 2, 2]]
+_ONE_MEDIUM = [[1, 2, 2]]
+
+
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize(
-    ("grid_thw_list", "ulysses_enabled", "rejected"),
+    ("attn_implementation", "grid_thw_list", "ulysses_enabled", "rejected"),
     [
-        ([[1, 2, 2], [1, 2, 2]], False, True),
-        ([[1, 2, 2]], True, True),
-        ([[1, 2, 2]], False, False),
+        ("eager", _TWO_MEDIA, False, True),
+        ("eager", _ONE_MEDIUM, True, True),
+        ("flash_attention_2", _ONE_MEDIUM, True, True),
+        ("eager", _ONE_MEDIUM, False, False),
+        ("veomni_flash_attention_2_with_sp", _TWO_MEDIA, False, False),
+        ("veomni_flash_attention_2_with_sp", _TWO_MEDIA, True, False),
     ],
-    ids=["multiple_media", "ulysses", "single_media"],
+    ids=[
+        "eager_multiple_media",
+        "eager_ulysses",
+        "non_sp_varlen_ulysses",
+        "eager_single_medium",
+        "sp_varlen_multiple_media",
+        "sp_varlen_ulysses",
+    ],
 )
 def test_minimax_m3_vl_vision_requires_varlen_attention_to_isolate_media(
-    module_name, grid_thw_list, ulysses_enabled, rejected, monkeypatch
+    module_name, attn_implementation, grid_thw_list, ulysses_enabled, rejected, monkeypatch
 ):
-    """Without a mask, eager/SDPA vision attention would mix media samples or skip the Ulysses exchange."""
+    """Without a mask, non-varlen vision attention would mix media samples; non-SP backends skip the Ulysses exchange."""
     modeling = importlib.import_module(module_name)
-    vision_model = _tiny_vision_model(modeling, "eager")
+    vision_model = _tiny_vision_model(modeling, attn_implementation)
     monkeypatch.setattr(
         modeling,
         "get_parallel_state",
@@ -287,6 +301,17 @@ def test_minimax_m3_vl_vision_requires_varlen_attention_to_isolate_media(
             vision_model(**forward_kwargs)
     else:
         vision_model(**forward_kwargs)
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_lists_every_veomni_varlen_backend_as_flash_compatible(module_name):
+    """HF replaces a flash backend missing from this list with its first entry, MiniMax's own Hub kernel."""
+    from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
+
+    modeling = importlib.import_module(module_name)
+    compatible = modeling.MiniMaxM3VLPreTrainedModel._compatible_flash_implementations
+    sp_backends = [name for name in VARLEN_ATTENTION_TYPES if name.endswith("_with_sp")]
+    assert set(sp_backends) <= set(compatible)
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)

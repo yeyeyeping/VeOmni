@@ -487,7 +487,7 @@
 
      def forward(
          self,
-@@ -677,26 +873,38 @@
+@@ -677,26 +873,40 @@
          return hidden_states
 
 
@@ -524,13 +524,15 @@
 +        "flash_attention_3",
 +        "flash_attention_4",
 +        "veomni_flash_attention_2_with_sp",
++        "veomni_flash_attention_2_hub_with_sp",
 +        "veomni_flash_attention_3_with_sp",
++        "veomni_flash_attention_3_hub_with_sp",
 +        "veomni_flash_attention_4_with_sp",
 +    ]
 
      @torch.no_grad()
      def _init_weights(self, module):
-@@ -712,6 +920,12 @@
+@@ -712,6 +922,12 @@
              init.zeros_(module.weight)
 
 
@@ -543,7 +545,7 @@
  @auto_docstring
  class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
      config: MiniMaxM3VLTextConfig
-@@ -730,6 +944,18 @@
+@@ -730,6 +946,18 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -562,7 +564,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -738,48 +964,73 @@
+@@ -738,48 +966,73 @@
          input_ids: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
@@ -663,7 +665,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -789,180 +1040,6 @@
+@@ -789,180 +1042,6 @@
          return MoeModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
@@ -844,7 +846,7 @@
          )
 
 
-@@ -990,6 +1067,12 @@
+@@ -990,6 +1069,12 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -857,7 +859,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,13 +1102,17 @@
+@@ -1019,13 +1104,17 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -882,7 +884,7 @@
          coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
-@@ -1156,6 +1243,12 @@
+@@ -1156,6 +1245,12 @@
          return hidden_states
 
 
@@ -895,7 +897,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1271,141 @@
+@@ -1178,23 +1273,144 @@
          )
          self.post_init()
 
@@ -940,15 +942,18 @@
 +
 +        parallel_state = get_parallel_state()
 +        # The vision attention passes no mask, so only a varlen backend keeps media
-+        # samples apart and runs the ViT Ulysses all-to-all; eager/SDPA would silently
-+        # attend across samples or within the local shard only.
++        # samples apart, and only the VeOmni ``*_with_sp`` backends run the ViT Ulysses
++        # all-to-all; anything else silently attends across samples or within the
++        # local shard only.
 +        attention_implementation = self.config._attn_implementation
-+        if attention_implementation not in VARLEN_ATTENTION_TYPES and (
-+            len(grid_thw_list) > 1 or parallel_state.ulysses_enabled
-+        ):
++        varlen_backend = attention_implementation in VARLEN_ATTENTION_TYPES and (
++            not parallel_state.ulysses_enabled or attention_implementation.endswith("_with_sp")
++        )
++        if not varlen_backend and (len(grid_thw_list) > 1 or parallel_state.ulysses_enabled):
 +            raise ValueError(
 +                "MiniMax M3 VL vision attention needs a varlen FlashAttention backend (flash_attention_2/3/4) for "
-+                f"multiple media inputs or Ulysses, got {attention_implementation!r}."
++                "multiple media inputs, and its VeOmni *_with_sp variant under Ulysses, "
++                f"got {attention_implementation!r}."
 +            )
 +
 +        sp_pad_seq_len = 0
@@ -1043,7 +1048,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1489,26 @@
+@@ -1278,6 +1494,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1070,7 +1075,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1581,123 @@
+@@ -1350,46 +1586,123 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1211,7 +1216,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,6 +1734,12 @@
+@@ -1426,6 +1739,12 @@
          return vision_outputs
 
 
@@ -1224,7 +1229,7 @@
  @auto_docstring(custom_intro="MiniMax M3 VL full model with LM head (text + vision).")
  class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3VLPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -1448,48 +1762,25 @@
+@@ -1448,48 +1767,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1291,7 +1296,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1795,42 @@
+@@ -1504,15 +1800,42 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1339,7 +1344,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1842,19 @@
+@@ -1524,9 +1847,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 

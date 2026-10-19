@@ -902,7 +902,9 @@ class MiniMaxM3VLPreTrainedModel(PreTrainedModel):
         "flash_attention_3",
         "flash_attention_4",
         "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_2_hub_with_sp",
         "veomni_flash_attention_3_with_sp",
+        "veomni_flash_attention_3_hub_with_sp",
         "veomni_flash_attention_4_with_sp",
     ]
 
@@ -1307,15 +1309,18 @@ class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
 
         parallel_state = get_parallel_state()
         # The vision attention passes no mask, so only a varlen backend keeps media
-        # samples apart and runs the ViT Ulysses all-to-all; eager/SDPA would silently
-        # attend across samples or within the local shard only.
+        # samples apart, and only the VeOmni ``*_with_sp`` backends run the ViT Ulysses
+        # all-to-all; anything else silently attends across samples or within the
+        # local shard only.
         attention_implementation = self.config._attn_implementation
-        if attention_implementation not in VARLEN_ATTENTION_TYPES and (
-            len(grid_thw_list) > 1 or parallel_state.ulysses_enabled
-        ):
+        varlen_backend = attention_implementation in VARLEN_ATTENTION_TYPES and (
+            not parallel_state.ulysses_enabled or attention_implementation.endswith("_with_sp")
+        )
+        if not varlen_backend and (len(grid_thw_list) > 1 or parallel_state.ulysses_enabled):
             raise ValueError(
                 "MiniMax M3 VL vision attention needs a varlen FlashAttention backend (flash_attention_2/3/4) for "
-                f"multiple media inputs or Ulysses, got {attention_implementation!r}."
+                "multiple media inputs, and its VeOmni *_with_sp variant under Ulysses, "
+                f"got {attention_implementation!r}."
             )
 
         sp_pad_seq_len = 0
