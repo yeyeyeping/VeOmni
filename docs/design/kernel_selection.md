@@ -17,7 +17,7 @@ selection knob.
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
-| MiniMax sparse attention | — (no config field until a kernel backend exists) | `eager` | `"eager"` | Model build via two `OpSlot`s (`indexer`, `attention`) of op `minimax_sparse_attention`; a backend adds `minimax_sparse_attention_implementation`. The eager attention dispatches to `torch_npu.npu_fusion_attention` on NPU tensors |
+| MiniMax sparse attention | `minimax_sparse_attention_implementation` | `eager`, `npu_split_kv_gbsa` (Ascend CANN) | `"eager"` | Model build via two `OpSlot`s (`indexer`, `attention`) of op `minimax_sparse_attention` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
@@ -50,6 +50,27 @@ dynamic-batch `cu_seqlens`.
 The per-op fields are typed as plain `str` (not `Literal`), so third-party
 backends can be registered via `extra_backends` in a model's `device_patch.py`
 without modifying `OpsImplementationConfig`.
+
+### MiniMax M3 sparse attention on Ascend
+
+Set `minimax_sparse_attention_implementation: npu_split_kv_gbsa` to bind both
+MiniMax language OpSlots. This backend lazily loads the operator functions
+from `cann_ops_transformer.ops`; it requires the matching custom CANN libraries
+and Torch extensions. `msa_index_score` plus per-query local-block selection
+and TopK implements the indexer. The attention autograd Function uses
+`k2q_csr` and `npu_minimax_sparse_attention_split_kv` in forward, then constructs
+sorted batch-local KV-to-Q lists and calls
+`generic_block_sparse_attention_grad_metadata` and
+`generic_block_sparse_attention_grad` in backward. The model-facing tensor
+layout stays packed TND, including under Ulysses.
+
+The sparse path requires block size 128, attention head dimension 128,
+matching BF16 inputs (FP16 where the installed split-KV kernel supports it),
+and GQA group size at most 16. Dense layers and nonzero attention dropout use
+the existing eager implementation. Missing sparse operator exports raise an
+error; they do not silently select eager. Only first-order backward is
+supported. See the [MiniMax M3 guide](../examples/minimax_m3_vl.md#cann-sparse-attention)
+for configuration, metadata formats, memory costs, and numerical validation.
 
 ---
 

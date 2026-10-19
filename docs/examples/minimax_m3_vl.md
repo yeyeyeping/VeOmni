@@ -60,6 +60,94 @@ The sparse-attention indexer (`self_attn.indexer.*`) is frozen and keeps its che
 
 MiniMax's Gemma-style RMSNorm is wired to VeOmni's `rms_norm/qwen3_5` operator variant, selecting Liger on GPU and `torch_npu.npu_rms_norm` on NPU according to `model.ops_implementation.rms_norm_implementation`.
 
+## CANN Sparse Attention
+
+The NPU example selects the CANN language attention backend explicitly:
+
+```yaml
+model:
+  ops_implementation:
+    minimax_sparse_attention_implementation: npu_split_kv_gbsa
+```
+
+The default for this field is `eager`. Set it to `eager` to run without the
+custom MiniMax CANN operators. `attn_implementation` continues to select the
+vision attention backend independently.
+
+Install the CANN operator libraries and matching Torch extensions for the
+target device before enabling this backend. The following callable names
+must be exported directly under `cann_ops_transformer.ops`:
+
+| Function | Use |
+|---|---|
+| `msa_index_score` | Index Q/K to FP32 block scores |
+| `k2q_csr` | Q-to-KV-block selections to interleaved KV-to-Q CSR |
+| `npu_minimax_sparse_attention_split_kv` | Forward attention output and global FP32 LSE |
+| `generic_block_sparse_attention_grad_metadata` | Backward task metadata |
+| `generic_block_sparse_attention_grad` | Q/K/V gradients |
+
+These signatures follow the ops-transformer wrappers analyzed at commit
+`41121b97f9bf46e3c9575f366095390f13bbe280`. Some of those wrappers live under
+`experimental/` upstream and need to be exported into the namespace above by
+the installed extension package. VeOmni does not import `custom_ops`, fall
+back to another namespace, or bundle those vendor kernels.
+
+The indexer calls `msa_index_score` with `layout_key="TND"`,
+`sparse_mode=3`, no block table or dequantization scale, an int8
+`[2048,2048]` zero mask template, and `init_blocks=local_blocks=0`.
+The checked kernel ignores mask tensor contents and computes right-down
+causal bounds from the packed lengths. Its internal local boost uses one
+`start_loc` per sequence, so VeOmni instead applies `index_local_blocks` per
+query before TopK. The model's local-block setting is preserved.
+FP32-minimum invalid scores are normalized to `-inf` and unused selection
+slots are filled with `-1`.
+
+The attention Function canonicalizes selections, removes duplicate and
+future-block edges, and builds CSR with `order_method=1` and
+`q_global_offset=True`. Split-KV consumes per-sequence int32 lengths and
+continuous TND Q/K/V, runs with `inner_precise=0`, and returns output plus
+`softmax_lse_flag=True`. Backward reuses the saved Q/K/V/output/LSE and compact
+selections, builds sorted local-query lists of shape `[B,Hkv,J,Smax]`, then
+calls metadata and GBSA Grad with `block_shape=[1,128]`, causal mask mode 1,
+softmax precision 0, and the original model softmax scale. CSR uses int32
+prefix sums; GBSA uses int64 prefix sums. The forward CSR is not retained
+for backward. The frozen indexer receives no gradients; double backward is
+not supported.
+
+Supported sparse inputs have `index_block_size=128`, attention head dimension
+128, index head dimension a positive multiple of 16 no larger than 128,
+matching BF16 Q/K/V, and an integral Q-to-KV head ratio no larger than 16.
+FP16 is accepted where supported by the installed split-KV implementation;
+its Ascend 950 path requires BF16 for this non-quantized configuration.
+Unsupported sparse shapes raise. Dense layers and nonzero attention dropout
+retain the existing eager path. Packing isolates all samples, including a
+synthetic sequence used for SP tail padding. Ulysses communication remains
+in the model, outside these two OpSlots; context parallelism remains unsupported.
+
+This backend still has material memory costs. Split-KV's FP32 output partials
+scale as `T * Hq_local * K * D * 4` bytes, and backward query lists require
+`B * Hkv_local * ceil(Smax/128) * Smax * 4` bytes, plus conversion temporaries.
+The adapter reads the existing pack prefix sums on the host to determine CSR
+allocation sizes; device-resident `cu_seqlens` therefore introduces a D2H
+synchronization. Passing host prefix sums avoids that adapter copy, although
+the checked upstream index-score TND wrapper also reads lengths for its
+output allocation. This initial adapter uses PyTorch sorting for backward
+index conversion and makes no throughput guarantee. Measure the complete
+pipeline and workspace before increasing sequence length.
+
+Run the tests with the custom operators installed:
+
+```bash
+pytest -v tests/ops/test_minimax_sparse_attention.py -k cann
+```
+
+CPU contract tests check finite invalid fill, TopK, interleaved CSR, sorted
+batch-local backward lists, and autograd wiring against eager math. Actual
+NPU numerical tests separately compare block scores and fixed-selection
+attention outputs/QKV gradients, including GQA ratios 2 and 16. Those tests
+skip when hardware or the optional operator set is absent; CPU success alone
+does not establish vendor-kernel numerical agreement.
+
 MiniMax routed experts use the `moe_experts/swiglu_oai` operator variant. It preserves the model's clamped `(up + 1) * gate * sigmoid(alpha * gate)` activation while reusing VeOmni's standard EP token dispatch. Enable EP with `fused_triton` on GPU or `fused_npu` on NPU:
 
 ```yaml

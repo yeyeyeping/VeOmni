@@ -36,15 +36,39 @@ synthetic SP tail-padding sequence appended by the collator.
 
 MiniMax generated modeling declares ``OpSlot("minimax_sparse_attention",
 "indexer")`` and ``OpSlot("minimax_sparse_attention", "attention")`` and falls
-back to the eager functions below when a slot is bound to ``eager`` (the only
-implementation today). On Ascend NPU tensors the eager attention runs its masked
-softmax through ``torch_npu.npu_fusion_attention``; the indexer stays eager. A
-kernel backend registers a ``KernelSpec`` for both variants plus a
-``minimax_sparse_attention_implementation`` config field; the model code does
-not change.
+back to the eager functions below when a slot is bound to ``eager``. On Ascend
+NPU, ``npu_split_kv_gbsa`` replaces both slots with CANN operators exported by
+``cann_ops_transformer.ops``. Its attention uses split-KV forward and GBSA
+backward; dense layers and nonzero attention dropout retain the eager path.
 """
 
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 from .eager import minimax_sparse_attention_eager, minimax_sparse_indexer_eager
+
+
+def _npu_indexer_factory():
+    from .npu import minimax_sparse_indexer_npu
+
+    return minimax_sparse_indexer_npu
+
+
+def _npu_attention_factory():
+    from .npu import minimax_sparse_attention_npu
+
+    return minimax_sparse_attention_npu
+
+
+for variant, factory in (("indexer", _npu_indexer_factory), ("attention", _npu_attention_factory)):
+    KERNEL_REGISTRY.register(
+        KernelSpec(
+            name="npu_split_kv_gbsa",
+            op_name="minimax_sparse_attention",
+            variant=variant,
+            factory=factory,
+            hardware=HardwareRequirement(device_type="npu"),
+            description=f"CANN MiniMax M3 {variant}: index score / split-KV forward with GBSA backward",
+        )
+    )
 
 
 __all__ = ["minimax_sparse_attention_eager", "minimax_sparse_indexer_eager"]

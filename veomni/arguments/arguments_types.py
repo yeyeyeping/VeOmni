@@ -1478,6 +1478,15 @@ class OpsImplementationConfig:
             "attention mask. Nonzero attention dropout falls back to eager with a warning."
         },
     )
+    minimax_sparse_attention_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "MiniMax M3 sparse indexer and attention backend. 'npu_split_kv_gbsa' uses "
+            "cann_ops_transformer.ops on Ascend: index score/TopK, split-KV forward and GBSA backward. "
+            "Requires block size 128, attention head dimension 128, BF16 (FP16 on supported hardware), "
+            "and GQA group size <=16. Dense layers and nonzero attention dropout use eager."
+        },
+    )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
         default="eager",
         metadata={
