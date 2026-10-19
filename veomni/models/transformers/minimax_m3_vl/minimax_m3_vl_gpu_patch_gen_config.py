@@ -424,25 +424,16 @@ def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, grid_thw, **k
     )
 
     parallel_state = get_parallel_state()
-    if parallel_state.cp_enabled:
-        raise ValueError("MiniMax M3 VL does not support context parallelism; set cp_size=1.")
-
+    # The vision attention passes no mask, so only a varlen backend keeps media
+    # samples apart and runs the ViT Ulysses all-to-all; eager/SDPA would silently
+    # attend across samples or within the local shard only.
     attention_implementation = self.config._attn_implementation
-    if (
-        len(grid_thw_list) > 1
-        and attention_implementation not in VARLEN_ATTENTION_TYPES
-        and attention_implementation != "MiniMaxAI/msa"
+    if attention_implementation not in VARLEN_ATTENTION_TYPES and (
+        len(grid_thw_list) > 1 or parallel_state.ulysses_enabled
     ):
         raise ValueError(
-            "MiniMax M3 VL vision batches with multiple media inputs require a varlen flash-attention backend, "
-            f"got {attention_implementation!r}."
-        )
-    if parallel_state.ulysses_enabled and (
-        attention_implementation not in VARLEN_ATTENTION_TYPES or not attention_implementation.startswith("veomni_")
-    ):
-        raise ValueError(
-            "MiniMax M3 VL vision Ulysses requires a VeOmni SP-aware varlen flash-attention backend, "
-            f"got {attention_implementation!r}."
+            "MiniMax M3 VL vision attention needs a varlen FlashAttention backend (flash_attention_2/3/4) for "
+            f"multiple media inputs or Ulysses, got {attention_implementation!r}."
         )
 
     sp_pad_seq_len = 0
@@ -727,13 +718,14 @@ def minimax_m3_vl_model_forward_patched(
 # 2. accept only packed inputs so language attention has a single path: the
 #    collator's varlen kwargs flow unchanged to the attention layers, and a
 #    lone unpadded sequence without them is described as a one-segment pack;
-#    padded batches, KV cache and context parallelism are rejected
+#    padded batches and KV cache are rejected (context parallelism is refused
+#    at model build by ``check_context_parallel_supported``)
 # 3. generate RoPE once from the local packed position IDs; attention and the
 #    indexer apply it before their respective Ulysses communications
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLTextModel.forward",
-    description="Accept only packed inputs and reject padded batches, KV cache and CP",
+    description="Accept only packed inputs and reject padded batches and KV cache",
 )
 def minimax_m3_vl_text_model_forward_patched(
     self,
@@ -764,8 +756,6 @@ def minimax_m3_vl_text_model_forward_patched(
     if past_key_values is not None:
         raise ValueError("MiniMax M3 VL language model in VeOmni is training-only and does not support KV cache.")
     parallel_state = get_parallel_state()
-    if parallel_state.cp_enabled:
-        raise ValueError("MiniMax M3 VL language attention supports Ulysses only; set cp_size=1.")
     if kwargs.get("cu_seq_lens_q") is None:
         if parallel_state.sp_enabled or inputs_embeds.shape[0] != 1:
             raise ValueError(

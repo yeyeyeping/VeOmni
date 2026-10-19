@@ -139,7 +139,7 @@ config.override_method(
 config.override_method(
     "MiniMaxM3VLTextModel.forward",
     replacement=minimax_m3_vl_text_model_forward_patched,
-    description="Accept only packed inputs and reject padded batches, KV cache and CP",
+    description="Accept only packed inputs and reject padded batches and KV cache",
 )
 config.override_method(
     "MiniMaxM3SparseForConditionalGeneration.forward",

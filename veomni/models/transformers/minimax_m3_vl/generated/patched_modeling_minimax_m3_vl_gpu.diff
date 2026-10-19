@@ -47,7 +47,7 @@
 +#    - method_override: MiniMaxM3VLModel.forward
 +#      Add MiniMax VLM metadata fast path and FSDP dummy vision branch
 +#    - method_override: MiniMaxM3VLTextModel.forward
-+#      Accept only packed inputs and reject padded batches, KV cache and CP
++#      Accept only packed inputs and reject padded batches and KV cache
 +#    - method_override: MiniMaxM3SparseForConditionalGeneration.forward
 +#      Unpack VeOmni causal LM loss tuple and route fused loss kernels when selected
 +#    - method_override: MiniMaxM3SparseForConditionalGeneration.get_parallel_plan
@@ -543,7 +543,7 @@
  @auto_docstring
  class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
      config: MiniMaxM3VLTextConfig
-@@ -730,6 +944,17 @@
+@@ -730,6 +944,18 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -554,14 +554,15 @@
 +    # 2. accept only packed inputs so language attention has a single path: the
 +    #    collator's varlen kwargs flow unchanged to the attention layers, and a
 +    #    lone unpadded sequence without them is described as a one-segment pack;
-+    #    padded batches, KV cache and context parallelism are rejected
++    #    padded batches and KV cache are rejected (context parallelism is refused
++    #    at model build by ``check_context_parallel_supported``)
 +    # 3. generate RoPE once from the local packed position IDs; attention and the
 +    #    indexer apply it before their respective Ulysses communications
 +    # ================================================================
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -738,48 +963,75 @@
+@@ -738,48 +964,73 @@
          input_ids: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
@@ -594,8 +595,6 @@
 +        if past_key_values is not None:
 +            raise ValueError("MiniMax M3 VL language model in VeOmni is training-only and does not support KV cache.")
 +        parallel_state = get_parallel_state()
-+        if parallel_state.cp_enabled:
-+            raise ValueError("MiniMax M3 VL language attention supports Ulysses only; set cp_size=1.")
 +        if kwargs.get("cu_seq_lens_q") is None:
 +            if parallel_state.sp_enabled or inputs_embeds.shape[0] != 1:
 +                raise ValueError(
@@ -664,7 +663,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -789,180 +1041,6 @@
+@@ -789,180 +1040,6 @@
          return MoeModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
@@ -845,7 +844,7 @@
          )
 
 
-@@ -990,6 +1068,12 @@
+@@ -990,6 +1067,12 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -858,7 +857,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,13 +1103,17 @@
+@@ -1019,13 +1102,17 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -883,7 +882,7 @@
          coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
-@@ -1156,6 +1244,12 @@
+@@ -1156,6 +1243,12 @@
          return hidden_states
 
 
@@ -896,7 +895,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1272,151 @@
+@@ -1178,23 +1271,141 @@
          )
          self.post_init()
 
@@ -940,26 +939,16 @@
 +        )
 +
 +        parallel_state = get_parallel_state()
-+        if parallel_state.cp_enabled:
-+            raise ValueError("MiniMax M3 VL does not support context parallelism; set cp_size=1.")
-+
++        # The vision attention passes no mask, so only a varlen backend keeps media
++        # samples apart and runs the ViT Ulysses all-to-all; eager/SDPA would silently
++        # attend across samples or within the local shard only.
 +        attention_implementation = self.config._attn_implementation
-+        if (
-+            len(grid_thw_list) > 1
-+            and attention_implementation not in VARLEN_ATTENTION_TYPES
-+            and attention_implementation != "MiniMaxAI/msa"
++        if attention_implementation not in VARLEN_ATTENTION_TYPES and (
++            len(grid_thw_list) > 1 or parallel_state.ulysses_enabled
 +        ):
 +            raise ValueError(
-+                "MiniMax M3 VL vision batches with multiple media inputs require a varlen flash-attention backend, "
-+                f"got {attention_implementation!r}."
-+            )
-+        if parallel_state.ulysses_enabled and (
-+            attention_implementation not in VARLEN_ATTENTION_TYPES
-+            or not attention_implementation.startswith("veomni_")
-+        ):
-+            raise ValueError(
-+                "MiniMax M3 VL vision Ulysses requires a VeOmni SP-aware varlen flash-attention backend, "
-+                f"got {attention_implementation!r}."
++                "MiniMax M3 VL vision attention needs a varlen FlashAttention backend (flash_attention_2/3/4) for "
++                f"multiple media inputs or Ulysses, got {attention_implementation!r}."
 +            )
 +
 +        sp_pad_seq_len = 0
@@ -1054,7 +1043,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1500,26 @@
+@@ -1278,6 +1489,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1081,7 +1070,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1592,123 @@
+@@ -1350,46 +1581,123 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1222,7 +1211,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,6 +1745,12 @@
+@@ -1426,6 +1734,12 @@
          return vision_outputs
 
 
@@ -1235,7 +1224,7 @@
  @auto_docstring(custom_intro="MiniMax M3 VL full model with LM head (text + vision).")
  class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3VLPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -1448,48 +1773,25 @@
+@@ -1448,48 +1762,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1302,7 +1291,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1806,42 @@
+@@ -1504,15 +1795,42 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1350,7 +1339,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1853,19 @@
+@@ -1524,9 +1842,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 

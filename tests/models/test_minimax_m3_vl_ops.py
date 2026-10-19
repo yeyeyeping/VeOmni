@@ -211,7 +211,7 @@ def test_minimax_m3_vl_text_model_rejects_unpacked_input_under_sequence_parallel
     """A local SP shard cannot describe the global sequence, so the collator's metadata is mandatory."""
     modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
-    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False, sp_enabled=True))
+    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=True))
 
     with pytest.raises(ValueError, match="requires packed inputs"):
         model(inputs_embeds=torch.randn(1, 4, model.config.hidden_size))
@@ -235,6 +235,58 @@ def test_minimax_m3_vl_metadata_preserves_visual_batch_boundaries_and_isolates_s
     assert metadata["vit_image_max_seqlen"] == 4
     assert metadata["vit_video_cu_seqlens"].tolist() == [0, 4, 12]
     assert metadata["vit_video_max_seqlen"] == 8
+
+
+def _tiny_vision_model(modeling, attn_implementation):
+    config = modeling.MiniMaxM3VLVisionConfig(
+        hidden_size=12,
+        intermediate_size=24,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_channels=3,
+        patch_size=2,
+        temporal_patch_size=1,
+        spatial_merge_size=2,
+    )
+    vision_model = modeling.MiniMaxM3VLVisionModel(config)
+    vision_model.config._attn_implementation = attn_implementation
+    vision_model.layers = torch.nn.ModuleList([_RecordingVisionLayer()])
+    return vision_model
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+@pytest.mark.parametrize(
+    ("grid_thw_list", "ulysses_enabled", "rejected"),
+    [
+        ([[1, 2, 2], [1, 2, 2]], False, True),
+        ([[1, 2, 2]], True, True),
+        ([[1, 2, 2]], False, False),
+    ],
+    ids=["multiple_media", "ulysses", "single_media"],
+)
+def test_minimax_m3_vl_vision_requires_varlen_attention_to_isolate_media(
+    module_name, grid_thw_list, ulysses_enabled, rejected, monkeypatch
+):
+    """Without a mask, eager/SDPA vision attention would mix media samples or skip the Ulysses exchange."""
+    modeling = importlib.import_module(module_name)
+    vision_model = _tiny_vision_model(modeling, "eager")
+    monkeypatch.setattr(
+        modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_enabled=False, ulysses_enabled=ulysses_enabled),
+    )
+    num_patches = sum(t * h * w for t, h, w in grid_thw_list)
+    forward_kwargs = dict(
+        pixel_values=torch.randn(num_patches, 3 * 2 * 2),
+        grid_thw=torch.tensor(grid_thw_list, dtype=torch.long),
+        vit_metadata={"grid_thw_list": grid_thw_list},
+    )
+
+    if rejected:
+        with pytest.raises(ValueError, match="needs a varlen FlashAttention backend"):
+            vision_model(**forward_kwargs)
+    else:
+        vision_model(**forward_kwargs)
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
@@ -264,7 +316,6 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
         sp_enabled=True,
         sp_size=2,
         ulysses_enabled=True,
-        cp_enabled=False,
     )
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: parallel_state)
 
