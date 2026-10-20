@@ -82,6 +82,7 @@ config.add_import(
     "veomni.ops.kernels.minimax_sparse_attention",
     names=["minimax_sparse_attention_eager", "minimax_sparse_indexer_eager"],
 )
+config.add_import("veomni.ops.kernels.minimax_sparse_attention.ulysses", names=["start_minimax_ulysses_projections"])
 config.add_import("veomni.models.transformers.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
 config.add_post_import_block(
@@ -275,6 +276,8 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
 # 4. keep language attention independent from the generic ViT-controlled
 #    ``attn_implementation`` configuration; attention masks and KV cache are
 #    rejected upstream in the text model, so this is the only path
+# 5. when async Ulysses is enabled, launch indexer and main Q/K/V exchanges
+#    between projections and defer main waits until after block selection
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLAttention.forward",
@@ -291,40 +294,51 @@ def minimax_m3_vl_attention_forward_patched(
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-    # --- Patch.1 ---
-    cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-    # --- Patch.1 ---
-
-    # --- Patch.2 ---
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
-    index_query = index_key = None
-    if self.indexer is not None:
-        index_query, index_key = _minimax_m3_indexer_project(self.indexer, hidden_states, position_embeddings)
-
+    # --- Patch.5 ---
     parallel_state = get_parallel_state()
-    if parallel_state.ulysses_enabled:
-        query_states, key_states, value_states, _ = prepare_ulysses_qkv(
-            query_states,
-            key_states,
-            value_states,
+    async_ulysses = parallel_state.ulysses_enabled and getattr(parallel_state, "async_enabled", False)
+    if async_ulysses:
+        main_collectors, index_query, index_key = start_minimax_ulysses_projections(
+            self,
+            hidden_states,
+            position_embeddings,
             group=parallel_state.ulysses_group,
             ulysses_size=parallel_state.ulysses_size,
         )
-        if index_query is not None:
-            index_query = gather_seq_scatter_kv_heads(
-                index_query,
+    else:
+        # --- Patch.5 ---
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        # --- Patch.1 ---
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # --- Patch.1 ---
+
+        # --- Patch.2 ---
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        index_query = index_key = None
+        if self.indexer is not None:
+            index_query, index_key = _minimax_m3_indexer_project(self.indexer, hidden_states, position_embeddings)
+        if parallel_state.ulysses_enabled:
+            query_states, key_states, value_states, _ = prepare_ulysses_qkv(
+                query_states,
+                key_states,
+                value_states,
                 group=parallel_state.ulysses_group,
                 ulysses_size=parallel_state.ulysses_size,
             )
-            index_key = gather_outputs(index_key, gather_dim=1, group=parallel_state.ulysses_group)
-    # --- Patch.2 ---
+            if index_query is not None:
+                index_query = gather_seq_scatter_kv_heads(
+                    index_query,
+                    group=parallel_state.ulysses_group,
+                    ulysses_size=parallel_state.ulysses_size,
+                )
+                index_key = gather_outputs(index_key, gather_dim=1, group=parallel_state.ulysses_group)
+        # --- Patch.2 ---
 
     # --- Patch.3 ---
     # The text model guarantees packed varlen metadata; training packs samples
@@ -344,6 +358,10 @@ def minimax_m3_vl_attention_forward_patched(
             topk_blocks=self.indexer.topk_blocks,
             local_blocks=self.indexer.local_blocks,
         )
+    # --- Patch.5 ---
+    if async_ulysses:
+        query_states, key_states, value_states = (collect() for collect in main_collectors)
+    # --- Patch.5 ---
     attn_output = msa_attention(
         query_states[0],
         key_states[0],

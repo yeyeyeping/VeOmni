@@ -72,6 +72,13 @@ error; they do not silently select eager. Only first-order backward is
 supported. See the [MiniMax M3 guide](../examples/minimax_m3_vl.md#cann-sparse-attention)
 for configuration, metadata formats, memory costs, and numerical validation.
 
+MiniMax's `model.accelerator.enable_async: true` separately enables forward
+projection/Ulysses overlap when `ulysses_size > 1`. It preserves both OpSlot
+interfaces and works with either eager or CANN MSA. Indexer exchanges start
+before the main projections, main exchanges launch as each Q/K/V becomes
+ready, and their waits occur after selection. See
+[projection and Ulysses overlap](../examples/minimax_m3_vl.md#projection-and-ulysses-overlap).
+
 ---
 
 ## Lifecycle Overview

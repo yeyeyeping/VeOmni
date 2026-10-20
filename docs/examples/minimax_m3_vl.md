@@ -148,6 +148,54 @@ attention outputs/QKV gradients, including GQA ratios 2 and 16. Those tests
 skip when hardware or the optional operator set is absent; CPU success alone
 does not establish vendor-kernel numerical agreement.
 
+## Projection and Ulysses Overlap
+
+Enable the MiniMax language forward pipeline with:
+
+```yaml
+model:
+  accelerator:
+    ulysses_size: 2
+    enable_async: true
+```
+
+The NPU example enables this option. It is active only when Ulysses size is
+greater than one; disabling `enable_async` retains the serial projection and
+communication path. All ranks must use the same setting.
+
+The asynchronous path starts the frozen Index K projection/Norm/RoPE and its
+all-gather first, then starts Index Q projection/Norm/RoPE and its head/sequence
+all-to-all. It subsequently runs each main Q/K/V projection and immediately
+launches that tensor's all-to-all. Main Q/K normalization and partial RoPE
+are applied locally before exchange, matching the serial math. The indexer
+waits occur after these projections. Main Q/K/V waits are deferred until
+after block selection, immediately before attention. This permits indexer
+communication to overlap main projections, main communication to overlap
+later projections, and pending main exchanges to overlap indexer selection.
+
+Tensor ownership is unchanged: each attention rank still holds the full
+sequence and its local head slice. Index Q is exchanged before selection,
+Index K is gathered, and block indices require no additional exchange. The
+single-head Index K uses one asynchronous equal-shard all-gather without a
+host shape exchange; VeOmni's packed SP padding guarantees equal local token
+counts.
+
+The pipeline invokes the original Linear and Norm modules, preserving their
+hooks, parameter gradients, and adapter behavior. A small autograd wrapper
+connects each deferred main exchange to its inverse all-to-all in backward,
+including KV-head repetition when Ulysses size exceeds the KV-head count.
+The indexer stays frozen and runs under `no_grad`. This schedules forward
+overlap; backward uses the inverse exchanges and normal projection autograd.
+
+Tests in `tests/models/test_minimax_m3_vl_ops.py` check projection/launch/wait
+ordering and partial RoPE, and compare serial versus asynchronous outputs,
+input gradients and projection/normalization parameter gradients with two
+processes. They cover sparse and dense layers, KV-head repetition, packed
+boundaries, SP tail padding and non-reentrant checkpointing. CPU/Gloo checks
+run without accelerators; NCCL/HCCL cases require two matching devices.
+Scheduling and numerical parity do not establish a speedup: confirm actual
+device overlap and exposed communication time with a target-device trace.
+
 MiniMax routed experts use the `moe_experts/swiglu_oai` operator variant. It preserves the model's clamped `(up + 1) * gate * sigmoid(alpha * gate)` activation while reusing VeOmni's standard EP token dispatch. Enable EP with `fused_triton` on GPU or `fused_npu` on NPU:
 
 ```yaml

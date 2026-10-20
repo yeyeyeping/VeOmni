@@ -14,10 +14,16 @@
 
 import copy
 import importlib
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from veomni.ops.kernels.minimax_sparse_attention import ulysses as msa_ulysses
+from veomni.utils.device import get_device_type, get_torch_device
 
 
 _MODELING_MODULES = (
@@ -434,3 +440,202 @@ def test_minimax_m3_vl_rms_norm_preserves_eager_fp32_semantics(module_name):
 
     assert output.dtype == hidden_states.dtype
     assert torch.equal(output, expected.to(hidden_states.dtype))
+
+
+@pytest.mark.parametrize("rotary_dim", [4, 8], ids=["partial", "full"])
+def test_minimax_async_single_projection_rotary_matches_upstream(rotary_dim):
+    modeling = importlib.import_module(_MODELING_MODULES[0])
+    torch.manual_seed(5)
+    q = torch.randn(1, 6, 4, 8, requires_grad=True)
+    cos, sin = torch.randn(1, 6, rotary_dim), torch.randn(1, 6, rotary_dim)
+    expected = modeling.apply_rotary_pos_emb(q, q, cos, sin, unsqueeze_dim=2)[0]
+    actual = msa_ulysses._rotary_one(q, (cos, sin))
+    grad = torch.randn_like(q)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual, q, grad)[0], torch.autograd.grad(expected, q, grad)[0], rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+@pytest.mark.parametrize("layer_type", ["minimax_m3_sparse", "full_attention"], ids=["sparse", "dense"])
+def test_minimax_async_projection_schedule_and_gradients(module_name, layer_type, monkeypatch):
+    """Check launch-before-projection and wait-after-selection, without claiming real overlap."""
+    modeling = importlib.import_module(module_name)
+    config = _text_config(modeling, layer_types=[layer_type], index_block_size=2, index_topk_blocks=2)
+    torch.manual_seed(11)
+    attention = modeling.MiniMaxM3VLAttention(config, layer_idx=0).eval()
+    reference = copy.deepcopy(attention)
+    state = SimpleNamespace(ulysses_enabled=True, async_enabled=False, ulysses_size=1, ulysses_group=object())
+    monkeypatch.setattr(modeling, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(modeling, "prepare_ulysses_qkv", lambda q, k, v, **kw: (q, k, v, q.shape[2]))
+    monkeypatch.setattr(modeling, "gather_seq_scatter_kv_heads", lambda x, **kw: x)
+    monkeypatch.setattr(modeling, "gather_outputs", lambda x, **kw: x)
+    monkeypatch.setattr(modeling, "restore_ulysses_output", lambda x, **kw: x)
+    hidden = torch.randn(1, 5, config.hidden_size, requires_grad=True)
+    expected_input = hidden.detach().clone().requires_grad_()
+    position_embeddings = (torch.randn(1, 5, 4), torch.randn(1, 5, 4))
+    kwargs = dict(
+        position_embeddings=position_embeddings,
+        attention_mask=None,
+        cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+        max_length_q=3,
+    )
+    expected = reference(expected_input, **kwargs)[0]
+    grad = torch.randn_like(expected)
+    expected.backward(grad)
+
+    events = []
+    labels = iter((["indexQ"] if attention.indexer is not None else []) + ["Q", "K", "V"])
+
+    def fake_a2a(tensor, *, async_op=False, **kw):
+        if not async_op:
+            events.append("inverse")
+            return tensor
+        label = next(labels)
+        events.append("launch " + label)
+
+        def wait():
+            events.append("wait " + label)
+            return tensor
+
+        return wait
+
+    def fake_gather(output, source, *, async_op, **kw):
+        assert async_op is True
+        assert not source.requires_grad
+        events.append("launch indexK")
+        output.copy_(source)
+
+        class Work:
+            def wait(self):
+                events.append("wait indexK")
+
+        return Work()
+
+    monkeypatch.setattr(msa_ulysses, "all_to_all_tensor", fake_a2a)
+    monkeypatch.setattr(msa_ulysses.dist, "all_gather_into_tensor", fake_gather)
+    for name, module in attention.named_modules():
+        if name in ("q_proj", "k_proj", "v_proj", "indexer.q_proj", "indexer.k_proj"):
+            module.register_forward_hook(lambda mod, args, out, label=name: events.append("project " + label))
+    eager_indexer = modeling.minimax_sparse_indexer_eager
+
+    def indexer(*args, **kw):
+        events.append("select")
+        return eager_indexer(*args, **kw)
+
+    monkeypatch.setattr(modeling, "minimax_sparse_indexer_eager", indexer)
+    state.async_enabled = True
+    actual = attention(hidden, **kwargs)[0]
+    actual.backward(grad)
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(hidden.grad, expected_input.grad, rtol=2e-5, atol=2e-5)
+    for name, parameter in attention.named_parameters():
+        other = dict(reference.named_parameters())[name]
+        if parameter.requires_grad:
+            torch.testing.assert_close(parameter.grad, other.grad, rtol=2e-5, atol=2e-5)
+        else:
+            assert parameter.grad is None
+    assert events.index("launch Q") < events.index("project k_proj")
+    assert events.index("launch K") < events.index("project v_proj")
+    assert events.count("inverse") == 3
+    if attention.indexer is not None:
+        assert events.index("launch indexK") < events.index("project indexer.q_proj")
+        assert events.index("launch indexQ") < events.index("project q_proj")
+        assert events.index("launch V") < events.index("wait indexQ") < events.index("select")
+        assert events.index("wait indexK") < events.index("select") < events.index("wait Q")
+    else:
+        assert "launch indexK" not in events and "select" not in events
+
+
+def _run_minimax_async_two_rank(rank, rendezvous, backend):
+    """Compare the actual collective path, input gradients and all projection/norm gradients."""
+    from torch.utils.checkpoint import checkpoint
+
+    device = torch.device("cpu")
+    if backend != "gloo":
+        get_torch_device().set_device(rank)
+        device = torch.device(f"{get_device_type()}:{rank}")
+    dist.init_process_group(backend, init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=90))
+    torch.set_num_threads(1)
+    try:
+        for module_name in _MODELING_MODULES:
+            modeling = importlib.import_module(module_name)
+            for kv_heads, layer_type, recompute in (
+                (2, "minimax_m3_sparse", False),
+                (1, "minimax_m3_sparse", True),
+                (1, "full_attention", False),
+            ):
+                torch.manual_seed(13)
+                dim = 4 if backend == "gloo" else 128
+                dtype = torch.float32 if backend == "gloo" else torch.bfloat16
+                config = _text_config(
+                    modeling,
+                    num_attention_heads=4,
+                    num_key_value_heads=kv_heads,
+                    index_n_heads=kv_heads,
+                    head_dim=dim,
+                    rotary_dim=dim,
+                    index_head_dim=dim,
+                    layer_types=[layer_type],
+                    index_block_size=2,
+                    index_topk_blocks=2,
+                )
+                serial = modeling.MiniMaxM3VLAttention(config, layer_idx=0).to(device=device, dtype=dtype)
+                asynchronous = copy.deepcopy(serial)
+                state = SimpleNamespace(
+                    ulysses_enabled=True, async_enabled=False, ulysses_size=2, ulysses_group=dist.group.WORLD
+                )
+                original_state = modeling.get_parallel_state
+                modeling.get_parallel_state = lambda current=state: current
+                try:
+                    full_input = torch.randn(1, 6, config.hidden_size).to(device=device, dtype=dtype)
+                    full_grad = torch.randn_like(full_input)
+                    local_input = full_input[:, rank * 3 : (rank + 1) * 3].detach()
+                    position_ids = torch.tensor([[0, 1, 2, 3, 0, 0]], device=device)[:, rank * 3 : (rank + 1) * 3]
+                    rotary = modeling.MiniMaxM3VLRotaryEmbedding(config).to(device)
+                    embeddings = rotary(local_input, position_ids)
+                    kwargs = dict(
+                        position_embeddings=embeddings,
+                        attention_mask=None,
+                        cu_seq_lens_q=torch.tensor([0, 4, 5, 6], dtype=torch.int32),
+                        max_length_q=4,
+                    )
+                    inputs = [local_input.clone().requires_grad_(), local_input.clone().requires_grad_()]
+                    outputs = []
+                    for enabled, attention, hidden in zip((False, True), (serial, asynchronous), inputs):
+                        state.async_enabled = enabled
+                        if recompute:
+                            output = checkpoint(
+                                lambda x, module=attention, call_kwargs=kwargs: module(x, **call_kwargs)[0],
+                                hidden,
+                                use_reentrant=False,
+                            )
+                        else:
+                            output = attention(hidden, **kwargs)[0]
+                        output.backward(full_grad[:, rank * 3 : (rank + 1) * 3])
+                        outputs.append(output.detach())
+                    tolerance = 2e-5 if backend == "gloo" else 2e-2
+                    torch.testing.assert_close(outputs[1], outputs[0], atol=tolerance, rtol=tolerance)
+                    torch.testing.assert_close(inputs[1].grad, inputs[0].grad, atol=tolerance, rtol=tolerance)
+                    for name, parameter in asynchronous.named_parameters():
+                        expected = dict(serial.named_parameters())[name]
+                        if parameter.requires_grad:
+                            torch.testing.assert_close(parameter.grad, expected.grad, atol=tolerance, rtol=tolerance)
+                        else:
+                            assert parameter.grad is None
+                finally:
+                    modeling.get_parallel_state = original_state
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "hccl"])
+def test_minimax_async_two_rank_forward_and_projection_gradients(tmp_path, backend):
+    if not dist.is_available() or not dist.is_backend_available(backend):
+        pytest.skip(f"{backend} is unavailable")
+    if backend != "gloo":
+        needed = "cuda" if backend == "nccl" else "npu"
+        if get_device_type() != needed or get_torch_device().device_count() < 2:
+            pytest.skip(f"Two {needed} devices required")
+    mp.spawn(_run_minimax_async_two_rank, args=((tmp_path / "rendezvous").as_uri(), backend), nprocs=2)

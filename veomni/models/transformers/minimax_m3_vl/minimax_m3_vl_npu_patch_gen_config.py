@@ -73,6 +73,7 @@ config.add_import(
     "veomni.ops.kernels.minimax_sparse_attention",
     names=["minimax_sparse_attention_eager", "minimax_sparse_indexer_eager"],
 )
+config.add_import("veomni.ops.kernels.minimax_sparse_attention.ulysses", names=["start_minimax_ulysses_projections"])
 config.add_import("veomni.models.transformers.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
 config.add_post_import_block(

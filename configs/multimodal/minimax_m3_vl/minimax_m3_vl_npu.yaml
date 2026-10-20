@@ -14,6 +14,7 @@ model:
       enable_reentrant: false
     init_device: meta
     ulysses_size: 2
+    enable_async: true
     ep_size: 2
     fsdp_config:
       fsdp_mode: fsdp2
