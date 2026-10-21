@@ -81,7 +81,7 @@ must be exported directly under `cann_ops_transformer.ops`:
 | Function | Use |
 |---|---|
 | `msa_index_score` | Index Q/K to FP32 block scores |
-| `build_k2q_csr` | Upstream PyTorch helper: Q-to-KV-block selections to interleaved KV-to-Q CSR |
+| `k2q_csr` | Native AscendC pipeline: selections to interleaved KV-to-Q CSR with ascending Q IDs |
 | `npu_minimax_sparse_attention_split_kv` | Forward attention output and global FP32 LSE |
 | `generic_block_sparse_attention_grad_metadata` | Backward task metadata |
 | `generic_block_sparse_attention_grad` | Q/K/V gradients |
@@ -92,22 +92,28 @@ These signatures follow the ops-transformer wrappers analyzed at commit
 the installed extension package. VeOmni does not import `custom_ops`, fall
 back to another namespace, or bundle those vendor kernels.
 
-`build_k2q_csr` comes from
-`experimental/attention/minimax_sparse_attention_split_kv/torch_ops_extension/custom_ops/minimax_sparse_attention_split_kv_csr.py`.
-Install that directory's `torch_ops_extension` package and the regular CANN
-MSA/GBSA extensions first. Then install VeOmni's metadata-only bridge from
-the repository root, into the same Python environment:
+`k2q_csr` comes from `experimental/attention/minimax_build_k2q_csr`; install
+both its CANN operator libraries and its Torch extension, exporting
+`k2q_csr` under `cann_ops_transformer.ops`. Build the extension from the
+ops-transformer repository root with
+`bash build.sh --torch_extension --experimental --ops=minimax_build_k2q_csr --vendor_name=minimax_csr`,
+then install the resulting `build_out/cann_ops_transformer_minimax_csr-*.whl`
+alongside the regular `cann_ops_transformer` package. The operator's
+`torch_extension/` directory is not a standalone pip project.
+The Split-KV extension comes from
+`experimental/attention/minimax_sparse_attention_split_kv/torch_ops_extension`.
+Install it and the regular MSA/GBSA extensions, then install VeOmni's
+metadata-only bridge from the repository root, into the same Python environment:
 
 ```bash
-python -m pip install --no-build-isolation --no-deps ./scripts/kernel/minimax_cann_bridge
+python -m pip install --upgrade --no-build-isolation --no-deps ./scripts/kernel/minimax_cann_bridge
 ```
 
-The bridge exports `custom_ops:build_k2q_csr` and
-`custom_ops:npu_minimax_sparse_attention_split_kv` via the
+The bridge exports `custom_ops:npu_minimax_sparse_attention_split_kv` via the
 `cann_ops_transformer.ops` entry-point group. It does not compile or install
 the operator libraries. Restart Python after installation so the CANN loader
 discovers the entries. The separate native `minimax_build_k2q_csr` extension
-is no longer required by this backend.
+is required; the Python `build_k2q_csr` helper is not used by this backend.
 
 The indexer calls `msa_index_score` with `layout_key="TND"`,
 `sparse_mode=3`, no block table or dequantization scale, an int8
@@ -121,17 +127,18 @@ slots are filled with `-1`.
 
 The indexer guarantees unique causal block IDs with trailing `-1` slots.
 The attention Function consumes that contract directly, without repeating
-filtering, sorting or deduplication. `build_k2q_csr` receives `[Hkv,T,K]`
-selections, per-sequence int32 lengths (not prefix sums),
-`index_mode="batch_local"`, and `input_layout="TND"`. It emits interleaved
-KV-block rows and global packed Q IDs. Split-KV consumes the same lengths and
+filtering, sorting or deduplication. `k2q_csr` receives `[Hkv,T,K]`
+selections, int32 Q prefix sums and int32 KV-block-count prefix sums. It uses
+`order_method=1`, `q_global_offset=True`, and `use_simt=False` to emit interleaved
+KV-block rows with ascending global packed Q IDs. Split-KV consumes per-sequence
+int32 lengths (not prefix sums) and
 continuous TND Q/K/V, runs with `inner_precise=0`, and returns output plus
 `softmax_lse_flag=True`. Backward reuses the saved Q/K/V/output/LSE, CSR row
 pointers and Q IDs. It maps rows back to batch/block order, subtracts each
-sequence's Q offset, and sorts local-query lists of shape `[B,Hkv,J,Smax]`, then
+sequence's Q offset, and pads local-query lists to `[B,Hkv,J,Smax]`, then
 calls metadata and GBSA Grad with `block_shape=[1,128]`, causal mask mode 1,
-softmax precision 0, and the original model softmax scale. This sorting is
-necessary because the helper does not guarantee Q order within each CSR row.
+softmax precision 0, and the original model softmax scale. Backward does not
+sort: it relies on ascending Q order from the native CSR MC implementation.
 The model supplies packed prefix sums; GBSA receives their int64 device copy.
 CSR slot IDs are only needed by forward and are not saved for backward.
 The frozen indexer receives no gradients; double backward is not supported.
@@ -149,15 +156,17 @@ in the model, outside these two OpSlots; context parallelism remains unsupported
 This backend still has material memory costs. Split-KV's FP32 output partials
 scale as `T * Hq_local * K * D * 4` bytes, and backward query lists require
 `B * Hkv_local * ceil(Smax/128) * Smax * 4` bytes, plus conversion temporaries.
-The adapter uses the supplied Python `max_seqlen` and device prefix sums,
-without `.cpu()`, `.item()` or `.tolist()` reads. Its per-indexer and
-per-attention host layout copies have been removed. GBSA's sequence-capacity
-bound is clamped to the total packed token count, as required by its TND
-tiling checks. However, the checked
-upstream CSR helper still calls `meta.tolist()`, and the index-score TND
-extension calls `kv_len.cpu()` for output allocation. This is not a
-synchronization-free pipeline. The Python helper also sorts edges; replacing
-the native CSR builder is not a throughput guarantee. Backward saves
+The adapter uses the supplied Python `max_seqlen` and prefix sums without
+copying device metadata to the host. When prefix sums are on CPU, it computes
+`total_rows` and `max_kv` there; for one packed sequence these sizes can also
+be derived from the token shape. Otherwise it leaves both sizes unset, and
+the native CSR wrapper reads the device block-prefix sums once to infer them.
+GBSA's sequence-capacity bound is clamped to the total packed token count,
+as required by its TND tiling checks. The index-score TND extension also
+calls `kv_len.cpu()` for output allocation, so this is not a synchronization-free
+pipeline. Switching to native CSR removes the Python helper's edge sort and
+the adapter's backward sort, but the GBSA rectangular output and gather
+temporaries remain. Backward saves
 `Hkv * (total_kv_rows + 1)` int32 row pointers in addition to the
 `Hkv * T * K` int32 Q IDs that replace saved block selections. Measure the
 complete pipeline and workspace before increasing sequence length.
@@ -170,8 +179,9 @@ pytest -v tests/ops/test_minimax_sparse_attention.py -k cann
 
 CPU contract tests check finite invalid fill, TopK, interleaved CSR, sorted
 batch-local backward lists, and autograd wiring against eager math. Actual
-NPU numerical tests separately compare block scores and fixed-selection
-attention outputs/QKV gradients, including GQA ratios 2 and 16. Those tests
+NPU tests separately check exact native CSR Q/slot order, block scores, and
+fixed-selection attention outputs/QKV gradients, including GQA ratios 2 and 16
+and both CPU and NPU prefix sums. Those tests
 skip when hardware or the optional operator set is absent; CPU success alone
 does not establish vendor-kernel numerical agreement.
 

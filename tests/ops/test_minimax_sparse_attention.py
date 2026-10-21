@@ -379,15 +379,16 @@ class _FakeMSACannOps:
         scores = _index_scores(kwargs["query"], kwargs["key"], kwargs["actual_seq_qlen"].diff().tolist())
         return scores.masked_fill(torch.isneginf(scores), torch.finfo(torch.float32).min)
 
-    def build_k2q_csr(self, *, select_idx, actual_seq_lengths, actual_seq_lengths_kv, **kwargs):
+    def k2q_csr(self, q2k, cu, cu_blocks, *, order_method, total_rows=None, max_kv=None, use_simt, q_global_offset):
         self.calls.append("csr")
-        assert kwargs == dict(block_size=128, index_mode="batch_local", input_layout="TND")
-        q2k = select_idx
-        assert q2k.dtype == actual_seq_lengths.dtype == actual_seq_lengths_kv.dtype == torch.int32
-        torch.testing.assert_close(actual_seq_lengths, actual_seq_lengths_kv)
-        lengths = actual_seq_lengths.tolist()
-        cu = F.pad(actual_seq_lengths.cumsum(0), (1, 0))
+        assert order_method == 1 and q_global_offset is True and use_simt is False
+        assert q2k.dtype == cu.dtype == cu_blocks.dtype == torch.int32
+        lengths = cu.diff().tolist()
         counts = [(length + 127) // 128 for length in lengths]
+        assert cu_blocks.tolist() == [0] + torch.tensor(counts).cumsum(0).tolist()
+        assert total_rows is None or total_rows == sum(counts)
+        assert max_kv is None or max_kv == max(counts)
+        self.csr_sizes = (total_rows, max_kv)
         self.rows = [(b, j) for j in range(max(counts)) for b, count in enumerate(counts) if j < count]
         self.q2k = q2k
         heads, total, budget = q2k.shape
@@ -397,13 +398,10 @@ class _FakeMSACannOps:
         for h in range(heads):
             edges = []
             for row, (b, block) in enumerate(self.rows):
-                row_edges = []
                 for query in range(int(cu[b]), int(cu[b + 1])):
                     for slot in range(budget):
                         if q2k[h, query, slot] == block:
-                            row_edges.append((query, slot))
-                # The upstream helper makes no intra-row ordering guarantee.
-                edges.extend(reversed(row_edges))
+                            edges.append((query, slot))
                 ptr[h, row + 1] = len(edges)
             if edges:
                 queries[h, : len(edges)], slots[h, : len(edges)] = torch.tensor(edges, dtype=torch.int32).T
@@ -515,7 +513,7 @@ def test_cann_indexer_adapter_matches_eager_and_handles_finite_invalid_fill(
 
 @pytest.mark.parametrize("lengths", [(129, 257, 1), (0, 129, 0, 257, 1, 0), (1,), (128,)])
 @pytest.mark.parametrize("max_seqlen_padding", [0, 256])
-def test_cann_csr_to_gbsa_preserves_edges_without_host_reads(monkeypatch, lengths, max_seqlen_padding):
+def test_cann_csr_to_gbsa_preserves_edges_without_host_reads_or_sort(monkeypatch, lengths, max_seqlen_padding):
     torch.manual_seed(29)
     max_seqlen = max(lengths) + max_seqlen_padding
     blocks = (max_seqlen + 127) // 128
@@ -526,18 +524,18 @@ def test_cann_csr_to_gbsa_preserves_edges_without_host_reads(monkeypatch, length
     # Include a head with no edges and repeated row pointers.
     selected[:, 1] = -1
     fake = _FakeMSACannOps()
-    ptr, queries, _ = fake.build_k2q_csr(
-        select_idx=selected.permute(1, 0, 2).contiguous(),
-        actual_seq_lengths=torch.tensor(lengths, dtype=torch.int32),
-        actual_seq_lengths_kv=torch.tensor(lengths, dtype=torch.int32),
-        block_size=128,
-        index_mode="batch_local",
-        input_layout="TND",
-    )
     cu = _cu_seqlens(lengths)
+    cu_blocks = F.pad(((cu.diff() + 127) // 128).cumsum(0, dtype=torch.int32), (1, 0))
+    ptr, queries, _ = fake.k2q_csr(
+        selected.permute(1, 0, 2).contiguous(), cu, cu_blocks, order_method=1, use_simt=False, q_global_offset=True
+    )
     with monkeypatch.context() as guard:
-        for name in ("cpu", "item", "tolist"):
-            guard.setattr(torch.Tensor, name, lambda *a, **kw: pytest.fail("CSR conversion must stay on device"))
+        for name in ("cpu", "item", "tolist", "sort", "argsort"):
+            guard.setattr(
+                torch.Tensor, name, lambda *a, **kw: pytest.fail("CSR conversion must not read back or sort")
+            )
+        for name in ("sort", "argsort"):
+            guard.setattr(torch, name, lambda *a, **kw: pytest.fail("CSR conversion must not sort"))
         idx, counts = msa_npu._csr_to_gbsa(ptr, queries, cu, max_seqlen)
     assert idx.shape == (len(lengths), 2, blocks, max_seqlen)
     assert idx.dtype == counts.dtype == torch.int32
@@ -571,6 +569,8 @@ def test_cann_split_kv_gbsa_autograd_matches_eager_through_both_index_formats(
     _install_fake_cann_ops(monkeypatch, fake)
     actual = msa_npu._SplitKVGBSA.apply(*inputs, selected, cu, max(lengths) + max_seqlen_padding, 0.17)
     torch.testing.assert_close(fake.q2k, selected.permute(1, 0, 2))
+    block_counts = [(length + 127) // 128 for length in lengths]
+    assert fake.csr_sizes == (sum(block_counts), max(block_counts))
     reference_inputs = [tensor.detach().clone().requires_grad_() for tensor in inputs]
     expected = minimax_sparse_attention_eager(
         *reference_inputs, selected, cu, max(lengths), block_size=128, scale=0.17
@@ -635,14 +635,40 @@ def test_cann_registry_binds_both_slots_and_gates_hardware(monkeypatch):
 
 
 @pytest.mark.skipif(not is_torch_npu_available(), reason="Requires Ascend NPU")
+@pytest.mark.parametrize("lengths", [(1025,), (0, 129, 257, 0, 513, 1)], ids=["single", "packed"])
+def test_cann_native_csr_matches_sorted_reference(lengths):
+    ops = pytest.importorskip("cann_ops_transformer.ops")
+    if not callable(getattr(ops, "k2q_csr", None)):
+        pytest.skip("The native CANN k2q_csr extension is not installed")
+    torch.manual_seed(43)
+    blocks = (max(lengths) + 127) // 128
+    selected = torch.rand(2, sum(lengths), blocks).topk(min(4, blocks), dim=-1).indices.to(torch.int32)
+    positions = torch.cat([torch.arange(length) for length in lengths])
+    selected.masked_fill_(selected > positions[None, :, None] // 128, -1)
+    selected[1] = -1
+    cu = _cu_seqlens(lengths)
+    counts = (cu.diff() + 127) // 128
+    cu_blocks = F.pad(counts.cumsum(0, dtype=torch.int32), (1, 0))
+    kwargs = dict(order_method=1, use_simt=False, q_global_offset=True)
+    expected = _FakeMSACannOps().k2q_csr(selected, cu, cu_blocks, **kwargs)
+    inputs = [tensor.to("npu") for tensor in (selected, cu, cu_blocks)]
+    for sizes in ({}, dict(total_rows=int(cu_blocks[-1]), max_kv=int(counts.max()))):
+        actual = ops.k2q_csr(*inputs, **kwargs, **sizes)
+        # Exact Q/slot order is required: backward now consumes rows without sorting.
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result.cpu(), reference)
+
+
+@pytest.mark.skipif(not is_torch_npu_available(), reason="Requires Ascend NPU")
+@pytest.mark.parametrize("cu_device", ["cpu", "npu"])
 @pytest.mark.parametrize("heads", [4, 32], ids=["gqa2", "gqa16"])
 @pytest.mark.parametrize(
     ("lengths", "max_seqlen_padding"), [((129, 257, 1), 0), ((128,), 128)], ids=["packed", "padded_bound"]
 )
-def test_cann_split_kv_gbsa_numerical_forward_and_backward(heads, lengths, max_seqlen_padding):
+def test_cann_split_kv_gbsa_numerical_forward_and_backward(heads, lengths, max_seqlen_padding, cu_device):
     ops = pytest.importorskip("cann_ops_transformer.ops")
     required = (
-        "build_k2q_csr",
+        "k2q_csr",
         "npu_minimax_sparse_attention_split_kv",
         "generic_block_sparse_attention_grad_metadata",
         "generic_block_sparse_attention_grad",
@@ -664,7 +690,12 @@ def test_cann_split_kv_gbsa_numerical_forward_and_backward(heads, lengths, max_s
     )
     expected = minimax_sparse_attention_eager(*cpu_inputs, selected, cu, max(lengths), block_size=128, scale=0.11)
     actual = msa_npu.minimax_sparse_attention_npu(
-        *npu_inputs, selected.to("npu"), cu, max(lengths) + max_seqlen_padding, block_size=128, scale=0.11
+        *npu_inputs,
+        selected.to("npu"),
+        cu.to(cu_device),
+        max(lengths) + max_seqlen_padding,
+        block_size=128,
+        scale=0.11,
     )
     grad = torch.randn_like(expected).to(torch.bfloat16).float()
     expected_grads = torch.autograd.grad(expected, cpu_inputs, grad)

@@ -82,7 +82,7 @@ def minimax_sparse_indexer_npu(index_q, index_k, cu_seqlens, max_seqlen, *, bloc
 
 
 def _csr_to_gbsa(row_ptr, q_indices, cu_seqlens, max_seqlen):
-    """Expand interleaved CSR into sorted batch-local BNKQ lists on device."""
+    """Expand Q-sorted interleaved CSR into batch-local BNKQ lists on device."""
     batch = cu_seqlens.numel() - 1
     heads = row_ptr.shape[0]
     blocks = (max_seqlen + _BLOCK_SIZE - 1) // _BLOCK_SIZE
@@ -100,9 +100,8 @@ def _csr_to_gbsa(row_ptr, q_indices, cu_seqlens, max_seqlen):
         offsets = (starts[:, :, None].long() + slots).clamp(max=q_indices.shape[1] - 1)
         queries = q_indices.gather(1, offsets.flatten(1)).view(heads, blocks, max_seqlen) - cu_seqlens[b]
         valid = slots < counts[b, :, :, None]
-        # Upstream build_k2q_csr does not guarantee ascending Q IDs within a row.
-        ordered = queries.masked_fill(~valid, max_seqlen).sort(dim=-1).values
-        idx[b] = ordered.masked_fill(ordered == max_seqlen, -1)
+        # Native k2q_csr's MC path already writes ascending Q IDs within each row.
+        idx[b] = queries.masked_fill(~valid, -1)
     return idx, counts
 
 
@@ -114,14 +113,24 @@ class _SplitKVGBSA(torch.autograd.Function):
         q, k, v = (tensor.contiguous() for tensor in (q, k, v))
         cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
         lengths = cu.diff()
+        block_counts = (cu_seqlens.diff() + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+        cu_blocks = F.pad(block_counts.cumsum(0, dtype=torch.int32), (1, 0))
+        # Use known host/shape metadata; otherwise the native wrapper infers sizes.
+        total_rows = max_kv = None
+        if cu_seqlens.device.type == "cpu":
+            total_rows, max_kv = int(cu_blocks[-1]), int(block_counts.max())
+        elif cu_seqlens.numel() == 2:
+            total_rows = max_kv = (q.shape[0] + _BLOCK_SIZE - 1) // _BLOCK_SIZE
         # The indexer owns uniqueness, causality and -1 padding of selections.
-        row_ptr, q_idx, slot_idx = ops.build_k2q_csr(
-            select_idx=block_indices.permute(1, 0, 2).contiguous(),
-            actual_seq_lengths=lengths,
-            actual_seq_lengths_kv=lengths,
-            block_size=_BLOCK_SIZE,
-            index_mode="batch_local",
-            input_layout="TND",
+        row_ptr, q_idx, slot_idx = ops.k2q_csr(
+            block_indices.permute(1, 0, 2).contiguous(),
+            cu,
+            cu_blocks.to(device=q.device),
+            order_method=1,
+            total_rows=total_rows,
+            max_kv=max_kv,
+            use_simt=False,
+            q_global_offset=True,
         )
         out, lse = ops.npu_minimax_sparse_attention_split_kv(
             query=q,
