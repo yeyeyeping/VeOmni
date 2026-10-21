@@ -502,10 +502,9 @@ def test_models_patch_fwd_bwd(
 
     # Upstream MiniMax M3 VL supports neither Flash Attention
     # (``_supports_flash_attn = False``) nor packed sequences, so the HF
-    # reference runs eager attention. VeOmni's language attention always goes
-    # through the packed MiniMax sparse attention operators regardless of
-    # ``attn_implementation`` (which only selects the ViT backend), so the
-    # default VeOmni mode grid still applies.
+    # reference runs eager attention. VeOmni's sparse layers use MiniMax ops,
+    # while dense language layers and ViT use the configured FlashAttention
+    # backend, so the default VeOmni mode grid still applies.
     if case_id == "minimax_m3_vl":
         hf_model_modes = [ModelMode("hf", "eager")]
 

@@ -78,6 +78,7 @@ config.add_import(
     "veomni.ops.kernels.attention.ulysses",
     names=["gather_seq_scatter_kv_heads", "prepare_ulysses_qkv", "restore_ulysses_output"],
 )
+config.add_import("veomni.ops.kernels.attention", names=["flash_attention_forward"])
 config.add_import(
     "veomni.ops.kernels.minimax_sparse_attention",
     names=["minimax_sparse_attention_eager", "minimax_sparse_indexer_eager"],
@@ -98,7 +99,7 @@ veomni_msa_attention = OpSlot("minimax_sparse_attention", "attention")
 
 @config.replace_class(
     "MiniMaxM3VLPreTrainedModel",
-    description="Allow VeOmni flash-attention implementations for the config-driven vision tower",
+    description="Allow VeOmni FlashAttention for vision and dense language layers",
 )
 class PatchedMiniMaxM3VLPreTrainedModel(PreTrainedModel):
     config: MiniMaxM3VLConfig | MiniMaxM3VLTextConfig
@@ -273,15 +274,14 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
 # 3. run block selection and attention through the TND MiniMax sparse
 #    attention operators (``minimax_sparse_attention`` OpSlots, eager by
 #    default); any padded layout they need stays inside them
-# 4. keep language attention independent from the generic ViT-controlled
-#    ``attn_implementation`` configuration; attention masks and KV cache are
-#    rejected upstream in the text model, so this is the only path
+# 4. send layers without an indexer directly to configured FlashAttention;
+#    skip its Ulysses exchange because Q/K/V have already been exchanged
 # 5. when async Ulysses is enabled, launch indexer and main Q/K/V exchanges
 #    between projections and defer main waits until after block selection
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLAttention.forward",
-    description="Run packed MiniMax language attention through the TND sparse attention operators",
+    description="Use packed sparse attention for indexed layers and FlashAttention for dense layers",
 )
 def minimax_m3_vl_attention_forward_patched(
     self,
@@ -345,10 +345,8 @@ def minimax_m3_vl_attention_forward_patched(
     # with identical query/key boundaries.
     cu_seqlens = kwargs["cu_seq_lens_q"]
     max_seqlen = kwargs["max_length_q"]
-    msa_indexer = veomni_msa_indexer if veomni_msa_indexer.use_non_eager_impl else minimax_sparse_indexer_eager
-    msa_attention = veomni_msa_attention if veomni_msa_attention.use_non_eager_impl else minimax_sparse_attention_eager
-    block_indices = None
     if self.indexer is not None:
+        msa_indexer = veomni_msa_indexer if veomni_msa_indexer.use_non_eager_impl else minimax_sparse_indexer_eager
         block_indices = msa_indexer(
             index_query[0],
             index_key[0],
@@ -362,17 +360,41 @@ def minimax_m3_vl_attention_forward_patched(
     if async_ulysses:
         query_states, key_states, value_states = (collect() for collect in main_collectors)
     # --- Patch.5 ---
-    attn_output = msa_attention(
-        query_states[0],
-        key_states[0],
-        value_states[0],
-        block_indices,
-        cu_seqlens,
-        max_seqlen,
-        block_size=self.indexer.block_size if self.indexer is not None else None,
-        scale=self.scaling,
-        dropout_p=0.0 if not self.training else self.attention_dropout,
-    ).unsqueeze(0)
+    dropout = self.attention_dropout if self.training else 0.0
+    # --- Patch.4 ---
+    if self.indexer is None:
+        # NPU FA consumes host prefix sums; GPU FA consumes device prefix sums.
+        fa_cu_seqlens = cu_seqlens if IS_NPU_AVAILABLE else cu_seqlens.to(query_states.device)
+        attn_output, _ = flash_attention_forward(
+            self,
+            query_states.transpose(1, 2),
+            key_states.transpose(1, 2),
+            value_states.transpose(1, 2),
+            attention_mask=None,
+            dropout=dropout,
+            scaling=self.scaling,
+            skip_ulysses=True,
+            cu_seq_lens_q=fa_cu_seqlens,
+            cu_seq_lens_k=fa_cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+        )
+    else:
+        # --- Patch.4 ---
+        msa_attention = (
+            veomni_msa_attention if veomni_msa_attention.use_non_eager_impl else minimax_sparse_attention_eager
+        )
+        attn_output = msa_attention(
+            query_states[0],
+            key_states[0],
+            value_states[0],
+            block_indices,
+            cu_seqlens,
+            max_seqlen,
+            block_size=self.indexer.block_size,
+            scale=self.scaling,
+            dropout_p=dropout,
+        ).unsqueeze(0)
 
     if parallel_state.ulysses_enabled:
         attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)

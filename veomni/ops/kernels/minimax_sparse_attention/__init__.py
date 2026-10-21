@@ -41,7 +41,9 @@ MiniMax generated modeling declares ``OpSlot("minimax_sparse_attention",
 back to the eager functions below when a slot is bound to ``eager``. On Ascend
 NPU, ``npu_split_kv_gbsa`` replaces both slots with CANN operators exported by
 ``cann_ops_transformer.ops``. Its attention uses split-KV forward and GBSA
-backward; dense layers and nonzero attention dropout retain the eager path.
+backward; nonzero attention dropout retains the eager path. Dense model layers
+bypass these slots and call FlashAttention directly. Standalone calls with
+``block_indices=None`` still use the dense eager reference.
 """
 
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec

@@ -21,7 +21,9 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 
+from veomni.ops.kernels.attention import flash as flash_attention
 from veomni.ops.kernels.minimax_sparse_attention import ulysses as msa_ulysses
 from veomni.utils.device import get_device_type, get_torch_device
 
@@ -30,6 +32,31 @@ _MODELING_MODULES = (
     "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu",
     "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_npu",
 )
+
+
+def _reference_varlen_flash(q, k, v, attention_mask, **kwargs):
+    """CPU stand-in for the low-level FA call; retain the real VeOmni FA adapter."""
+    assert attention_mask is None
+    assert kwargs["query_length"] == q.shape[1]
+    assert kwargs["is_causal"] is True
+    assert kwargs["attn_implementation"] == "flash_attention_2"
+    cu = kwargs["cu_seq_lens_q"]
+    torch.testing.assert_close(cu, kwargs["cu_seq_lens_k"])
+    assert cu.dtype == torch.int32
+    assert kwargs["max_length_q"] == kwargs["max_length_k"] >= int(cu.diff().max())
+    outputs = []
+    for start, end in zip(cu[:-1].tolist(), cu[1:].tolist()):
+        output = F.scaled_dot_product_attention(
+            q[:, start:end].transpose(1, 2),
+            k[:, start:end].transpose(1, 2),
+            v[:, start:end].transpose(1, 2),
+            is_causal=True,
+            scale=kwargs["softmax_scale"],
+            dropout_p=kwargs["dropout"],
+            enable_gqa=True,
+        )
+        outputs.append(output.transpose(1, 2))
+    return torch.cat(outputs, dim=1)
 
 
 def _upstream_text_model(model):
@@ -83,13 +110,33 @@ def _single_layer_sparse_text_model(modeling):
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize("layer_type", ["minimax_m3_sparse", "full_attention"], ids=["sparse", "full"])
-def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, layer_type):
+def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, layer_type, monkeypatch):
     """Packed samples match the upstream model run per sample, in forward and backward."""
     modeling = importlib.import_module(module_name)
     model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=[layer_type])).eval()
     reference = _upstream_text_model(model)
-    # The shared config selects the ViT backend only; language attention must ignore it.
+    # Dense layers use the configured FA backend; sparse layers keep their MSA dispatch.
     model.config._attn_implementation = "veomni_flash_attention_2_with_sp"
+    flash_calls = []
+
+    def record_flash(*args, **kwargs):
+        flash_calls.append(kwargs)
+        return _reference_varlen_flash(*args, **kwargs)
+
+    monkeypatch.setattr(flash_attention, "_flash_attention_forward", record_flash)
+    if layer_type == "full_attention":
+
+        def reject_sparse(*args, **kwargs):
+            pytest.fail("Dense layers must bypass both MiniMax sparse OpSlots and eager sparse adapters")
+
+        reject_sparse.use_non_eager_impl = True
+        for name in (
+            "veomni_msa_indexer",
+            "veomni_msa_attention",
+            "minimax_sparse_indexer_eager",
+            "minimax_sparse_attention_eager",
+        ):
+            monkeypatch.setattr(modeling, name, reject_sparse)
     hidden_size = model.config.hidden_size
     first = torch.randn(1, 2, hidden_size, requires_grad=True)
     second = torch.randn(1, 3, hidden_size, requires_grad=True)
@@ -122,6 +169,42 @@ def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, la
     (packed_grad,) = torch.autograd.grad(actual.square().sum(), packed)
     first_grad, second_grad = torch.autograd.grad(expected.square().sum(), (first, second))
     torch.testing.assert_close(packed_grad, torch.cat((first_grad, second_grad), dim=1))
+    assert len(flash_calls) == int(layer_type == "full_attention")
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_minimax_dense_flash_forward_and_backward_on_device(module_name, device_type, monkeypatch):
+    """Run the real dense FA backend against a per-sequence CPU attention reference."""
+    if get_device_type() != device_type or not get_torch_device().is_available():
+        pytest.skip(f"Requires {device_type}")
+    modeling = importlib.import_module(module_name)
+    config = _text_config(modeling, layer_types=["full_attention"], head_dim=128, rotary_dim=64)
+    config._attn_implementation = "veomni_flash_attention_2_with_sp"
+    torch.manual_seed(23)
+    actual_layer = modeling.MiniMaxM3VLAttention(config, layer_idx=0).to(device_type, torch.bfloat16).eval()
+    reference_layer = copy.deepcopy(actual_layer).to(device="cpu", dtype=torch.float32)
+    actual_layer.scaling = reference_layer.scaling = 0.17
+    hidden = torch.randn(1, 7, config.hidden_size).to(torch.bfloat16)
+    actual_input = hidden.to(device_type).requires_grad_()
+    reference_input = hidden.float().requires_grad_()
+    embeddings = tuple(torch.randn(1, 7, 64).to(torch.bfloat16) for _ in range(2))
+    kwargs = dict(attention_mask=None, cu_seq_lens_q=torch.tensor([0, 3, 7], dtype=torch.int32), max_length_q=4)
+    actual = actual_layer(actual_input, position_embeddings=tuple(t.to(device_type) for t in embeddings), **kwargs)[0]
+    grad = torch.randn_like(hidden)
+    actual.backward(grad.to(device_type))
+    with monkeypatch.context() as reference_context:
+        reference_context.setattr(flash_attention, "_flash_attention_forward", _reference_varlen_flash)
+        expected = reference_layer(
+            reference_input, position_embeddings=tuple(t.float() for t in embeddings), **kwargs
+        )[0]
+        expected.backward(grad.float())
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(actual_input.grad.float().cpu(), reference_input.grad, atol=3e-2, rtol=3e-2)
+    for name, parameter in actual_layer.named_parameters():
+        torch.testing.assert_close(
+            parameter.grad.float().cpu(), dict(reference_layer.named_parameters())[name].grad, atol=3e-2, rtol=3e-2
+        )
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
@@ -465,9 +548,18 @@ def test_minimax_async_projection_schedule_and_gradients(module_name, layer_type
     config = _text_config(modeling, layer_types=[layer_type], index_block_size=2, index_topk_blocks=2)
     torch.manual_seed(11)
     attention = modeling.MiniMaxM3VLAttention(config, layer_idx=0).eval()
+    attention.config._attn_implementation = "veomni_flash_attention_2_with_sp"
     reference = copy.deepcopy(attention)
     state = SimpleNamespace(ulysses_enabled=True, async_enabled=False, ulysses_size=1, ulysses_group=object())
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_attention, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_attention, "_flash_attention_forward", _reference_varlen_flash)
+
+    def reject_extra_exchange(*args, **kwargs):
+        pytest.fail("Dense FA must not repeat the model's Ulysses exchanges")
+
+    monkeypatch.setattr(flash_attention, "prepare_ulysses_qkv", reject_extra_exchange)
+    monkeypatch.setattr(flash_attention, "restore_ulysses_output", reject_extra_exchange)
     monkeypatch.setattr(modeling, "prepare_ulysses_qkv", lambda q, k, v, **kw: (q, k, v, q.shape[2]))
     monkeypatch.setattr(modeling, "gather_seq_scatter_kv_heads", lambda x, **kw: x)
     monkeypatch.setattr(modeling, "gather_outputs", lambda x, **kw: x)
@@ -525,6 +617,13 @@ def test_minimax_async_projection_schedule_and_gradients(module_name, layer_type
         return eager_indexer(*args, **kw)
 
     monkeypatch.setattr(modeling, "minimax_sparse_indexer_eager", indexer)
+    if layer_type == "full_attention":
+
+        def record_flash(*args, **kw):
+            events.append("dense FA")
+            return _reference_varlen_flash(*args, **kw)
+
+        monkeypatch.setattr(flash_attention, "_flash_attention_forward", record_flash)
     state.async_enabled = True
     actual = attention(hidden, **kwargs)[0]
     actual.backward(grad)
@@ -546,6 +645,7 @@ def test_minimax_async_projection_schedule_and_gradients(module_name, layer_type
         assert events.index("wait indexK") < events.index("select") < events.index("wait Q")
     else:
         assert "launch indexK" not in events and "select" not in events
+        assert events.index("wait V") < events.index("dense FA")
 
 
 def _run_minimax_async_two_rank(rank, rendezvous, backend):
@@ -558,6 +658,9 @@ def _run_minimax_async_two_rank(rank, rendezvous, backend):
         device = torch.device(f"{get_device_type()}:{rank}")
     dist.init_process_group(backend, init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=90))
     torch.set_num_threads(1)
+    original_flash = flash_attention._flash_attention_forward
+    if backend == "gloo":
+        flash_attention._flash_attention_forward = _reference_varlen_flash
     try:
         for module_name in _MODELING_MODULES:
             modeling = importlib.import_module(module_name)
@@ -581,13 +684,16 @@ def _run_minimax_async_two_rank(rank, rendezvous, backend):
                     index_block_size=2,
                     index_topk_blocks=2,
                 )
+                config._attn_implementation = "veomni_flash_attention_2_with_sp"
                 serial = modeling.MiniMaxM3VLAttention(config, layer_idx=0).to(device=device, dtype=dtype)
                 asynchronous = copy.deepcopy(serial)
                 state = SimpleNamespace(
                     ulysses_enabled=True, async_enabled=False, ulysses_size=2, ulysses_group=dist.group.WORLD
                 )
                 original_state = modeling.get_parallel_state
+                original_flash_state = flash_attention.get_parallel_state
                 modeling.get_parallel_state = lambda current=state: current
+                flash_attention.get_parallel_state = lambda current=state: current
                 try:
                     full_input = torch.randn(1, 6, config.hidden_size).to(device=device, dtype=dtype)
                     full_grad = torch.randn_like(full_input)
@@ -626,7 +732,9 @@ def _run_minimax_async_two_rank(rank, rendezvous, backend):
                             assert parameter.grad is None
                 finally:
                     modeling.get_parallel_state = original_state
+                    flash_attention.get_parallel_state = original_flash_state
     finally:
+        flash_attention._flash_attention_forward = original_flash
         dist.destroy_process_group()
 
 

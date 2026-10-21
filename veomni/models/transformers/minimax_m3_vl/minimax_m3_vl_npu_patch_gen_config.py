@@ -69,6 +69,7 @@ config.add_import(
     "veomni.ops.kernels.attention.ulysses",
     names=["gather_seq_scatter_kv_heads", "prepare_ulysses_qkv", "restore_ulysses_output"],
 )
+config.add_import("veomni.ops.kernels.attention", names=["flash_attention_forward"])
 config.add_import(
     "veomni.ops.kernels.minimax_sparse_attention",
     names=["minimax_sparse_attention_eager", "minimax_sparse_indexer_eager"],
@@ -92,7 +93,7 @@ config.add_helper(collate_multimodal_metadata)
 config.replace_class(
     "MiniMaxM3VLPreTrainedModel",
     replacement=PatchedMiniMaxM3VLPreTrainedModel,
-    description="Allow VeOmni flash-attention implementations for the config-driven vision tower",
+    description="Allow VeOmni FlashAttention for vision and dense language layers",
 )
 
 config.replace_class(
@@ -135,7 +136,7 @@ config.override_method(
 config.override_method(
     "MiniMaxM3VLAttention.forward",
     replacement=minimax_m3_vl_attention_forward_patched,
-    description="Run packed MiniMax language attention through the TND sparse attention operators",
+    description="Use packed sparse attention for indexed layers and FlashAttention for dense layers",
 )
 config.override_method(
     "MiniMaxM3VLTextModel.forward",

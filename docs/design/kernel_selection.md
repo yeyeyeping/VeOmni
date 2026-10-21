@@ -54,7 +54,10 @@ without modifying `OpsImplementationConfig`.
 ### MiniMax M3 sparse attention on Ascend
 
 Set `minimax_sparse_attention_implementation: npu_split_kv_gbsa` to bind both
-MiniMax language OpSlots. This backend lazily loads the operator functions
+MiniMax sparse language OpSlots. Layers with `indexer=None` bypass these
+slots in the model and call varlen FlashAttention, selected through
+`attn_implementation`. The model owns their Ulysses exchanges and calls FA
+with `skip_ulysses=True`. This backend lazily loads the operator functions
 from `cann_ops_transformer.ops`; it requires the matching custom CANN libraries
 and Torch extensions. `msa_index_score` plus per-query local-block selection
 and TopK implements the indexer. The attention autograd Function uses
@@ -73,8 +76,9 @@ The checked index-score extension also reads lengths for allocation.
 
 The sparse path requires block size 128, attention head dimension 128,
 matching BF16 inputs (FP16 where the installed split-KV kernel supports it),
-and GQA group size at most 16. Dense layers and nonzero attention dropout use
-the existing eager implementation. Missing sparse operator exports raise an
+and GQA group size at most 16. Sparse layers with nonzero attention dropout use
+the existing eager implementation; dense layers use FlashAttention in the
+model. Missing sparse operator exports raise an
 error; they do not silently select eager. Only first-order backward is
 supported. See the [MiniMax M3 guide](../examples/minimax_m3_vl.md#cann-sparse-attention)
 for configuration, metadata formats, memory costs, and numerical validation.
