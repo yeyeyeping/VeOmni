@@ -39,7 +39,7 @@ synthetic SP tail-padding sequence appended by the collator.
 MiniMax generated modeling declares ``OpSlot("minimax_sparse_attention",
 "indexer")`` and ``OpSlot("minimax_sparse_attention", "attention")`` and falls
 back to the eager functions below when a slot is bound to ``eager``. On Ascend
-NPU, ``npu_split_kv_gbsa`` replaces both slots with CANN operators exported by
+NPU, ``npu`` replaces both slots with CANN operators exported by
 ``cann_ops_transformer.ops``. Its attention uses split-KV forward and GBSA
 backward; nonzero attention dropout retains the eager path. Dense model layers
 bypass these slots and call FlashAttention directly. Standalone calls with
@@ -65,7 +65,7 @@ def _npu_attention_factory():
 for variant, factory in (("indexer", _npu_indexer_factory), ("attention", _npu_attention_factory)):
     KERNEL_REGISTRY.register(
         KernelSpec(
-            name="npu_split_kv_gbsa",
+            name="npu",
             op_name="minimax_sparse_attention",
             variant=variant,
             factory=factory,

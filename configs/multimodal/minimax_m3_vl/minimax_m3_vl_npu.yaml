@@ -5,7 +5,7 @@ model:
     moe_implementation: fused_npu
     rms_norm_implementation: npu
     cross_entropy_loss_implementation: eager
-    minimax_sparse_attention_implementation: npu_split_kv_gbsa
+    minimax_sparse_attention_implementation: npu
   optimizer:
     lr: 1.0e-5
     lr_decay_style: cosine

@@ -67,7 +67,7 @@ The NPU example selects the CANN language attention backend explicitly:
 ```yaml
 model:
   ops_implementation:
-    minimax_sparse_attention_implementation: npu_split_kv_gbsa
+    minimax_sparse_attention_implementation: npu
 ```
 
 The default for this field is `eager`. Set it to `eager` to run without the

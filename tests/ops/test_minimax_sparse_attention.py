@@ -624,7 +624,7 @@ def test_cann_registry_binds_both_slots_and_gates_hardware(monkeypatch):
         indexer=OpSlot("minimax_sparse_attention", "indexer"),
         attention=OpSlot("minimax_sparse_attention", "attention"),
     )
-    config = SimpleNamespace(minimax_sparse_attention_implementation="npu_split_kv_gbsa")
+    config = SimpleNamespace(minimax_sparse_attention_implementation="npu")
     monkeypatch.setattr(kernel_registry, "IS_NPU_AVAILABLE", False)
     with pytest.raises(RuntimeError, match="requires device_type='npu'"):
         _bind_veomni_ops(module, config)

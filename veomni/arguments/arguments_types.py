@@ -1481,10 +1481,11 @@ class OpsImplementationConfig:
     minimax_sparse_attention_implementation: str = field(
         default="eager",
         metadata={
-            "help": "MiniMax M3 sparse indexer and attention backend. 'npu_split_kv_gbsa' uses "
+            "help": "MiniMax M3 sparse indexer and attention backend. 'npu' uses "
             "cann_ops_transformer.ops on Ascend: index score/TopK, split-KV forward and GBSA backward. "
             "Requires block size 128, attention head dimension 128, BF16 (FP16 on supported hardware), "
-            "and GQA group size <=16. Dense layers and nonzero attention dropout use eager."
+            "and GQA group size <=16. Sparse layers with nonzero attention dropout use eager; "
+            "dense layers use the configured FlashAttention backend."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
