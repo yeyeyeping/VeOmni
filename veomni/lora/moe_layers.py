@@ -172,13 +172,21 @@ def _moe_lora_op(base_layer: nn.Module, variant: str):
     return VeomniOp("moe_experts_lora", variant, impl)
 
 
-def _validate_silu_act_fn(base_layer: nn.Module) -> None:
-    """Raise unless ``base_layer.act_fn`` is SiLU; every ``moe_experts_lora`` impl hard-codes SwiGLU."""
-    act_fn = base_layer.act_fn
+def _resolve_gated_activation(base_layer: nn.Module) -> tuple[float | None, float | None]:
+    """Return ``(swiglu_alpha, swiglu_limit)`` for the experts' gated activation.
+
+    ``moe_experts_lora`` implements SwiGLU (``(None, None)``: SiLU ``act_fn``) and
+    SwiGLU-OAI (experts without ``act_fn`` that carry ``swiglu_alpha`` and an
+    optional ``swiglu_limit``, e.g. MiniMax M3). Anything else raises.
+    """
+    act_fn = getattr(base_layer, "act_fn", None)
+    if act_fn is None and getattr(base_layer, "swiglu_alpha", None) is not None:
+        return base_layer.swiglu_alpha, getattr(base_layer, "swiglu_limit", None)
     if act_fn is F.silu or isinstance(act_fn, (nn.SiLU, SiLUActivation)):
-        return
+        return None, None
     raise ValueError(
-        f"VeOmni MoE-LoRA only supports SiLU experts; {type(base_layer).__name__} uses {type(act_fn).__name__}."
+        f"VeOmni MoE-LoRA only supports SiLU or SwiGLU-OAI experts; {type(base_layer).__name__} uses "
+        f"{type(act_fn).__name__}."
     )
 
 
@@ -416,7 +424,7 @@ class LoraSharedExperts(nn.Module):
         # into self below so a downstream caller seeing the drained
         # base_layer would get a confusing error.
         _validate_fused_layout(base_layer)
-        _validate_silu_act_fn(base_layer)
+        swiglu_alpha, swiglu_limit = _resolve_gated_activation(base_layer)
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -428,7 +436,9 @@ class LoraSharedExperts(nn.Module):
         self.num_experts = base_layer.num_experts
         self.hidden_dim = base_layer.hidden_dim
         self.intermediate_dim = base_layer.intermediate_dim
-        self.act_fn = base_layer.act_fn
+        self.act_fn = getattr(base_layer, "act_fn", None)
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_limit = swiglu_limit
 
         # Steal the base experts' Parameters / Buffers, then re-register
         # the Parameters under per-spec sub-modules at the PEFT-aligned
@@ -721,6 +731,8 @@ class LoraSharedExperts(nn.Module):
             lora_scale_gate=self._lora_scale_value,
             lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_limit=self.swiglu_limit,
         )
 
     def extra_repr(self) -> str:
@@ -820,7 +832,7 @@ class LoraIndependentExperts(nn.Module):
         # Validate before stealing — see LoraSharedExperts.__init__ for the
         # rationale on this ordering.
         _validate_fused_layout(base_layer)
-        _validate_silu_act_fn(base_layer)
+        swiglu_alpha, swiglu_limit = _resolve_gated_activation(base_layer)
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -830,7 +842,9 @@ class LoraIndependentExperts(nn.Module):
         self.num_experts = base_layer.num_experts
         self.hidden_dim = base_layer.hidden_dim
         self.intermediate_dim = base_layer.intermediate_dim
-        self.act_fn = base_layer.act_fn
+        self.act_fn = getattr(base_layer, "act_fn", None)
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_limit = swiglu_limit
 
         # Steal base experts' Parameters / Buffers — see
         # LoraSharedExperts.__init__ for the per-spec sub-module layout
@@ -1019,6 +1033,8 @@ class LoraIndependentExperts(nn.Module):
             lora_scale_gate=self._lora_scale_value,
             lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_limit=self.swiglu_limit,
         )
 
     def extra_repr(self) -> str:

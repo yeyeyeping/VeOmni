@@ -22,6 +22,7 @@ from torch import Tensor
 from .....distributed.parallel_state import get_parallel_state
 from ...moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
 from ...moe_experts.shared.group_gemm import group_gemm_same_mn, group_gemm_same_nk
+from ...moe_experts.shared.swiglu import apply_swiglu_clamp, swiglu_activation, swiglu_activation_backward
 
 
 class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
@@ -66,6 +67,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         lora_scale_gate,
         lora_scale_up,
         lora_scale_down,
+        swiglu_limit=None,
+        swiglu_alpha=None,
     ):
         """Run non-EP fused MoE with LoRA weights shared by all experts."""
         splits = expert_histogram(expert_index, num_experts)
@@ -93,13 +96,16 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         tmp_up = torch.nn.functional.linear(scatter_output, lora_a_up)  # [T, r]
         delta_up = torch.nn.functional.linear(tmp_up, lora_b_up) * lora_scale_up  # [T, I]
         # Cat per-half deltas into [T, 2I] and add into fc1_output *before*
-        # chunk + silu — LoRA must enter the pre-activation linear.
+        # chunk + activation — LoRA must enter the pre-activation linear.
         fc1_output = fc1_output + torch.cat([delta_gate, delta_up], dim=-1)
 
         # Standard fused MoE post-fc1.
         fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)  # views, no copy
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_activation = fc1_1_activation * fc1_2_output  # mid in eager terms — [T, I]
+        # Optional clamp, then SwiGLU or SwiGLU-OAI (``swiglu_alpha``); masks are None without a clamp.
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
+        fc1_activation = swiglu_activation(fc1_1_output, fc1_2_output, swiglu_alpha)  # mid in eager terms — [T, I]
 
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
@@ -129,6 +135,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
         ctx.lora_scale_down = lora_scale_down
+        ctx.swiglu_limit = swiglu_limit
+        ctx.swiglu_alpha = swiglu_alpha
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -151,6 +159,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=fc1_1_output.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=fc1_1_output.device),
         )
 
         return output
@@ -180,6 +190,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
@@ -231,12 +243,13 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
         grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
 
-        # MoE step 7: chain through silu(gate) * up.
-        # Recompute silu output to save memory (matches existing function).
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
-        grad_fc1_2_output = fc1_1_activation * grad_fc1_activation
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        # MoE step 7: chain through the gated activation.
+        grad_fc1_1_output, grad_fc1_2_output = swiglu_activation_backward(
+            grad_fc1_activation, fc1_1_output, fc1_2_output, ctx.swiglu_alpha
+        )
+        if ctx.swiglu_limit is not None:
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)  # [T, 2I]
 
         # ---- LoRA fc1 backward (per-half closed form). ------------------
@@ -307,6 +320,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             None,  # lora_scale_gate
             None,  # lora_scale_up
             None,  # lora_scale_down
+            None,  # swiglu_limit
+            None,  # swiglu_alpha
         )
 
 
@@ -362,6 +377,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
         lora_scale_gate,
         lora_scale_up,
         lora_scale_down,
+        swiglu_limit=None,
+        swiglu_alpha=None,
     ):
         """Run EP-local grouped GEMM with LoRA weights shared by all experts."""
         max_t = permute_tokens.shape[0]
@@ -378,17 +395,20 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
 
         # Two independent shared LoRA deltas on gate / up halves —
         # rank-invariant ⇒ plain F.linear chains. Cat per-half deltas into
-        # [T_local, 2I] and add into fc1_output before chunk + silu.
+        # [T_local, 2I] and add into fc1_output before chunk + activation.
         tmp_gate = torch.nn.functional.linear(permute_tokens, lora_a_gate)  # [T_local, r]
         delta_gate = torch.nn.functional.linear(tmp_gate, lora_b_gate) * lora_scale_gate  # [T_local, I]
         tmp_up = torch.nn.functional.linear(permute_tokens, lora_a_up)  # [T_local, r]
         delta_up = torch.nn.functional.linear(tmp_up, lora_b_up) * lora_scale_up  # [T_local, I]
         fc1_output = fc1_output + torch.cat([delta_gate, delta_up], dim=-1)
 
-        # silu(gate) * up — no routing-weight scaling here (applied after all2all combine).
+        # Gated activation — no routing-weight scaling here (applied after all2all combine).
         fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_act = fc1_1_activation * fc1_2_output  # [T_local, I]
+        # Optional clamp, then SwiGLU or SwiGLU-OAI (``swiglu_alpha``); masks are None without a clamp.
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
+        fc1_act = swiglu_activation(fc1_1_output, fc1_2_output, swiglu_alpha)  # [T_local, I]
 
         # Base fc2: [T_local, H]
         fc2_output = group_gemm_same_nk(
@@ -408,6 +428,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
         ctx.lora_scale_down = lora_scale_down
+        ctx.swiglu_limit = swiglu_limit
+        ctx.swiglu_alpha = swiglu_alpha
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -425,6 +447,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=fc1_1_output.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=fc1_1_output.device),
         )
 
         return fc2_output
@@ -451,6 +475,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
@@ -488,11 +514,13 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        # silu chain — recompute fc1_1_activation to save memory (matches EPMergedFc1GroupGemm).
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        grad_fc1_1_activation = grad_fc1_act * fc1_2_output
-        grad_fc1_2_output = fc1_1_activation * grad_fc1_act
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        # Gated-activation chain, recomputed from the saved pre-activations.
+        grad_fc1_1_output, grad_fc1_2_output = swiglu_activation_backward(
+            grad_fc1_act, fc1_1_output, fc1_2_output, ctx.swiglu_alpha
+        )
+        if ctx.swiglu_limit is not None:
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)  # [T_local, 2I]
 
         # ---- LoRA fc1 backward (per-half closed form). ------------------
@@ -550,6 +578,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             None,  # lora_scale_gate
             None,  # lora_scale_up
             None,  # lora_scale_down
+            None,  # swiglu_limit
+            None,  # swiglu_alpha
         )
 
 
@@ -569,6 +599,8 @@ def group_gemm_fused_lora_moe_forward(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Triton grouped-gemm fused MoE forward with shared seed-style two-LoRA (Mode 2).
 
@@ -589,6 +621,10 @@ def group_gemm_fused_lora_moe_forward(
         lora_a_down / lora_b_down: shared LoRA pair on down
             (``[r, I]`` / ``[H, r]``).
         lora_scale_gate / lora_scale_up / lora_scale_down: per-spec scaling.
+        swiglu_alpha: SwiGLU-OAI ``(up + 1) * gate * sigmoid(alpha * gate)``
+            (MiniMax M3) instead of ``silu(gate) * up`` when set.
+        swiglu_limit: clamp ``gate`` to ``max=limit`` and ``up`` to
+            ``[-limit, limit]`` before the activation when set.
 
     Returns:
         ``[B, S, H]`` (or ``[N, H]``) — same shape as ``hidden_states``.
@@ -621,6 +657,8 @@ def group_gemm_fused_lora_moe_forward(
             lora_scale_gate,
             lora_scale_up,
             lora_scale_down,
+            swiglu_limit,
+            swiglu_alpha,
         )
     return MergedFc1TritonFusedLoRAMoeExpertFunction.apply(
         num_experts,
@@ -638,6 +676,8 @@ def group_gemm_fused_lora_moe_forward(
         lora_scale_gate,
         lora_scale_up,
         lora_scale_down,
+        swiglu_limit,
+        swiglu_alpha,
     )
 
 
@@ -658,6 +698,8 @@ def wrapper(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
     """Shared Triton fused LoRA MoE."""
     return group_gemm_fused_lora_moe_forward(
@@ -676,4 +718,6 @@ def wrapper(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
     )

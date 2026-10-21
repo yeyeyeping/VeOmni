@@ -32,6 +32,9 @@ _FWD_L2REL_TOL = 0.02
 _GRAD_L2REL_TOL = 0.02
 _LORA_KEYS = ("lora_a_gate", "lora_b_gate", "lora_a_up", "lora_b_up", "lora_a_down", "lora_b_down")
 _SCALES = dict(lora_scale_gate=0.5, lora_scale_up=0.5, lora_scale_down=0.5)
+# Gated activations: standard SwiGLU, and clamped SwiGLU-OAI (MiniMax M3). The
+# limit is small enough that the clamp saturates part of the pre-activations.
+_ACTIVATIONS = {"swiglu": {}, "swiglu_oai": dict(swiglu_alpha=1.702, swiglu_limit=0.1)}
 
 
 def _l2_rel(actual: torch.Tensor, ref: torch.Tensor) -> float:
@@ -51,7 +54,7 @@ def _lora_tensors(variant: str, *, E: int, H: int, I: int, r: int, device, dtype
     return [0.02 * torch.randn(*shape, device=device, dtype=dtype) for shape in shapes]
 
 
-def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *, num_experts: int):
+def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *, num_experts: int, **activation):
     return VeomniOp("moe_experts_lora", variant, impl)(
         hidden,
         routing,
@@ -61,6 +64,7 @@ def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *
         *loras,
         num_experts=num_experts,
         **_SCALES,
+        **activation,
     )
 
 
@@ -78,6 +82,7 @@ def _run_fused_vs_eager(
     shape: str = "small",
     base_trainable: bool = True,
     concentrated_routing: bool = False,
+    activation: str = "swiglu",
 ):
     torch.manual_seed(0)
     device = torch.device("npu" if impl == "fused_npu" else "cuda")
@@ -105,10 +110,11 @@ def _run_fused_vs_eager(
     fc2_f = fc2.detach().clone().requires_grad_(base_trainable)
     lora_e = [t.detach().clone().requires_grad_(True) for t in loras]
     lora_f = [t.detach().clone().requires_grad_(True) for t in loras]
-    case = f"[{impl}/{variant}/{shape}/base_trainable={base_trainable}]"
+    case = f"[{impl}/{variant}/{activation}/{shape}/base_trainable={base_trainable}]"
+    act = _ACTIVATIONS[activation]
 
-    out_e = _call("eager", variant, hidden_e, routing_e, selected, fc1_e, fc2_e, lora_e, num_experts=E)
-    out_f = _call(impl, variant, hidden_f, routing_f, selected, fc1_f, fc2_f, lora_f, num_experts=E)
+    out_e = _call("eager", variant, hidden_e, routing_e, selected, fc1_e, fc2_e, lora_e, num_experts=E, **act)
+    out_f = _call(impl, variant, hidden_f, routing_f, selected, fc1_f, fc2_f, lora_f, num_experts=E, **act)
     fwd_l2 = _l2_rel(out_f, out_e)
     assert fwd_l2 <= _FWD_L2REL_TOL, (
         f"{case} forward L2 rel {fwd_l2:.4%} > {_FWD_L2REL_TOL:.2%} (eager_norm={out_e.float().norm().item():.3e})"
@@ -143,6 +149,8 @@ def _manual_moe_lora_oracle(
     fc1: torch.Tensor,
     fc2: torch.Tensor,
     loras: list[torch.Tensor],
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Compute routed MoE-LoRA directly, without registry or scatter/grouped-GEMM helpers."""
     lora_a_gate, lora_b_gate, lora_a_up, lora_b_up, lora_a_down, lora_b_down = loras
@@ -167,7 +175,13 @@ def _manual_moe_lora_oracle(
             base_gate, base_up = F.linear(token, fc1[expert_index]).chunk(2, dim=-1)
             gate = base_gate + F.linear(F.linear(token, a_gate), b_gate) * _SCALES["lora_scale_gate"]
             up = base_up + F.linear(F.linear(token, a_up), b_up) * _SCALES["lora_scale_up"]
-            intermediate = F.silu(gate) * up
+            if swiglu_limit is not None:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+            if swiglu_alpha is None:
+                intermediate = F.silu(gate) * up
+            else:
+                intermediate = (up + 1) * gate * torch.sigmoid(swiglu_alpha * gate)
             intermediate = intermediate * routing[token_index, slot_index]
             expert_output = F.linear(intermediate, fc2[expert_index])
             expert_output = expert_output + (
@@ -202,8 +216,9 @@ def _build_lora_leaves(variant: str, *, E: int, H: int, I: int, r: int, dtype: t
     }
 
 
+@pytest.mark.parametrize("activation", ["swiglu", "swiglu_oai"])
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(variant):
+def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(variant, activation):
     torch.manual_seed(11)
     B, H, I, E, top_k, r = 4, 5, 7, 3, 2, 3
     dtype = torch.float64
@@ -219,8 +234,10 @@ def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(
     hidden_e, routing_e, fc1_e, fc2_e, *lora_e = eager_inputs
     hidden_o, routing_o, fc1_o, fc2_o, *lora_o = oracle_inputs
 
-    output_e = _call("eager", variant, hidden_e, routing_e, selected, fc1_e, fc2_e, lora_e, num_experts=E)
-    output_o = _manual_moe_lora_oracle(variant, hidden_o, routing_o, selected, fc1_o, fc2_o, lora_o)
+    # Pre-activations have std ~0.45 here, so this limit clamps part of them.
+    act = dict(swiglu_alpha=1.702, swiglu_limit=0.3) if activation == "swiglu_oai" else {}
+    output_e = _call("eager", variant, hidden_e, routing_e, selected, fc1_e, fc2_e, lora_e, num_experts=E, **act)
+    output_o = _manual_moe_lora_oracle(variant, hidden_o, routing_o, selected, fc1_o, fc2_o, lora_o, **act)
     torch.testing.assert_close(output_e, output_o, atol=1e-10, rtol=1e-10)
 
     grad_output = torch.randn_like(output_e)
@@ -237,15 +254,40 @@ def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(
         )
 
 
+@pytest.mark.parametrize("variant", ["shared", "independent"])
+def test_moe_experts_lora_eager_swiglu_oai_with_zero_lora_b_matches_base_experts(variant):
+    """Zero LoRA B reproduces ``moe_experts/swiglu_oai/eager`` (the MiniMax M3 experts) bit for bit."""
+    torch.manual_seed(5)
+    B, H, I, E, top_k, r = 16, 32, 24, 4, 2, 4
+    dtype = torch.bfloat16
+    act = dict(swiglu_alpha=1.702, swiglu_limit=0.05)
+    hidden = 0.5 * torch.randn(B, H, dtype=dtype)
+    routing = torch.softmax(torch.randn(B, top_k), dim=-1).to(dtype)
+    selected = torch.randint(0, E, (B, top_k))
+    fc1 = 0.1 * torch.randn(E, 2 * I, H, dtype=dtype)
+    fc2 = 0.1 * torch.randn(E, H, I, dtype=dtype)
+    loras = _lora_tensors(variant, E=E, H=H, I=I, r=r, device=hidden.device, dtype=dtype)
+    loras = [lora if key.startswith("lora_a") else torch.zeros_like(lora) for key, lora in zip(_LORA_KEYS, loras)]
+    unused = fc1.new_empty(0)
+
+    with torch.no_grad():
+        output = _call("eager", variant, hidden, routing, selected, fc1, fc2, loras, num_experts=E, **act)
+        expected = VeomniOp("moe_experts", "swiglu_oai", "eager")(
+            hidden, routing, selected, unused, unused, fc2, fc1, num_experts=E, **act
+        )
+    assert torch.equal(output, expected)
+
+
 @pytest.mark.skipif(
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton moe_experts_lora needs a GPU + triton",
 )
+@pytest.mark.parametrize("activation", list(_ACTIVATIONS))
 @pytest.mark.parametrize("shape", list(_SHAPES))
 @pytest.mark.parametrize("base_trainable", [True, False], ids=["base_trainable", "base_frozen"])
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_triton_matches_eager(variant, base_trainable, shape):
-    _run_fused_vs_eager("fused_triton", variant, shape=shape, base_trainable=base_trainable)
+def test_triton_matches_eager(variant, base_trainable, shape, activation):
+    _run_fused_vs_eager("fused_triton", variant, shape=shape, base_trainable=base_trainable, activation=activation)
 
 
 @pytest.mark.skipif(
@@ -258,19 +300,21 @@ def test_triton_matches_eager_with_concentrated_routes(variant):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="npu moe_experts_lora needs torch_npu")
+@pytest.mark.parametrize("activation", list(_ACTIVATIONS))
 @pytest.mark.parametrize("shape", list(_SHAPES))
 @pytest.mark.parametrize("base_trainable", [True, False], ids=["base_trainable", "base_frozen"])
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_npu_matches_eager(variant, base_trainable, shape):
-    _run_fused_vs_eager("fused_npu", variant, shape=shape, base_trainable=base_trainable)
+def test_npu_matches_eager(variant, base_trainable, shape, activation):
+    _run_fused_vs_eager("fused_npu", variant, shape=shape, base_trainable=base_trainable, activation=activation)
 
 
 @pytest.mark.skipif(
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton moe_experts_lora needs a GPU + triton",
 )
+@pytest.mark.parametrize("activation", list(_ACTIVATIONS))
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_triton_ep_class_matches_nonep_single_rank(variant):
+def test_triton_ep_class_matches_nonep_single_rank(variant, activation):
     """EP autograd class output and LoRA grads match the non-EP class on one rank."""
     from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
     from veomni.ops.kernels.moe_experts_lora.independent.triton import (
@@ -287,6 +331,8 @@ def test_triton_ep_class_matches_nonep_single_rank(variant):
         "independent": (EPMergedFc1IndependentLoRAGroupGemm, MergedFc1IndependentTritonFusedLoRAMoeExpertFunction),
     }
     ep_cls, nonep_cls = classes[variant]
+    act = _ACTIVATIONS[activation]
+    swiglu_args = (act.get("swiglu_limit"), act.get("swiglu_alpha"))
 
     dev = torch.device(get_device_type())
     dtype = torch.bfloat16
@@ -322,6 +368,7 @@ def test_triton_ep_class_matches_nonep_single_rank(variant):
                 scale_gate,
                 scale_up,
                 scale_down,
+                *swiglu_args,
             )
         else:
             out = nonep_cls.apply(
@@ -335,6 +382,7 @@ def test_triton_ep_class_matches_nonep_single_rank(variant):
                 scale_gate,
                 scale_up,
                 scale_down,
+                *swiglu_args,
             )
         return out, lora
 
@@ -384,8 +432,9 @@ def _single_rank_dist():
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="npu moe_experts_lora needs torch_npu")
+@pytest.mark.parametrize("activation", list(_ACTIVATIONS))
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
+def test_npu_ep_matches_nonep_single_rank(variant, activation, _single_rank_dist):
     if variant == "shared":
         from veomni.ops.kernels.moe_experts_lora.shared.npu import (
             _npu_ep_fused_lora_moe_forward,
@@ -431,6 +480,7 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
             lora_a_down=lora["lora_a_down"],
             lora_b_down=lora["lora_b_down"],
             **_SCALES,
+            **_ACTIVATIONS[activation],
         )
         if ep:
             out = _npu_ep_fused_lora_moe_forward(ep_group=None, **kwargs)

@@ -353,7 +353,7 @@ multimodal example configs listed below.
 ### 5.1 Two LoRAs on the fused `gate_up_proj`
 
 The wrapper does **not** allocate one rank-`r` LoRA over the fused `[E, 2I, H]` parameter.
-Because `SiLU(gate) * up` is non-linear, LoRA must be added **before activation**, not on
+Because the gated activation (`SiLU(gate) * up`, or SwiGLU-OAI) is non-linear, LoRA must be added **before activation**, not on
 the merged `gate_up`. The wrapper therefore allocates **two independent rank-`r` LoRAs** —
 one over the gate half, one over the up half:
 
@@ -379,6 +379,7 @@ VeOmni MoE-LoRA wrappers require the **v5 fused experts layout** (`gate_up_proj`
 | `qwen3_vl_moe`     | fused `gate_up_proj` | VLM; FQN includes `model.language_model.`. |
 | `qwen3_omni_moe`   | fused `gate_up_proj` | Thinker tower. |
 | `deepseek_v3` (v5) | fused `gate_up_proj` | Per-expert disk → fused via on-load converter. |
+| `minimax_m3_vl`    | fused `gate_up_proj` | SwiGLU-OAI experts; FQN includes `model.language_model.`. See the [MiniMax M3 VL recipe](../examples/minimax_m3_vl.md) for the attention-LoRA indexer exclusion. |
 
 DeepSeek-V3 also exposes **shared experts** (`mlp.shared_experts.{gate,up,down}_proj`)
 implemented as plain `nn.Linear`. Add them to `lora_modules` if you want PEFT to LoRA them
@@ -399,8 +400,11 @@ The fused GPU path lives in `veomni/ops/kernels/moe_experts_lora/` and reuses th
 inherits the same EP `all-to-all` dispatch pipeline. Each wrapper constructs
 `VeomniOp("moe_experts_lora", variant, impl)` from the wrapped experts'
 `veomni_moe.impl`. Any other impl (for example `fused_quack`, or `fused_triton`
-on MLU) has no available LoRA row and uses `eager`. MoE-LoRA requires SiLU
-experts and rejects other activations at wrap time.
+on MLU) has no available LoRA row and uses `eager`. MoE-LoRA supports SiLU
+experts (`SiLU(gate) * up`) and SwiGLU-OAI experts (MiniMax M3: no `act_fn`,
+`swiglu_alpha` and an optional `swiglu_limit` on the experts module, computing
+`(clamp(up) + 1) * clamp(gate) * sigmoid(alpha * clamp(gate))`); every backend
+implements both, and other activations are rejected at wrap time.
 
 ### 5.4 Expert Parallelism (EP)
 

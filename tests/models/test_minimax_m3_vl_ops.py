@@ -590,6 +590,48 @@ def test_minimax_m3_vl_experts_preserve_swiglu_oai_eager_semantics(module_name, 
     torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-7)
 
 
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_experts_support_moe_lora(module_name, mode):
+    from veomni.lora.moe_layers import LoraIndependentExperts, LoraSharedExperts
+
+    modeling = importlib.import_module(module_name)
+    config = SimpleNamespace(
+        num_local_experts=2,
+        hidden_size=4,
+        intermediate_size=3,
+        swiglu_limit=0.7,
+        swiglu_alpha=1.702,
+    )
+    experts = modeling.MiniMaxM3VLExperts(config)
+    torch.manual_seed(0)
+    experts.gate_up_proj.data.normal_(mean=0.0, std=0.5)
+    experts.down_proj.data.normal_(mean=0.0, std=0.5)
+    hidden_states = torch.randn(5, 4)
+    top_k_index = torch.tensor([[0], [1], [0], [1], [0]])
+    top_k_weights = torch.rand(5, 1)
+    with torch.no_grad():
+        base_output = experts(hidden_states, top_k_index, top_k_weights)
+
+    wrapper_cls = LoraSharedExperts if mode == "shared" else LoraIndependentExperts
+    wrapper = wrapper_cls(experts, r=2, lora_alpha=4)
+    assert (wrapper.swiglu_alpha, wrapper.swiglu_limit) == (config.swiglu_alpha, config.swiglu_limit)
+    # Zero-initialised LoRA B: the wrapped experts reproduce the clamped SwiGLU-OAI base output.
+    with torch.no_grad():
+        torch.testing.assert_close(wrapper(hidden_states, top_k_index, top_k_weights), base_output, rtol=0, atol=0)
+
+    specs = ("gate_proj", "up_proj", "down_proj")
+    with torch.no_grad():
+        for spec in specs:
+            wrapper.get_lora_B_weight(spec).normal_(std=0.5)
+    output = wrapper(hidden_states, top_k_index, top_k_weights)
+    assert not torch.allclose(output, base_output)
+    output.sum().backward()
+    for spec in specs:
+        assert wrapper.get_lora_A_weight(spec).grad.abs().sum() > 0, spec
+        assert wrapper.get_lora_B_weight(spec).grad.abs().sum() > 0, spec
+
+
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_rms_norm_preserves_eager_fp32_semantics(module_name):
     modeling = importlib.import_module(module_name)

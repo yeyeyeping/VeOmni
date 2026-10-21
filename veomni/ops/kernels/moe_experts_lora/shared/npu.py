@@ -82,6 +82,8 @@ def _npu_fused_lora_moe_forward(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
     """NPU non-EP fused MoE + shared LoRA."""
     from ..helper import npu_non_ep_forward
@@ -106,6 +108,8 @@ def _npu_fused_lora_moe_forward(
         fc2_weight,
         gate_up,
         down,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
     )
 
 
@@ -126,6 +130,8 @@ def _npu_ep_fused_lora_moe_forward(
     lora_scale_up: float,
     lora_scale_down: float,
     ep_group: dist.ProcessGroup | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
     """NPU EP fused MoE + shared LoRA."""
     from ..helper import npu_ep_forward
@@ -151,6 +157,8 @@ def _npu_ep_fused_lora_moe_forward(
         gate_up,
         down,
         ep_group=ep_group,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
     )
 
 
@@ -170,6 +178,8 @@ def npu_fused_lora_moe_forward(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
     """NPU shared-LoRA fused MoE. Branches on EP from parallel state."""
     from .....distributed.parallel_state import get_parallel_state
@@ -190,6 +200,8 @@ def npu_fused_lora_moe_forward(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
     )
     if get_parallel_state().ep_enabled:
         return _npu_ep_fused_lora_moe_forward(ep_group=get_parallel_state().ep_group, **kwargs)
@@ -213,6 +225,8 @@ def wrapper(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
     """Shared NPU fused LoRA MoE."""
     return npu_fused_lora_moe_forward(
@@ -231,4 +245,6 @@ def wrapper(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
     )

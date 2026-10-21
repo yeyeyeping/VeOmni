@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ..helper import eager_gated_activation
 from ..routing import group_routing_assignments
 
 
@@ -40,8 +41,10 @@ def wrapper(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
-    """Routed SwiGLU with one shared LoRA pair per logical spec."""
+    """Routed SwiGLU (or SwiGLU-OAI) with one shared LoRA pair per logical spec."""
     scale_gate = hidden_states.new_tensor(lora_scale_gate)
     scale_up = hidden_states.new_tensor(lora_scale_up)
     scale_down = hidden_states.new_tensor(lora_scale_down)
@@ -55,7 +58,7 @@ def wrapper(
         current_state = hidden_states[token_idx]
         gate_up = F.linear(current_state, fc1_1_2_weight[expert_idx]) + lora_x_gate_up[token_idx]
         gate, up = gate_up.chunk(2, dim=-1)
-        mid = F.silu(gate) * up
+        mid = eager_gated_activation(gate, up, swiglu_alpha, swiglu_limit)
         lora_x_down = F.linear(F.linear(mid, lora_a_down), lora_b_down) * scale_down
         current_hidden_states = F.linear(mid, fc2_weight[expert_idx]) + lora_x_down
         current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]

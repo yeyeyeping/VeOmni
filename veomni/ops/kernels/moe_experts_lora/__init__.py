@@ -52,6 +52,8 @@ def _shared_triton_wrapper(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
     """Lazy-load and call the shared Triton MoE-LoRA implementation."""
     from .shared.triton import wrapper
@@ -72,6 +74,8 @@ def _shared_triton_wrapper(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -92,6 +96,8 @@ def _independent_triton_wrapper(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
     """Lazy-load and call the independent Triton MoE-LoRA implementation."""
     from .independent.triton import wrapper
@@ -112,6 +118,8 @@ def _independent_triton_wrapper(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
     )
 
 
