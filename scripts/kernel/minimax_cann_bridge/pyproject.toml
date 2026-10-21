@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "veomni-minimax-cann-bridge"
+version = "0.2.0"
+description = "Expose MiniMax Split-KV and its CSR helper through cann_ops_transformer.ops"
+requires-python = ">=3.11"
+dependencies = ["cann_ops_transformer", "custom_ops"]
+
+[project.entry-points."cann_ops_transformer.ops"]
+build_k2q_csr = "custom_ops:build_k2q_csr"
+npu_minimax_sparse_attention_split_kv = "custom_ops:npu_minimax_sparse_attention_split_kv"
+
+[tool.setuptools]
+packages = []

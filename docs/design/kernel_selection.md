@@ -58,11 +58,16 @@ MiniMax language OpSlots. This backend lazily loads the operator functions
 from `cann_ops_transformer.ops`; it requires the matching custom CANN libraries
 and Torch extensions. `msa_index_score` plus per-query local-block selection
 and TopK implements the indexer. The attention autograd Function uses
-`k2q_csr` and `npu_minimax_sparse_attention_split_kv` in forward, then constructs
-sorted batch-local KV-to-Q lists and calls
+the upstream `build_k2q_csr` Python helper and
+`npu_minimax_sparse_attention_split_kv` in forward, then expands the saved CSR
+into sorted batch-local KV-to-Q lists and calls
 `generic_block_sparse_attention_grad_metadata` and
 `generic_block_sparse_attention_grad` in backward. The model-facing tensor
-layout stays packed TND, including under Ulysses.
+layout stays packed TND, including under Ulysses. Indexer outputs must contain
+unique causal block IDs with trailing `-1` slots; the attention adapter does
+not repeat index normalization. VeOmni keeps metadata processing on device,
+but the checked upstream helper and index-score extension still read lengths
+on the host for allocation.
 
 The sparse path requires block size 128, attention head dimension 128,
 matching BF16 inputs (FP16 where the installed split-KV kernel supports it),

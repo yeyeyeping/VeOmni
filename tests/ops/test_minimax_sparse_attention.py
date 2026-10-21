@@ -15,7 +15,8 @@
 """TND eager MiniMax sparse attention against the upstream per-sample BSND reference."""
 
 import importlib
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -378,15 +379,15 @@ class _FakeMSACannOps:
         scores = _index_scores(kwargs["query"], kwargs["key"], kwargs["actual_seq_qlen"].diff().tolist())
         return scores.masked_fill(torch.isneginf(scores), torch.finfo(torch.float32).min)
 
-    def k2q_csr(self, q2k, cu, cu_blocks, **kwargs):
+    def build_k2q_csr(self, *, select_idx, actual_seq_lengths, actual_seq_lengths_kv, **kwargs):
         self.calls.append("csr")
-        assert kwargs["order_method"] == 1 and kwargs["q_global_offset"] is True
-        assert kwargs["use_simt"] is False
-        assert q2k.dtype == cu.dtype == cu_blocks.dtype == torch.int32
-        lengths = cu.diff().tolist()
+        assert kwargs == dict(block_size=128, index_mode="batch_local", input_layout="TND")
+        q2k = select_idx
+        assert q2k.dtype == actual_seq_lengths.dtype == actual_seq_lengths_kv.dtype == torch.int32
+        torch.testing.assert_close(actual_seq_lengths, actual_seq_lengths_kv)
+        lengths = actual_seq_lengths.tolist()
+        cu = F.pad(actual_seq_lengths.cumsum(0), (1, 0))
         counts = [(length + 127) // 128 for length in lengths]
-        assert kwargs["total_rows"] == sum(counts) and kwargs["max_kv"] == max(counts)
-        assert cu_blocks.tolist() == [0] + torch.tensor(counts).cumsum(0).tolist()
         self.rows = [(b, j) for j in range(max(counts)) for b, count in enumerate(counts) if j < count]
         self.q2k = q2k
         heads, total, budget = q2k.shape
@@ -396,10 +397,13 @@ class _FakeMSACannOps:
         for h in range(heads):
             edges = []
             for row, (b, block) in enumerate(self.rows):
+                row_edges = []
                 for query in range(int(cu[b]), int(cu[b + 1])):
                     for slot in range(budget):
                         if q2k[h, query, slot] == block:
-                            edges.append((query, slot))
+                            row_edges.append((query, slot))
+                # The upstream helper makes no intra-row ordering guarantee.
+                edges.extend(reversed(row_edges))
                 ptr[h, row + 1] = len(edges)
             if edges:
                 queries[h, : len(edges)], slots[h, : len(edges)] = torch.tensor(edges, dtype=torch.int32).T
@@ -452,6 +456,7 @@ class _FakeMSACannOps:
                 assert kwargs[key] == value
         assert kwargs["layout_q"] == kwargs["layout_kv"] == "TND"
         assert kwargs["mask_mode"] == 1 and kwargs["softmax_precision"] == 0
+        assert idx.shape[2] <= (k.shape[0] + 127) // 128  # Native GBSA TND tiling bound.
         keep = torch.zeros_like(self.forward_keep)
         cu = kwargs["cu_seqlens_q"]
         for b in range(idx.shape[0]):
@@ -475,45 +480,86 @@ class _FakeMSACannOps:
             return torch.autograd.grad(reference, inputs, dout)
 
 
+def _install_fake_cann_ops(monkeypatch, fake):
+    package = ModuleType("cann_ops_transformer")
+    package.ops = fake
+    monkeypatch.setitem(sys.modules, "cann_ops_transformer", package)
+
+
+@pytest.mark.parametrize("max_seqlen_padding", [0, 128])
 @pytest.mark.parametrize("local_blocks", [0, 1, 3])
 @pytest.mark.parametrize("topk_blocks", [2, 16], ids=["sparse_selection", "padded_slots"])
-def test_cann_indexer_adapter_matches_eager_and_handles_finite_invalid_fill(monkeypatch, local_blocks, topk_blocks):
+def test_cann_indexer_adapter_matches_eager_and_handles_finite_invalid_fill(
+    monkeypatch, local_blocks, topk_blocks, max_seqlen_padding
+):
     lengths = (127, 128, 129, 513, 3)
     torch.manual_seed(7)
     q = torch.randn(sum(lengths), 2, 128, dtype=torch.bfloat16)
     k = torch.randn(sum(lengths), 1, 128, dtype=torch.bfloat16)
     fake = _FakeMSACannOps()
-    monkeypatch.setattr(msa_npu, "_cann_ops", lambda: fake)
-    monkeypatch.setattr(msa_npu, "_check_npu_tensors", lambda *args: None)
+    _install_fake_cann_ops(monkeypatch, fake)
     kwargs = dict(block_size=128, topk_blocks=topk_blocks, local_blocks=local_blocks)
-    actual = msa_npu.minimax_sparse_indexer_npu(q, k, _cu_seqlens(lengths), max(lengths), **kwargs)
-    expected = minimax_sparse_indexer_eager(q, k, _cu_seqlens(lengths), max(lengths), **kwargs)
+    actual = msa_npu.minimax_sparse_indexer_npu(
+        q, k, _cu_seqlens(lengths), max(lengths) + max_seqlen_padding, **kwargs
+    )
+    expected = minimax_sparse_indexer_eager(q, k, _cu_seqlens(lengths), max(lengths) + max_seqlen_padding, **kwargs)
     assert torch.equal(actual.sort(-1).values, expected.sort(-1).values)
     assert actual.dtype == torch.int32 and actual.shape == (sum(lengths), 2, topk_blocks)
     assert fake.calls == ["score"]
+    positions = torch.cat([torch.arange(length) for length in lengths])
+    assert ((actual == -1) | ((actual >= 0) & (actual <= positions[:, None, None] // 128))).all()
+    ordered = actual.sort(-1).values
+    assert ((ordered[..., 1:] != ordered[..., :-1]) | (ordered[..., 1:] == -1)).all()
+    assert not ((actual[..., :-1] == -1) & (actual[..., 1:] != -1)).any()
 
 
-def test_cann_reverse_indices_are_local_sorted_and_deduplicated():
-    layout = msa_npu._packed_layout(_cu_seqlens((129, 257, 1)), 257, 387)
-    selected = torch.full((387, 2, 4), -1, dtype=torch.int32)
-    selected[128, 0] = torch.tensor([1, 0, 1, -1])
-    selected[129, 1] = torch.tensor([0, 1, -1, -1])  # block 1 is future for this query
-    selected[385, 0] = torch.tensor([2, 0, 2, 99])
-    selected[386, 1, 0] = 0
-    selected = msa_npu._canonical_indices(selected, layout)
-    assert selected[128, 0].tolist() == [0, 1, -1, -1]
-    assert selected[129, 1].tolist() == [0, -1, -1, -1]
-    idx, counts = msa_npu._backward_indices(selected, layout)
-    assert idx.shape == (3, 2, 3, 257)
-    assert counts[0, 0].tolist() == [1, 1, 0]
-    assert idx[0, 0, 0, 0] == idx[0, 0, 1, 0] == 128
-    assert idx[1, 0, 2, 0] == 256
-    assert idx[1, 1, 0, 0] == 0
-    assert idx[2, 1, 0, 0] == 0
+@pytest.mark.parametrize("lengths", [(129, 257, 1), (0, 129, 0, 257, 1, 0), (1,), (128,)])
+@pytest.mark.parametrize("max_seqlen_padding", [0, 256])
+def test_cann_csr_to_gbsa_preserves_edges_without_host_reads(monkeypatch, lengths, max_seqlen_padding):
+    torch.manual_seed(29)
+    max_seqlen = max(lengths) + max_seqlen_padding
+    blocks = (max_seqlen + 127) // 128
+    selected = torch.rand(sum(lengths), 2, blocks).topk(min(2, blocks), dim=-1).indices.to(torch.int32)
+    positions = torch.cat([torch.arange(length) for length in lengths])
+    selected.masked_fill_(selected > positions[:, None, None] // 128, -1)
+    selected = F.pad(selected, (0, 4 - selected.shape[-1]), value=-1)
+    # Include a head with no edges and repeated row pointers.
+    selected[:, 1] = -1
+    fake = _FakeMSACannOps()
+    ptr, queries, _ = fake.build_k2q_csr(
+        select_idx=selected.permute(1, 0, 2).contiguous(),
+        actual_seq_lengths=torch.tensor(lengths, dtype=torch.int32),
+        actual_seq_lengths_kv=torch.tensor(lengths, dtype=torch.int32),
+        block_size=128,
+        index_mode="batch_local",
+        input_layout="TND",
+    )
+    cu = _cu_seqlens(lengths)
+    with monkeypatch.context() as guard:
+        for name in ("cpu", "item", "tolist"):
+            guard.setattr(torch.Tensor, name, lambda *a, **kw: pytest.fail("CSR conversion must stay on device"))
+        idx, counts = msa_npu._csr_to_gbsa(ptr, queries, cu, max_seqlen)
+    assert idx.shape == (len(lengths), 2, blocks, max_seqlen)
+    assert idx.dtype == counts.dtype == torch.int32
+    for b, length in enumerate(lengths):
+        for h in range(2):
+            for block in range(blocks):
+                expected = torch.where((selected[int(cu[b]) : int(cu[b]) + length, h] == block).any(-1))[0]
+                count = expected.numel()
+                assert counts[b, h, block] == count
+                torch.testing.assert_close(idx[b, h, block, :count], expected.to(torch.int32))
+                assert (idx[b, h, block, count:] == -1).all()
 
 
-@pytest.mark.parametrize("lengths", [(129, 257, 1), (0, 129, 0, 257, 1)], ids=["packed", "empty_segments"])
-def test_cann_split_kv_gbsa_autograd_matches_eager_through_both_index_formats(monkeypatch, lengths):
+@pytest.mark.parametrize(
+    "lengths",
+    [(129, 257, 1), (0, 129, 0, 257, 1), (128,), (0, 1, 0)],
+    ids=["packed", "empty_segments", "single", "single_token"],
+)
+@pytest.mark.parametrize("max_seqlen_padding", [0, 128])
+def test_cann_split_kv_gbsa_autograd_matches_eager_through_both_index_formats(
+    monkeypatch, lengths, max_seqlen_padding
+):
     torch.manual_seed(31)
     inputs = [torch.randn(heads, sum(lengths), 16).transpose(0, 1).requires_grad_() for heads in (4, 2, 2)]
     index_q, index_k = torch.randn(sum(lengths), 2, 16), torch.randn(sum(lengths), 1, 16)
@@ -522,9 +568,9 @@ def test_cann_split_kv_gbsa_autograd_matches_eager_through_both_index_formats(mo
         index_q, index_k, cu, max(lengths), block_size=128, topk_blocks=2, local_blocks=1
     )
     fake = _FakeMSACannOps()
-    monkeypatch.setattr(msa_npu, "_cann_ops", lambda: fake)
-    layout = msa_npu._packed_layout(cu, max(lengths), sum(lengths))
-    actual = msa_npu._SplitKVGBSA.apply(*inputs, selected, layout, 0.17)
+    _install_fake_cann_ops(monkeypatch, fake)
+    actual = msa_npu._SplitKVGBSA.apply(*inputs, selected, cu, max(lengths) + max_seqlen_padding, 0.17)
+    torch.testing.assert_close(fake.q2k, selected.permute(1, 0, 2))
     reference_inputs = [tensor.detach().clone().requires_grad_() for tensor in inputs]
     expected = minimax_sparse_attention_eager(
         *reference_inputs, selected, cu, max(lengths), block_size=128, scale=0.17
@@ -538,8 +584,7 @@ def test_cann_split_kv_gbsa_autograd_matches_eager_through_both_index_formats(mo
 
 
 def test_cann_empty_pack_has_zero_gradients_without_loading_ops(monkeypatch):
-    monkeypatch.setattr(msa_npu, "_check_npu_tensors", lambda *args: None)
-    monkeypatch.setattr(msa_npu, "_cann_ops", lambda: pytest.fail("Empty input must not load CANN"))
+    monkeypatch.setitem(sys.modules, "cann_ops_transformer", None)
     q = torch.empty(0, 4, 128, dtype=torch.bfloat16, requires_grad=True)
     k = torch.empty(0, 2, 128, dtype=torch.bfloat16, requires_grad=True)
     v = torch.empty_like(k, requires_grad=True)
@@ -551,27 +596,13 @@ def test_cann_empty_pack_has_zero_gradients_without_loading_ops(monkeypatch):
         assert grad.shape == source.shape and grad.numel() == 0
 
 
-@pytest.mark.parametrize(
-    ("prefix", "max_seqlen", "total", "message"),
-    [
-        ([1, 3], 2, 3, "start at 0"),
-        ([0, 3, 2], 3, 2, "nondecreasing"),
-        ([0, 3], 2, 3, "cover every"),
-        ([0, 2], 2, 3, "packed token count"),
-    ],
-)
-def test_cann_rejects_invalid_packed_metadata(prefix, max_seqlen, total, message):
-    with pytest.raises(ValueError, match=message):
-        msa_npu._packed_layout(torch.tensor(prefix, dtype=torch.int32), max_seqlen, total)
-
-
 @pytest.mark.parametrize("dropout", [0.0, 0.2])
 def test_cann_attention_dense_and_dropout_use_eager_without_loading_cann(monkeypatch, dropout):
     q = torch.randn(5, 4, 8, requires_grad=True)
     k = torch.randn(5, 2, 8, requires_grad=True)
     v = torch.randn_like(k, requires_grad=True)
     indices = torch.zeros(5, 2, 3, dtype=torch.int32) if dropout else None
-    monkeypatch.setattr(msa_npu, "_cann_ops", lambda: pytest.fail("Fallback must not load CANN"))
+    monkeypatch.setitem(sys.modules, "cann_ops_transformer", None)
     kwargs = dict(block_size=2 if indices is not None else None, scale=0.3, dropout_p=dropout)
     torch.manual_seed(19)
     actual = msa_npu.minimax_sparse_attention_npu(q, k, v, indices, _cu_seqlens((2, 3)), 3, **kwargs)
@@ -605,10 +636,13 @@ def test_cann_registry_binds_both_slots_and_gates_hardware(monkeypatch):
 
 @pytest.mark.skipif(not is_torch_npu_available(), reason="Requires Ascend NPU")
 @pytest.mark.parametrize("heads", [4, 32], ids=["gqa2", "gqa16"])
-def test_cann_split_kv_gbsa_numerical_forward_and_backward(heads):
+@pytest.mark.parametrize(
+    ("lengths", "max_seqlen_padding"), [((129, 257, 1), 0), ((128,), 128)], ids=["packed", "padded_bound"]
+)
+def test_cann_split_kv_gbsa_numerical_forward_and_backward(heads, lengths, max_seqlen_padding):
     ops = pytest.importorskip("cann_ops_transformer.ops")
     required = (
-        "k2q_csr",
+        "build_k2q_csr",
         "npu_minimax_sparse_attention_split_kv",
         "generic_block_sparse_attention_grad_metadata",
         "generic_block_sparse_attention_grad",
@@ -616,7 +650,6 @@ def test_cann_split_kv_gbsa_numerical_forward_and_backward(heads):
     if any(not callable(getattr(ops, name, None)) for name in required):
         pytest.skip("The optional CANN MiniMax operator set is not installed")
     torch.manual_seed(37)
-    lengths = (129, 257, 1)
     cu = _cu_seqlens(lengths)
     cpu_inputs = [torch.randn(sum(lengths), h, 128).to(torch.bfloat16).float().requires_grad_() for h in (heads, 2, 2)]
     npu_inputs = [tensor.detach().to(device="npu", dtype=torch.bfloat16).requires_grad_() for tensor in cpu_inputs]
@@ -631,7 +664,7 @@ def test_cann_split_kv_gbsa_numerical_forward_and_backward(heads):
     )
     expected = minimax_sparse_attention_eager(*cpu_inputs, selected, cu, max(lengths), block_size=128, scale=0.11)
     actual = msa_npu.minimax_sparse_attention_npu(
-        *npu_inputs, selected.to("npu"), cu, max(lengths), block_size=128, scale=0.11
+        *npu_inputs, selected.to("npu"), cu, max(lengths) + max_seqlen_padding, block_size=128, scale=0.11
     )
     grad = torch.randn_like(expected).to(torch.bfloat16).float()
     expected_grads = torch.autograd.grad(expected, cpu_inputs, grad)
@@ -657,7 +690,7 @@ def test_cann_indexer_numerical_scores_and_topk():
         start_loc=torch.zeros(3, dtype=torch.int32, device="npu"),
         block_table=None,
         scale=None,
-        atten_mask=msa_npu._mask_template(q_npu.device),
+        atten_mask=torch.zeros((2048, 2048), dtype=torch.int8, device=q_npu.device),
         actual_seq_qlen=cu_npu,
         actual_seq_klen=cu_npu,
         layout_key="TND",

@@ -81,7 +81,7 @@ must be exported directly under `cann_ops_transformer.ops`:
 | Function | Use |
 |---|---|
 | `msa_index_score` | Index Q/K to FP32 block scores |
-| `k2q_csr` | Q-to-KV-block selections to interleaved KV-to-Q CSR |
+| `build_k2q_csr` | Upstream PyTorch helper: Q-to-KV-block selections to interleaved KV-to-Q CSR |
 | `npu_minimax_sparse_attention_split_kv` | Forward attention output and global FP32 LSE |
 | `generic_block_sparse_attention_grad_metadata` | Backward task metadata |
 | `generic_block_sparse_attention_grad` | Q/K/V gradients |
@@ -91,6 +91,23 @@ These signatures follow the ops-transformer wrappers analyzed at commit
 `experimental/` upstream and need to be exported into the namespace above by
 the installed extension package. VeOmni does not import `custom_ops`, fall
 back to another namespace, or bundle those vendor kernels.
+
+`build_k2q_csr` comes from
+`experimental/attention/minimax_sparse_attention_split_kv/torch_ops_extension/custom_ops/minimax_sparse_attention_split_kv_csr.py`.
+Install that directory's `torch_ops_extension` package and the regular CANN
+MSA/GBSA extensions first. Then install VeOmni's metadata-only bridge from
+the repository root, into the same Python environment:
+
+```bash
+python -m pip install --no-build-isolation --no-deps ./scripts/kernel/minimax_cann_bridge
+```
+
+The bridge exports `custom_ops:build_k2q_csr` and
+`custom_ops:npu_minimax_sparse_attention_split_kv` via the
+`cann_ops_transformer.ops` entry-point group. It does not compile or install
+the operator libraries. Restart Python after installation so the CANN loader
+discovers the entries. The separate native `minimax_build_k2q_csr` extension
+is no longer required by this backend.
 
 The indexer calls `msa_index_score` with `layout_key="TND"`,
 `sparse_mode=3`, no block table or dequantization scale, an int8
@@ -102,17 +119,22 @@ query before TopK. The model's local-block setting is preserved.
 FP32-minimum invalid scores are normalized to `-inf` and unused selection
 slots are filled with `-1`.
 
-The attention Function canonicalizes selections, removes duplicate and
-future-block edges, and builds CSR with `order_method=1` and
-`q_global_offset=True`. Split-KV consumes per-sequence int32 lengths and
+The indexer guarantees unique causal block IDs with trailing `-1` slots.
+The attention Function consumes that contract directly, without repeating
+filtering, sorting or deduplication. `build_k2q_csr` receives `[Hkv,T,K]`
+selections, per-sequence int32 lengths (not prefix sums),
+`index_mode="batch_local"`, and `input_layout="TND"`. It emits interleaved
+KV-block rows and global packed Q IDs. Split-KV consumes the same lengths and
 continuous TND Q/K/V, runs with `inner_precise=0`, and returns output plus
-`softmax_lse_flag=True`. Backward reuses the saved Q/K/V/output/LSE and compact
-selections, builds sorted local-query lists of shape `[B,Hkv,J,Smax]`, then
+`softmax_lse_flag=True`. Backward reuses the saved Q/K/V/output/LSE, CSR row
+pointers and Q IDs. It maps rows back to batch/block order, subtracts each
+sequence's Q offset, and sorts local-query lists of shape `[B,Hkv,J,Smax]`, then
 calls metadata and GBSA Grad with `block_shape=[1,128]`, causal mask mode 1,
-softmax precision 0, and the original model softmax scale. CSR uses int32
-prefix sums; GBSA uses int64 prefix sums. The forward CSR is not retained
-for backward. The frozen indexer receives no gradients; double backward is
-not supported.
+softmax precision 0, and the original model softmax scale. This sorting is
+necessary because the helper does not guarantee Q order within each CSR row.
+The model supplies packed prefix sums; GBSA receives their int64 device copy.
+CSR slot IDs are only needed by forward and are not saved for backward.
+The frozen indexer receives no gradients; double backward is not supported.
 
 Supported sparse inputs have `index_block_size=128`, attention head dimension
 128, index head dimension a positive multiple of 16 no larger than 128,
@@ -127,13 +149,18 @@ in the model, outside these two OpSlots; context parallelism remains unsupported
 This backend still has material memory costs. Split-KV's FP32 output partials
 scale as `T * Hq_local * K * D * 4` bytes, and backward query lists require
 `B * Hkv_local * ceil(Smax/128) * Smax * 4` bytes, plus conversion temporaries.
-The adapter reads the existing pack prefix sums on the host to determine CSR
-allocation sizes; device-resident `cu_seqlens` therefore introduces a D2H
-synchronization. Passing host prefix sums avoids that adapter copy, although
-the checked upstream index-score TND wrapper also reads lengths for its
-output allocation. This initial adapter uses PyTorch sorting for backward
-index conversion and makes no throughput guarantee. Measure the complete
-pipeline and workspace before increasing sequence length.
+The adapter uses the supplied Python `max_seqlen` and device prefix sums,
+without `.cpu()`, `.item()` or `.tolist()` reads. Its per-indexer and
+per-attention host layout copies have been removed. GBSA's sequence-capacity
+bound is clamped to the total packed token count, as required by its TND
+tiling checks. However, the checked
+upstream CSR helper still calls `meta.tolist()`, and the index-score TND
+extension calls `kv_len.cpu()` for output allocation. This is not a
+synchronization-free pipeline. The Python helper also sorts edges; replacing
+the native CSR builder is not a throughput guarantee. Backward saves
+`Hkv * (total_kv_rows + 1)` int32 row pointers in addition to the
+`Hkv * T * K` int32 Q IDs that replace saved block selections. Measure the
+complete pipeline and workspace before increasing sequence length.
 
 Run the tests with the custom operators installed:
 
