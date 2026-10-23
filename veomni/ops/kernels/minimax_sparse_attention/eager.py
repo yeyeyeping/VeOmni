@@ -125,7 +125,12 @@ def _block_causal_keep(
         (batch, num_groups, seq_len, num_key_blocks + 1), dtype=torch.bool, device=block_indices.device
     )
     selected.scatter_(-1, safe, True)
-    block_keep = selected[..., :num_key_blocks].repeat_interleave(block_size, dim=-1)[..., :seq_len]
+
+    # 用 FP16 执行末维重复，绕过待排查的 INT8 慢路径
+    block_keep = selected[..., :num_key_blocks].to(torch.float16)
+    block_keep = block_keep.repeat_interleave(block_size, dim=-1)[..., :seq_len]
+    block_keep = block_keep.bool()
+
     block_keep = block_keep.repeat_interleave(num_query_heads // num_groups, dim=1)
 
     positions = torch.arange(seq_len, device=block_indices.device)
@@ -136,6 +141,7 @@ def _block_causal_keep(
     # resulting NaN rows leak into K/V gradients through a zero upstream grad.
     # Let them attend everywhere instead: `_pack` drops their outputs.
     return keep | padding[:, None, :, None]
+
 
 
 def _dense_attention(
