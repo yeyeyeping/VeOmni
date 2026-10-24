@@ -164,11 +164,14 @@ class _SplitKVGBSA(torch.autograd.Function):
         q, k, v, out, lse, row_ptr, q_idx, cu = ctx.saved_tensors
         sparse_idx, sparse_count = _csr_to_gbsa(row_ptr, q_idx, cu, ctx.max_seqlen)
         cu_i64 = cu.to(torch.int64)
+        # CANN GBSA requires one int32 used length per packed sequence.
+        # Pass the same lengths to metadata and backward, including empty segments.
+        lengths = cu.diff().contiguous()
         attrs = dict(
             cu_seqlens_q=cu_i64,
             cu_seqlens_kv=cu_i64,
-            seqused_q=None,
-            seqused_kv=None,
+            seqused_q=lengths,
+            seqused_kv=lengths,
             layout_q="TND",
             layout_kv="TND",
             layout_sparse_pattern=1,

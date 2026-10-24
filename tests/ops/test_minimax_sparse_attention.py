@@ -430,6 +430,7 @@ class _FakeMSACannOps:
                     end = min(int(cu[b + 1]), begin + 128, query + 1)
                     keep[h, query, begin:end] = True
         self.forward_keep = keep
+        self.forward_lengths = lengths.clone()
         return _attention_from_keep(q, k, v, keep, kwargs["scale_value"])
 
     def generic_block_sparse_attention_grad_metadata(self, idx, count, hq, hkv, dim, block_shape, **kwargs):
@@ -438,6 +439,11 @@ class _FakeMSACannOps:
         assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_kv"] == idx.shape[-1]
         assert kwargs["cu_seqlens_q"].dtype == kwargs["cu_seqlens_kv"].dtype == torch.int64
         assert idx.dtype == count.dtype == torch.int32
+        for name in ("seqused_q", "seqused_kv"):
+            lengths = kwargs[name]
+            assert isinstance(lengths, torch.Tensor)
+            assert lengths.shape == (idx.shape[0],) and lengths.is_contiguous()
+            torch.testing.assert_close(lengths, self.forward_lengths)
         self.grad_attrs = {key: value for key, value in kwargs.items() if not key.startswith("max_seqlen_")}
         self.metadata = torch.zeros(198, dtype=torch.int32)
         return self.metadata
@@ -551,8 +557,8 @@ def test_cann_csr_to_gbsa_preserves_edges_without_host_reads_or_sort(monkeypatch
 
 @pytest.mark.parametrize(
     "lengths",
-    [(129, 257, 1), (0, 129, 0, 257, 1), (128,), (0, 1, 0)],
-    ids=["packed", "empty_segments", "single", "single_token"],
+    [(129, 257, 1), (0, 129, 0, 257, 1), (128,), (0, 1, 0), (1, 2, 3) * 7],
+    ids=["packed", "empty_segments", "single", "single_token", "packed_21"],
 )
 @pytest.mark.parametrize("max_seqlen_padding", [0, 128])
 def test_cann_split_kv_gbsa_autograd_matches_eager_through_both_index_formats(
@@ -663,7 +669,9 @@ def test_cann_native_csr_matches_sorted_reference(lengths):
 @pytest.mark.parametrize("cu_device", ["cpu", "npu"])
 @pytest.mark.parametrize("heads", [4, 32], ids=["gqa2", "gqa16"])
 @pytest.mark.parametrize(
-    ("lengths", "max_seqlen_padding"), [((129, 257, 1), 0), ((128,), 128)], ids=["packed", "padded_bound"]
+    ("lengths", "max_seqlen_padding"),
+    [((129, 257, 1), 0), ((128,), 128), ((1, 2, 3) * 7, 0)],
+    ids=["packed", "padded_bound", "packed_21"],
 )
 def test_cann_split_kv_gbsa_numerical_forward_and_backward(heads, lengths, max_seqlen_padding, cu_device):
     ops = pytest.importorskip("cann_ops_transformer.ops")
