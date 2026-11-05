@@ -230,6 +230,7 @@ jobs:
         # `uv sync --extra npu --group dev` step already installs it — no extra
         # sync needed here.
         run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_veomni_lora_moe_native.py
           uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
       - name: Run MoE-LoRA NPU fused vs eager parity
         # Numerical gate for the new NPU fused MoE-LoRA autograd composition

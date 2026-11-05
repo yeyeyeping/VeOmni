@@ -728,3 +728,15 @@ shared and independent native wrappers on eager and fused_npu paths, including
 EP. Select their fused `gate_up_proj` and `down_proj` using `target_parameters`.
 The older fused Triton LoRA backend rejects this activation explicitly.
 The port follows `0188c9ee` without adopting the newer operator registry.
+
+
+### Preserving frozen parameter storage
+
+`build_parallelize_model(..., is_peft_model=True, preserve_frozen_dtype=True)`
+retains caller-selected dtypes of frozen parameters and buffers, while upcasting
+trainable parameters (and existing gradients) to FP32. The option requires FSDP2
+and enabled mixed precision with an explicit compute `param_dtype`. It defaults
+to false, preserving the existing whole-model FP32 conversion for other callers.
+Choose the storage dtypes before parallelization. This option does not itself
+choose a frozen dtype or exempt a module from compute casting; model-specific
+FP32 routers should use `get_ignore_modules_in_mixed_precision()`.
