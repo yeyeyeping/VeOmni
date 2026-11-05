@@ -40,6 +40,7 @@ _FIELD_TO_OP = {
     "load_balancing_loss_implementation": "load_balancing_loss",
     "mhc_implementation": "mhc",
     "moe_implementation": "moe_experts",
+    "minimax_sparse_attention_implementation": "minimax_sparse_attention",
     "qsa_attention_implementation": "qsa_attention",
     "rms_norm_gated_implementation": "rms_norm_gated",
     "rms_norm_implementation": "rms_norm",

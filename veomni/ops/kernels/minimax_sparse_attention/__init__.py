@@ -36,18 +36,16 @@ Only sparse layers use these operators. Dense MiniMax layers call the standard
 all-to-all, and ``cu_seqlens`` describes every packed sequence, including the
 synthetic SP tail-padding sequence appended by the collator.
 
-MiniMax generated modeling constructs ``VeomniOp("minimax_sparse_attention",
-"indexer")`` and ``VeomniOp("minimax_sparse_attention", "attention")``, which
-resolve to the ``eager`` rows below (the only implementation today). On Ascend
-NPU tensors the eager attention runs its masked softmax through
-``torch_npu.npu_fusion_attention``; the indexer stays eager. A kernel backend
-registers rows for both variants (and, once there is a choice to make, a
-``minimax_sparse_attention_implementation`` config field); the model code does
-not change.
+MiniMax generated modeling binds both variants from the instance's
+``minimax_sparse_attention_implementation`` selection. ``eager`` is the default;
+``npu`` opts into the experimental CANN indexer and Split-KV/GBSA training
+backend. Dense layers keep the configured standard FlashAttention backend.
 """
 
+from ...platform import NpuKernelRequirement
 from ...registry import register_op
 from .eager import minimax_sparse_attention_eager, minimax_sparse_indexer_eager
+from .npu import minimax_sparse_attention_npu, minimax_sparse_indexer_npu
 
 
 register_op(
@@ -64,6 +62,26 @@ register_op(
     "eager",
     description="MiniMax M3 block-sparse attention on packed TND input (npu_fusion_attention on Ascend)",
     wrapper=minimax_sparse_attention_eager,
+)
+
+
+register_op(
+    "minimax_sparse_attention",
+    "indexer",
+    "npu",
+    description="Experimental Ascend CANN MiniMax M3 sparse indexer",
+    wrapper=minimax_sparse_indexer_npu,
+    requirement=NpuKernelRequirement(),
+    requires=("cann_ops_transformer",),
+)
+register_op(
+    "minimax_sparse_attention",
+    "attention",
+    "npu",
+    description="Experimental Ascend CANN MiniMax M3 Split-KV forward and GBSA backward",
+    wrapper=minimax_sparse_attention_npu,
+    requirement=NpuKernelRequirement(),
+    requires=("cann_ops_transformer",),
 )
 
 

@@ -89,6 +89,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from veomni.models.transformers.minimax_m3_vl.ulysses import start_minimax_ulysses_projections
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.attention.ulysses import (
     gather_seq_scatter_kv_heads,
@@ -218,7 +219,16 @@ def _require_varlen_attention(attention_implementation, *, num_segments, ulysses
 
 
 def _minimax_m3_sparse_attention(
-    attention, query_states, key_states, value_states, hidden_states, position_embeddings, *, dropout, **kwargs
+    attention,
+    query_states,
+    key_states,
+    value_states,
+    hidden_states,
+    position_embeddings,
+    *,
+    dropout,
+    projected=None,
+    **kwargs,
 ):
     """Run one sparse layer's block selection and attention on packed ``[1, H, S, D]`` Q/K/V.
 
@@ -228,31 +238,35 @@ def _minimax_m3_sparse_attention(
     consume TND tensors; any padded layout they need stays inside them. Returns
     ``[1, S, Hq, D]`` in the local sequence layout.
     """
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
     indexer = attention.indexer
-    index_query, index_key = _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings)
-
     parallel_state = get_parallel_state()
-    if parallel_state.ulysses_enabled:
-        query_states, key_states, value_states, _ = prepare_ulysses_qkv(
-            query_states,
-            key_states,
-            value_states,
-            group=parallel_state.ulysses_group,
-            ulysses_size=parallel_state.ulysses_size,
-        )
-        index_query = gather_seq_scatter_kv_heads(
-            index_query,
-            group=parallel_state.ulysses_group,
-            ulysses_size=parallel_state.ulysses_size,
-        )
-        # Index K has no grad and equal-length shards, so a fixed-size gather
-        # sizes its buffer locally and skips gather_outputs' host shape read.
-        # The gather is not differentiable: a trainable indexer needs autograd here.
-        index_key = _all_gather_into_tensor(index_key[0].contiguous(), group=parallel_state.ulysses_group)
-        index_key = index_key.unsqueeze(0)
+    if projected is None:
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        index_query, index_key = _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings)
+
+        if parallel_state.ulysses_enabled:
+            query_states, key_states, value_states, _ = prepare_ulysses_qkv(
+                query_states,
+                key_states,
+                value_states,
+                group=parallel_state.ulysses_group,
+                ulysses_size=parallel_state.ulysses_size,
+            )
+            index_query = gather_seq_scatter_kv_heads(
+                index_query,
+                group=parallel_state.ulysses_group,
+                ulysses_size=parallel_state.ulysses_size,
+            )
+            # Index K has no grad and equal-length shards, so a fixed-size gather
+            # sizes its buffer locally and skips gather_outputs' host shape read.
+            # The gather is not differentiable: a trainable indexer needs autograd here.
+            index_key = _all_gather_into_tensor(index_key[0].contiguous(), group=parallel_state.ulysses_group)
+            index_key = index_key.unsqueeze(0)
+
+    else:
+        main_collectors, index_query, index_key = projected
 
     # The text model guarantees packed varlen metadata; training packs samples
     # with identical query/key boundaries.
@@ -267,6 +281,8 @@ def _minimax_m3_sparse_attention(
         topk_blocks=indexer.topk_blocks,
         local_blocks=indexer.local_blocks,
     )
+    if projected is not None:
+        query_states, key_states, value_states = (collect() for collect in main_collectors)
     attn_output = attention.veomni_msa_attention(
         query_states[0],
         key_states[0],
@@ -679,8 +695,9 @@ class MiniMaxM3VLAttention(nn.Module):
         if self.indexer is None:
             self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
         else:
-            self.veomni_msa_indexer = VeomniOp("minimax_sparse_attention", "indexer")
-            self.veomni_msa_attention = VeomniOp("minimax_sparse_attention", "attention")
+            impl = self.config.ops_config.minimax_sparse_attention_implementation
+            self.veomni_msa_indexer = VeomniOp("minimax_sparse_attention", "indexer", impl)
+            self.veomni_msa_attention = VeomniOp("minimax_sparse_attention", "attention", impl)
 
     # ================================================================
     # Patch: MiniMaxM3VLAttention.forward
@@ -702,38 +719,75 @@ class MiniMaxM3VLAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # --- Patch.1 ---
-        dropout = 0.0 if not self.training else self.attention_dropout
-        if self.indexer is None:
-            attn_output, _ = self.veomni_attn(
+        parallel_state = get_parallel_state()
+        async_ulysses = parallel_state.ulysses_enabled and parallel_state.async_enabled
+        if async_ulysses:
+            projected = start_minimax_ulysses_projections(
                 self,
-                query_states,
-                key_states,
-                value_states,
-                None,
-                dropout=dropout,
-                scaling=self.scaling,
-                **kwargs,
-            )
-        else:
-            attn_output = _minimax_m3_sparse_attention(
-                self,
-                query_states,
-                key_states,
-                value_states,
                 hidden_states,
                 position_embeddings,
-                dropout=dropout,
-                **kwargs,
+                group=parallel_state.ulysses_group,
+                ulysses_size=parallel_state.ulysses_size,
             )
-        # --- Patch.1 ---
+            dropout = self.attention_dropout if self.training else 0.0
+            if self.indexer is None:
+                query_states, key_states, value_states = (collect().transpose(1, 2) for collect in projected[0])
+                attn_output, _ = self.veomni_attn(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    None,
+                    dropout=dropout,
+                    scaling=self.scaling,
+                    **{**kwargs, "skip_ulysses": True},
+                )
+                attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)
+            else:
+                attn_output = _minimax_m3_sparse_attention(
+                    self,
+                    None,
+                    None,
+                    None,
+                    hidden_states,
+                    position_embeddings,
+                    dropout=dropout,
+                    projected=projected,
+                    **kwargs,
+                )
+        else:
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            # --- Patch.1 ---
+            dropout = 0.0 if not self.training else self.attention_dropout
+            if self.indexer is None:
+                attn_output, _ = self.veomni_attn(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    None,
+                    dropout=dropout,
+                    scaling=self.scaling,
+                    **kwargs,
+                )
+            else:
+                attn_output = _minimax_m3_sparse_attention(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    hidden_states,
+                    position_embeddings,
+                    dropout=dropout,
+                    **kwargs,
+                )
+            # --- Patch.1 ---
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_output), None

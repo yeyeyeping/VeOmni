@@ -158,6 +158,8 @@ _BUILTIN_ENTRIES = (
     ("qsa_attention", "standard", "torch_npu", "npu", _NPU, ()),
     ("minimax_sparse_attention", "indexer", "eager", "any", _ANY, ()),
     ("minimax_sparse_attention", "attention", "eager", "any", _ANY, ()),
+    ("minimax_sparse_attention", "indexer", "npu", "npu", _NPU, ("cann_ops_transformer",)),
+    ("minimax_sparse_attention", "attention", "npu", "npu", _NPU, ("cann_ops_transformer",)),
     ("moe_experts", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),

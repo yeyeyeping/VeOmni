@@ -76,6 +76,188 @@ The public MiniMax checkpoint stores separate per-expert `w1`/`w2`/`w3` tensors.
 
 Exported Hugging Face weights (`save_hf_weights`) use the transformers-native layout: `model.language_model.*`, fused `mlp.experts.gate_up_proj` / `down_proj`, `self_attn.indexer.*`, and a `config.json` with `layer_types` / `index_*` fields. Transformers loads them directly, but vLLM and SGLang read the original MiniMax layout (`language_model.model.*`, per-expert `block_sparse_moe.experts.{j}.w{1,2,3}`, `index_{q,k}_proj`) and the legacy `sparse_attention_config` / `moe_layer_freq` config fields, so an export cannot be served by them without converting back. For the same reason, RL frameworks that sync actor weights into a vLLM/SGLang rollout (e.g. verl's VeOmni engine) are not supported yet: the checkpoint converter does not implement `export_weights`, and the rollout loader silently skips the unmatched names.
 
+## Experimental CANN Sparse Attention
+
+This backend is under development and has not completed target-device qualification.
+Use `configs/multimodal/minimax_m3_vl/minimax_m3_vl_npu_cann.yaml` to opt in;
+the baseline `minimax_m3_vl_npu.yaml` keeps eager sparse attention.
+
+
+The experimental NPU CANN example selects the CANN language attention backend explicitly:
+
+```yaml
+model:
+  ops_implementation:
+    minimax_sparse_attention_implementation: npu
+```
+
+The default for this field is `eager`. Set it to `eager` to run without the
+custom MiniMax CANN operators for sparse layers. Dense language layers and
+vision still use the FlashAttention backend selected by `attn_implementation`.
+
+Install the CANN operator libraries and matching Torch extensions for the
+target device before enabling this backend. The following callable names
+must be exported directly under `cann_ops_transformer.ops`:
+
+| Function | Use |
+|---|---|
+| `msa_index_score` | Index Q/K to FP32 block scores |
+| `k2q_csr` | Native AscendC pipeline: selections to interleaved KV-to-Q CSR with ascending Q IDs |
+| `npu_minimax_sparse_attention_split_kv` | Forward attention output and global FP32 LSE |
+| `generic_block_sparse_attention_grad_metadata` | Backward task metadata |
+| `generic_block_sparse_attention_grad` | Q/K/V gradients |
+
+These signatures follow the ops-transformer wrappers analyzed at commit
+`41121b97f9bf46e3c9575f366095390f13bbe280`. Some of those wrappers live under
+`experimental/` upstream and need to be exported into the namespace above by
+the installed extension package. VeOmni does not import `custom_ops`, fall
+back to another namespace, or bundle those vendor kernels.
+
+`k2q_csr` comes from `experimental/attention/minimax_build_k2q_csr`; install
+both its CANN operator libraries and its Torch extension, exporting
+`k2q_csr` under `cann_ops_transformer.ops`. Build the extension from the
+ops-transformer repository root with
+`bash build.sh --torch_extension --experimental --ops=minimax_build_k2q_csr --vendor_name=minimax_csr`,
+then install the resulting `build_out/cann_ops_transformer_minimax_csr-*.whl`
+alongside the regular `cann_ops_transformer` package. The operator's
+`torch_extension/` directory is not a standalone pip project.
+The Split-KV extension comes from
+`experimental/attention/minimax_sparse_attention_split_kv/torch_ops_extension`.
+Install it and the regular MSA/GBSA extensions, then install VeOmni's
+metadata-only bridge from the repository root, into the same Python environment:
+
+```bash
+python -m pip install --upgrade --no-build-isolation --no-deps ./scripts/kernel/minimax_cann_bridge
+```
+
+The bridge exports `custom_ops:npu_minimax_sparse_attention_split_kv` via the
+`cann_ops_transformer.ops` entry-point group. It does not compile or install
+the operator libraries. Restart Python after installation so the CANN loader
+discovers the entries. The separate native `minimax_build_k2q_csr` extension
+is required; the Python `build_k2q_csr` helper is not used by this backend.
+
+The indexer calls `msa_index_score` with `layout_key="TND"`,
+`sparse_mode=3`, no block table or dequantization scale, an int8
+`[2048,2048]` zero mask template, and `init_blocks=local_blocks=0`.
+The checked kernel ignores mask tensor contents and computes right-down
+causal bounds from the packed lengths. Its internal local boost uses one
+`start_loc` per sequence, so VeOmni instead applies `index_local_blocks` per
+query before TopK. The model's local-block setting is preserved.
+FP32-minimum invalid scores are normalized to `-inf` and unused selection
+slots are filled with `-1`.
+
+The indexer guarantees unique causal block IDs with trailing `-1` slots.
+The attention Function consumes that contract directly, without repeating
+filtering, sorting or deduplication. `k2q_csr` receives `[Hkv,T,K]`
+selections, int32 Q prefix sums and int32 KV-block-count prefix sums. It uses
+`order_method=1`, `q_global_offset=True`, and `use_simt=False` to emit interleaved
+KV-block rows with ascending global packed Q IDs. Split-KV consumes per-sequence
+int32 lengths (not prefix sums) and
+continuous TND Q/K/V, runs with `inner_precise=0`, and returns output plus
+`softmax_lse_flag=True`. Backward reuses the saved Q/K/V/output/LSE, CSR row
+pointers and Q IDs. It maps rows back to batch/block order, subtracts each
+sequence's Q offset, and pads local-query lists to `[B,Hkv,J,Smax]`, then
+calls metadata and GBSA Grad with `block_shape=[1,128]`, causal mask mode 1,
+softmax precision 0, and the original model softmax scale. Backward does not
+sort: it relies on ascending Q order from the native CSR MC implementation.
+The model supplies packed prefix sums; GBSA receives their int64 device copy.
+CSR slot IDs are only needed by forward and are not saved for backward.
+The frozen indexer receives no gradients; double backward is not supported.
+
+Supported sparse inputs have `index_block_size=128`, attention head dimension
+128, index head dimension a positive multiple of 16 no larger than 128,
+matching BF16 Q/K/V, and an integral Q-to-KV head ratio no larger than 16.
+FP16 is accepted where supported by the installed split-KV implementation;
+its Ascend 950 path requires BF16 for this non-quantized configuration.
+Unsupported sparse shapes raise. Sparse layers with nonzero attention dropout
+retain the existing eager path; dense layers use FlashAttention directly in
+the model. Packing isolates all samples, including a
+synthetic sequence used for SP tail padding. Ulysses communication remains
+in the model, outside these two instance-local VeomniOps; context parallelism remains unsupported.
+
+This backend still has material memory costs. Split-KV's FP32 output partials
+scale as `T * Hq_local * K * D * 4` bytes, and backward query lists require
+`B * Hkv_local * ceil(Smax/128) * Smax * 4` bytes, plus conversion temporaries.
+The adapter uses the supplied Python `max_seqlen` and prefix sums without
+copying device metadata to the host. When prefix sums are on CPU, it computes
+`total_rows` and `max_kv` there; for one packed sequence these sizes can also
+be derived from the token shape. Otherwise it leaves both sizes unset, and
+the native CSR wrapper reads the device block-prefix sums once to infer them.
+GBSA's sequence-capacity bound is clamped to the total packed token count,
+as required by its TND tiling checks. The index-score TND extension also
+calls `kv_len.cpu()` for output allocation, so this is not a synchronization-free
+pipeline. Switching to native CSR removes the Python helper's edge sort and
+the adapter's backward sort, but the GBSA rectangular output and gather
+temporaries remain. Backward saves
+`Hkv * (total_kv_rows + 1)` int32 row pointers in addition to the
+`Hkv * T * K` int32 Q IDs that replace saved block selections. Measure the
+complete pipeline and workspace before increasing sequence length.
+
+Run the tests with the custom operators installed:
+
+```bash
+pytest -v tests/ops/minimax_sparse_attention/test_npu.py
+```
+
+CPU contract tests check finite invalid fill, TopK, interleaved CSR, sorted
+batch-local backward lists, and autograd wiring against eager math. Actual
+NPU tests separately check exact native CSR Q/slot order, block scores, and
+fixed-selection attention outputs/QKV gradients, including GQA ratios 2 and 16
+and both CPU and NPU prefix sums. Those tests
+skip when hardware or the optional operator set is absent; CPU success alone
+does not establish vendor-kernel numerical agreement.
+
+## Projection and Ulysses Overlap
+
+Enable the MiniMax language forward pipeline with:
+
+```yaml
+model:
+  accelerator:
+    ulysses_size: 2
+    enable_async: true
+```
+
+The experimental NPU CANN example enables this option. It is active only when Ulysses size is
+greater than one; disabling `enable_async` retains the serial projection and
+communication path. All ranks must use the same setting.
+
+The asynchronous path starts the frozen Index K projection/Norm/RoPE and its
+all-gather first, then starts Index Q projection/Norm/RoPE and its head/sequence
+all-to-all. It subsequently runs each main Q/K/V projection and immediately
+launches that tensor's all-to-all. Main Q/K normalization and partial RoPE
+are applied locally before exchange, matching the serial math. The indexer
+waits occur after these projections. Main Q/K/V waits are deferred until
+after block selection, immediately before attention. Dense layers wait for
+the same main exchanges,
+then call FlashAttention with `skip_ulysses=True`; the model restores the local
+sequence layout once after either dense or sparse attention. This permits indexer
+communication to overlap main projections, main communication to overlap
+later projections, and pending main exchanges to overlap indexer selection.
+
+Tensor ownership is unchanged: each attention rank still holds the full
+sequence and its local head slice. Index Q is exchanged before selection,
+Index K is gathered, and block indices require no additional exchange. The
+single-head Index K uses one asynchronous equal-shard all-gather without a
+host shape exchange; VeOmni's packed SP padding guarantees equal local token
+counts.
+
+The pipeline invokes the original Linear and Norm modules, preserving their
+hooks, parameter gradients, and adapter behavior. A small autograd wrapper
+connects each deferred main exchange to its inverse all-to-all in backward,
+including KV-head repetition when Ulysses size exceeds the KV-head count.
+The indexer stays frozen and runs under `no_grad`. This schedules forward
+overlap; backward uses the inverse exchanges and normal projection autograd.
+
+Tests in `tests/models/test_minimax_m3_vl_ops.py` check projection/launch/wait
+ordering and partial RoPE, and compare serial versus asynchronous outputs,
+input gradients and projection/normalization parameter gradients with two
+processes. They cover sparse and dense layers, KV-head repetition, packed
+boundaries, SP tail padding and non-reentrant checkpointing. CPU/Gloo checks
+run without accelerators; NCCL/HCCL cases require two matching devices.
+Scheduling and numerical parity do not establish a speedup: confirm actual
+device overlap and exposed communication time with a target-device trace.
+
 To regenerate generated modeling files:
 
 ```bash

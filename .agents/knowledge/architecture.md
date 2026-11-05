@@ -381,3 +381,14 @@ overrides EP expert FSDP placement for either BF16 or FP8. Whole-expert
 dimension is recorded in `SpecInfo` for DCP resharding. The shared EP combine
 uses the registered `moe_unpermute` op with fused weighting/scatter on NVIDIA
 GPUs and eager PyTorch on other devices, retaining FP32 accumulation.
+
+### MiniMax M3 experimental sparse attention
+
+MiniMax M3 sparse layers bind `minimax_sparse_attention/indexer` and `/attention`
+from `config.ops_config.minimax_sparse_attention_implementation` (`eager` by
+default; `npu` selects optional CANN kernels). The CANN adapter lives in
+`veomni/ops/kernels/minimax_sparse_attention/npu.py`; projection/Ulysses
+scheduling remains model-specific in
+`veomni/models/transformers/minimax_m3_vl/ulysses.py`. Dense and vision layers
+use the standard attention family. See `docs/examples/minimax_m3_vl.md` for
+the experimental recipe and native-kernel testing limits.

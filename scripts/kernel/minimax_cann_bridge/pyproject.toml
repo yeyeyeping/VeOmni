@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "veomni-minimax-cann-bridge"
+version = "0.3.0"
+description = "Expose MiniMax Split-KV through cann_ops_transformer.ops"
+requires-python = ">=3.11"
+dependencies = ["cann_ops_transformer", "custom_ops"]
+
+[project.entry-points."cann_ops_transformer.ops"]
+npu_minimax_sparse_attention_split_kv = "custom_ops:npu_minimax_sparse_attention_split_kv"
+
+[tool.setuptools]
+packages = []

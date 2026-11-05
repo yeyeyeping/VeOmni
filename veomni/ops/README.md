@@ -57,7 +57,7 @@ when the selected implementation runs.
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
-| `minimax_sparse_attention` | `indexer`, `attention` | `eager` (Ascend NPU tensors run the masked softmax through `torch_npu.npu_fusion_attention`) |
+| `minimax_sparse_attention` | `indexer`, `attention` | `eager`, experimental `npu` (CANN indexer, Split-KV forward and GBSA backward) |
 
 The MLU `liger_kernel` rows reuse the CUDA adapters and use
 `MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
@@ -94,9 +94,11 @@ standard varlen `cu_seqlens` / `max_seqlen` metadata. `indexer` selects
 `[T, G, topk]` key blocks per query and KV group (`-1` marks an unused slot);
 `attention` applies them with token-level causality inside each block. Only
 sparse layers call it; dense MiniMax layers use the standard `attention` family
-selected by `attn_implementation`. It has no config field yet:
-the model resolves the default row, and a kernel backend adds its rows (and a
-`minimax_sparse_attention_implementation` field once there is a choice). MoE
+selected by `attn_implementation`. Each sparse layer binds both variants from
+`minimax_sparse_attention_implementation`: `eager` (default) or experimental
+`npu` (requires optional CANN extensions). See the
+[MiniMax guide](../../docs/examples/minimax_m3_vl.md) for installation, shapes,
+and hardware qualification limits. MoE
 `swiglu_oai` keeps the merged gate/up layout and replaces SiLU with the clamped
 `(up + 1) * gate * sigmoid(alpha * gate)` activation on the standard fused
 Triton and NPU paths, including EP.
