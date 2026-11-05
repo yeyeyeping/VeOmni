@@ -719,3 +719,12 @@ torchrun --nproc_per_node=4 tests/lora/test_moe_lora_trainer.py \
 1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.safetensors`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
 2. DCP-resume subprocess loads the step-2 DCP shard, continues to step 4, and the resulting LoRA tensors must be **bit-exact** vs the writer's `on_train_end` snapshot (DCP ships model + optimizer + RNG + dataloader state).
 3. LoRA-adapter-resume subprocess loads the step-4 HF adapter via `model.lora_config.lora_adapter`, and the resulting `on_train_begin` snapshot (= post-load, pre-train) must be bit-exact vs the writer's `on_train_end` snapshot in bf16 (the on-disk adapter dtype).
+
+
+### Local M3 SwiGLU-OAI support
+
+M3 routed experts with `swiglu_alpha` and `swiglu_limit` are supported by
+shared and independent native wrappers on eager and fused_npu paths, including
+EP. Select their fused `gate_up_proj` and `down_proj` using `target_parameters`.
+The older fused Triton LoRA backend rejects this activation explicitly.
+The port follows `0188c9ee` without adopting the newer operator registry.

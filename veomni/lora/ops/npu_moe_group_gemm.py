@@ -56,6 +56,7 @@ import torch_npu
 
 from ...distributed.parallel_state import get_parallel_state
 from ...ops.kernels.moe.npu_group_gemm import (
+    _apply_moe_activation,
     alltoall_combine,
     alltoall_dispatch,
     dispatch_preprocess,
@@ -143,6 +144,8 @@ def _npu_fused_lora_moe_forward(
     lora_scale_up: float,
     lora_scale_down: float,
     independent: bool,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """NPU single-device (non-EP) fused MoE forward + seed-style two-LoRA."""
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -168,7 +171,7 @@ def _npu_fused_lora_moe_forward(
         tokens_per_expert,
         independent,
     )
-    intermediate = torch_npu.npu_swiglu(gate_up, dim=-1)
+    intermediate = _apply_moe_activation(gate_up, swiglu_limit, swiglu_alpha)
     output = npu_group_gemm(intermediate, fc2_weight.transpose(1, 2), tokens_per_expert)
     output = output + _lora_down_delta(
         intermediate, lora_a_down, lora_b_down, lora_scale_down, tokens_per_expert, independent
@@ -194,6 +197,8 @@ def _npu_ep_fused_lora_moe_forward(
     lora_scale_down: float,
     independent: bool,
     ep_group: dist.ProcessGroup | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward + seed-style two-LoRA.
 
@@ -236,7 +241,7 @@ def _npu_ep_fused_lora_moe_forward(
         group_list,
         independent,
     )
-    intermediate = torch_npu.npu_swiglu(gate_up, dim=-1)
+    intermediate = _apply_moe_activation(gate_up, swiglu_limit, swiglu_alpha)
     output = npu_group_gemm(intermediate, fc2_weight.transpose(1, 2), group_list)
     output = output + _lora_down_delta(
         intermediate, lora_a_down, lora_b_down, lora_scale_down, group_list, independent
@@ -280,6 +285,8 @@ def npu_fused_lora_moe_forward(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """NPU Mode-2 (shared) fused MoE-LoRA forward.
 
@@ -304,6 +311,8 @@ def npu_fused_lora_moe_forward(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -323,6 +332,8 @@ def npu_fused_independent_lora_moe_forward(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """NPU Mode-1 (independent per-expert) fused MoE-LoRA forward.
 
@@ -347,4 +358,6 @@ def npu_fused_independent_lora_moe_forward(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
     )
