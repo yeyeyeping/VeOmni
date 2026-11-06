@@ -244,6 +244,8 @@ _REPO_ROOT = Path(moe_router_replay.__file__).resolve().parents[2]
 # unhooked shifts every learned router's target by three layers, which just
 # degrades the trained policy instead of raising.
 _GENERATED_FILES = {
+    _REPO_ROOT / "veomni/models/transformers/minimax_m3_vl/generated/patched_modeling_minimax_m3_vl_gpu.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/minimax_m3_vl/generated/patched_modeling_minimax_m3_vl_npu.py": 1,
     _REPO_ROOT / "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py": 1,
     _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_gpu.py": 1,
     _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py": 1,

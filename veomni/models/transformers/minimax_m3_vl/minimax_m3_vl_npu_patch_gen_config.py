@@ -37,6 +37,7 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     minimax_m3_vl_indexer_init_patched,
     minimax_m3_vl_model_forward_patched,
     minimax_m3_vl_rmsnorm_forward_patched,
+    minimax_m3_vl_router_forward_patched,
     minimax_m3_vl_sparse_for_conditional_generation_forward_patched,
     minimax_m3_vl_text_model_forward_patched,
     minimax_m3_vl_vision_dummy_forward_patched,
@@ -166,3 +167,9 @@ config.override_method(
 )
 
 config.add_helper_after("MiniMaxM3VLCausalLMOutputWithPast", MiniMaxM3VLCausalLMOutputWithLogProbs)
+
+config.override_method(
+    "MiniMaxM3VLTopKRouter.forward",
+    replacement=minimax_m3_vl_router_forward_patched,
+    description="Record/replay MiniMax routing before sigmoid weight gather and normalization",
+)

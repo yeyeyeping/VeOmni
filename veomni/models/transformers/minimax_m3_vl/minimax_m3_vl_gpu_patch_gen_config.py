@@ -978,3 +978,25 @@ def minimax_m3_vl_get_position_id_func_patched(self):
 )
 def minimax_m3_vl_get_metadata_collate_func_patched(self):
     return collate_multimodal_metadata  # noqa: F821 defined via add_helper
+
+
+# Patch: MiniMaxM3VLTopKRouter.forward
+# 1. Replay expert indices before gathering native sigmoid weights so gradients remain local.
+@config.override_method(
+    "MiniMaxM3VLTopKRouter.forward",
+    description="Record/replay MiniMax routing before sigmoid weight gather and normalization",
+)
+def minimax_m3_vl_router_forward_patched(self, hidden_states):
+    from veomni.utils.moe_router_replay import maybe_replay_indices
+
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    router_logits = F.linear(hidden_states.to(self.weight.dtype), self.weight)
+    routing_weights = F.sigmoid(router_logits.float())
+    scores_for_choice = routing_weights + self.e_score_correction_bias
+    _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)
+    # --- Patch.1: replace indices before the native weight math. ---
+    top_k_index = maybe_replay_indices(self, scores_for_choice, top_k_index)
+    # --- Patch.1 ---
+    top_k_weights = routing_weights.gather(1, top_k_index)
+    top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
+    return router_logits, top_k_weights, top_k_index

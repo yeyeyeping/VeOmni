@@ -747,3 +747,42 @@ def test_minimax_async_two_rank_forward_and_projection_gradients(tmp_path, backe
         if get_device_type() != needed or get_torch_device().device_count() < 2:
             pytest.skip(f"Two {needed} devices required")
     mp.spawn(_run_minimax_async_two_rank, args=((tmp_path / "rendezvous").as_uri(), backend), nprocs=2)
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_router_replay_preserves_native_and_target_gradients(module_name):
+    from veomni.utils.moe_router_replay import set_active_replay
+
+    modeling = importlib.import_module(module_name)
+    upstream = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    config = SimpleNamespace(num_experts_per_tok=2, num_local_experts=8, hidden_size=4)
+    router = modeling.MiniMaxM3VLTopKRouter(config)
+    reference = upstream.MiniMaxM3VLTopKRouter(config)
+    with torch.no_grad():
+        router.weight.copy_(torch.arange(32).reshape(8, 4) / 32 - 0.5)
+        router.e_score_correction_bias.copy_(torch.arange(8) / 100)
+    reference.load_state_dict(router.state_dict())
+    inputs = torch.tensor([[0.3, -0.2, 0.7, 0.1], [-0.1, 0.8, -0.4, 0.3]])
+    expected = reference(inputs)
+    set_active_replay(None)
+    actual = router(inputs)
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+    class Replay:
+        def on_router_forward(self, module, scores, indices):
+            return torch.tensor([[1, 3], [2, 5]], device=indices.device)
+
+    set_active_replay(Replay())
+    try:
+        logits, weights, indices = router(inputs)
+        torch.testing.assert_close(indices, torch.tensor([[1, 3], [2, 5]], device=indices.device))
+        torch.testing.assert_close(logits, expected[0], rtol=0, atol=0)
+        expected_weights = logits.float().sigmoid().gather(1, indices)
+        expected_weights = expected_weights / expected_weights.sum(-1, keepdim=True)
+        torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+        weights[:, 0].sum().backward()
+        assert torch.isfinite(router.weight.grad).all()
+        assert router.weight.grad.abs().sum() > 0
+    finally:
+        set_active_replay(None)

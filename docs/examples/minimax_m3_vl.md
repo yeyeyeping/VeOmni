@@ -261,3 +261,26 @@ patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_co
 patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_npu_patch_gen_config \
   -o veomni/models/transformers/minimax_m3_vl/generated --diff
 ```
+
+
+## Router replay for verl
+
+The GPU and NPU routers support VeOmni's `moe_router_replay` controller.
+Replay replaces top-k expert IDs before gathering and normalizing sigmoid
+weights. Router weights and gradients are recomputed by the training model;
+disabling replay preserves the upstream router outputs.
+
+Use the matching verl MiniMax R3 layer-mapping change and Ascend routed-expert
+capture fix together. In verl, enable
+`actor_rollout_ref.actor.veomni.router_replay.mode=R3` and
+`actor_rollout_ref.rollout.enable_rollout_routing_replay=True`. The tested
+Ascend runner requires `VLLM_USE_V2_MODEL_RUNNER=1` on rollout workers.
+Rollout tensors contain absolute decoder-layer slots, including dense FFNs;
+verl selects only `mlp_layer_types == "sparse"`. R2 recordings are already
+MoE-only. Missing/duplicate route rows use native routing, so replay alone
+does not guarantee complete route coverage or identical log probabilities.
+
+Regenerate both MiniMax patch configs with `transformers==5.16.1` after changes.
+`tests/models/test_minimax_m3_vl_ops.py` checks native-output preservation,
+forced expert IDs, normalized weights and gradients for both backends;
+`tests/utils/test_moe_router_replay.py` guards generated hook wiring.

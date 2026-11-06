@@ -37,6 +37,8 @@
 #      Use VeOmni's default 1-D packed-sequence position IDs for MiniMax M3 VL SFT data
 #    - method_override: MiniMaxM3SparseForConditionalGeneration.get_metadata_collate_func
 #      Expose MiniMax CPU-side vision grid metadata derivation to the VeOmni collator
+#    - method_override: MiniMaxM3VLTopKRouter.forward
+#      Record/replay MiniMax routing before sigmoid weight gather and normalization
 #
 # ==============================================================================
 
@@ -357,6 +359,12 @@ class MiniMaxM3VLExperts(nn.Module):
         return (up + 1.0) * glu
 
 
+# ======================================================================
+# [MODIFIED CLASS] MiniMaxM3VLTopKRouter
+# Methods patched: forward
+# ======================================================================
+
+
 class MiniMaxM3VLTopKRouter(nn.Module):
     def __init__(self, config: MiniMaxM3VLTextConfig):
         super().__init__()
@@ -366,13 +374,19 @@ class MiniMaxM3VLTopKRouter(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
         self.e_score_correction_bias = nn.Buffer(torch.zeros(config.num_local_experts))
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Patch: MiniMaxM3VLTopKRouter.forward
+    # 1. Replay expert indices before gathering native sigmoid weights so gradients remain local.
+    def forward(self, hidden_states):
+        from veomni.utils.moe_router_replay import maybe_replay_indices
+
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states.to(self.weight.dtype), self.weight)
-        # Sigmoid scoring (not softmax), as in M2.
         routing_weights = F.sigmoid(router_logits.float())
         scores_for_choice = routing_weights + self.e_score_correction_bias
         _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)
+        # --- Patch.1: replace indices before the native weight math. ---
+        top_k_index = maybe_replay_indices(self, scores_for_choice, top_k_index)
+        # --- Patch.1 ---
         top_k_weights = routing_weights.gather(1, top_k_index)
         top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
         return router_logits, top_k_weights, top_k_index
