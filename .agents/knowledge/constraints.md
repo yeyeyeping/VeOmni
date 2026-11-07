@@ -263,3 +263,9 @@ Core files:
     - Pass contiguous device-side `int32[B]` tensors to both `seqused_q` and `seqused_kv` in the gradient metadata and gradient calls. Derive them from the saved int32 `cu_seqlens.diff()`; keep `cu_seqlens_q/kv` as int64 prefix sums.
     - On the Ascend 950 / CANN 9.2 runtime, passing `None` reaches tiling as an input with one length and fails for packed batches (`seqused must hold B lengths, got 1`). `B` counts packed segments, including empty/padding segments, rather than the training micro-batch size.
     - `tests/ops/test_minimax_sparse_attention.py` checks the used-length contract against forward lengths and covers native forward/backward parity with 21 packed sequences.
+
+30. **FP32 direct-weight consumers must own their FSDP precision policy**
+    - A forward that reads child `A.weight` / `B.weight` directly does not trigger those children's FSDP forward hooks. Put the no-mixed-precision policy on the module whose forward actually consumes those weights.
+    - ExtraParallel owners must retain their ExtraParallel FSDP mesh and gradient divide factor. Apply the FP32 exception during the ExtraParallel wrapping pass, then skip already wrapped owners in the generic precision-exception pass. Do not rewrap expert children on the global FSDP mesh.
+    - For merged LoRA forward, keep adapters FP32, the frozen base BF16, and disable autocast around the FP32 delta GEMM and base-plus-delta addition. Cast only the merged result. The ordinary split-LoRA computation is not numerically identical to BF16 merged inference, even though the real-arithmetic formulas agree.
+    - Training-capable merge must preserve autograd through the merge/cast and never mutate the frozen base. A detached merge is only a forward diagnostic. Validate export hashes, input/A/B gradients, EP loss scaling, and checkpoint recomputation before enabling the mode; measure the extra matrix materialization memory separately.

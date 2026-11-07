@@ -764,7 +764,16 @@ def parallelize_model_fsdp2(
                     # decoder/root FSDP group through the normal bottom-up walk.
                     continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
+                para_fsdp_kwargs = extra_parallel_fsdp_kwargs[para]
+                para_uses_fp32_policy = bool(mp_ignored_classes and isinstance(_para_mod, mp_ignored_classes))
+                if para_uses_fp32_policy:
+                    # Keep an FP32 owner on its ExtraParallel mesh. Rewrapping
+                    # its children later on the global FSDP mesh is incorrect,
+                    # and direct reads of child weights do not fire child hooks.
+                    para_fsdp_kwargs = dict(para_fsdp_kwargs)
+                    para_fsdp_kwargs.pop("mp_policy", None)
+                    para_fsdp_kwargs["reshard_after_forward"] = False
+                fully_shard(_para_mod, **para_fsdp_kwargs)
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
@@ -774,7 +783,7 @@ def parallelize_model_fsdp2(
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
-                elif transport_reduction_scales is None:
+                elif transport_reduction_scales is None or para_uses_fp32_policy:
                     _para_mod.set_gradient_divide_factor(gradient_divide_factor)
                 else:
                     _configure_fsdp_gradient_reduction(
@@ -788,7 +797,11 @@ def parallelize_model_fsdp2(
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
-                if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
+                if (
+                    isinstance(sub_mod, mp_ignored_classes)
+                    and sub_mod is not layer_mod
+                    and not isinstance(sub_mod, FSDPModule)
+                ):
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     # Keep these modules off transport_reduction_scales: their genuine FP32
                     # gradients need native FP32 communication, not a lossy wire cast.
