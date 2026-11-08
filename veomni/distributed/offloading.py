@@ -35,8 +35,21 @@ class custom_save_on_cpu(saved_tensors_hooks):
 
         def pack_to_cpu(tensor: torch.Tensor) -> Tuple[OffloadPolicy, torch.device, torch.Tensor]:
             tensor_num_bytes = tensor.element_size() * tensor.nelement()
-            # heuristic to skip nn.Linear.weight
-            if type(tensor.grad_fn).__name__ == "TBackward0" or tensor_num_bytes <= min_offload_size:
+            # Frozen Linear weights are transpose views too, but have no
+            # TBackward0 because requires_grad=False. Keeping their existing
+            # device storage avoids restoring a duplicate full vocabulary head.
+            frozen_weight_transpose = (
+                tensor.ndim == 2
+                and tensor.stride(0) == 1
+                and tensor.is_leaf
+                and not tensor.requires_grad
+                and tensor._base is not None
+            )
+            if (
+                type(tensor.grad_fn).__name__ == "TBackward0"
+                or frozen_weight_transpose
+                or tensor_num_bytes <= min_offload_size
+            ):
                 return (OffloadPolicy.IGNORE, tensor.device, tensor)
 
             if self.cur_gpu_ram_in_mb < gpu_limit_in_gb * 1024:

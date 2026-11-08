@@ -284,3 +284,16 @@ Regenerate both MiniMax patch configs with `transformers==5.16.1` after changes.
 `tests/models/test_minimax_m3_vl_ops.py` checks native-output preservation,
 forced expert IDs, normalized weights and gradients for both backends;
 `tests/utils/test_moe_router_replay.py` guards generated hook wiring.
+
+## Pageable activation offload with merged LoRA
+
+The RL engine may wrap the training forward outside activation checkpointing
+with `custom_save_on_cpu(gpu_limit_in_gb=0.0, pin_memory=False)`. This stores
+saved activations in ordinary CPU memory without requiring pinned allocations.
+Frozen two-dimensional transpose views with stride zero equal to one retain
+their existing device storage, like trainable Linear weights. This avoids a
+duplicate vocabulary-head allocation when saved tensors are restored.
+
+For the current Ascend CANN GBSA gradient API, both metadata and backward use
+`softmax_precision=0`. The precision-one experiment is not compatible with
+the installed metadata operator.
