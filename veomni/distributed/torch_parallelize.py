@@ -764,16 +764,7 @@ def parallelize_model_fsdp2(
                     # decoder/root FSDP group through the normal bottom-up walk.
                     continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                para_fsdp_kwargs = extra_parallel_fsdp_kwargs[para]
-                para_uses_fp32_policy = bool(mp_ignored_classes and isinstance(_para_mod, mp_ignored_classes))
-                if para_uses_fp32_policy:
-                    # Keep an FP32 owner on its ExtraParallel mesh. Rewrapping
-                    # its children later on the global FSDP mesh is incorrect,
-                    # and direct reads of child weights do not fire child hooks.
-                    para_fsdp_kwargs = dict(para_fsdp_kwargs)
-                    para_fsdp_kwargs.pop("mp_policy", None)
-                    para_fsdp_kwargs["reshard_after_forward"] = False
-                fully_shard(_para_mod, **para_fsdp_kwargs)
+                fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
@@ -783,7 +774,7 @@ def parallelize_model_fsdp2(
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
-                elif transport_reduction_scales is None or para_uses_fp32_policy:
+                elif transport_reduction_scales is None:
                     _para_mod.set_gradient_divide_factor(gradient_divide_factor)
                 else:
                     _configure_fsdp_gradient_reduction(
@@ -797,11 +788,7 @@ def parallelize_model_fsdp2(
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
-                if (
-                    isinstance(sub_mod, mp_ignored_classes)
-                    and sub_mod is not layer_mod
-                    and not isinstance(sub_mod, FSDPModule)
-                ):
+                if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     # Keep these modules off transport_reduction_scales: their genuine FP32
                     # gradients need native FP32 communication, not a lossy wire cast.
@@ -990,27 +977,6 @@ def parallelize_model_ddp(
     )
 
 
-def _validate_preserve_frozen_dtype(enabled, is_peft_model, parallel_state, mixed_precision):
-    """Restrict mixed-storage preservation to PEFT with FSDP2 compute casting."""
-    if not isinstance(enabled, bool):
-        raise TypeError("preserve_frozen_dtype must be a bool")
-    if enabled and not is_peft_model:
-        raise ValueError("preserve_frozen_dtype requires is_peft_model=True")
-    if enabled and (not parallel_state.fsdp_enabled or parallel_state.dp_mode != "fsdp2"):
-        raise ValueError("preserve_frozen_dtype requires FSDP2")
-    if enabled and (not mixed_precision.enable or mixed_precision.param_dtype is None):
-        raise ValueError("preserve_frozen_dtype requires enabled mixed precision and a non-None param_dtype")
-
-
-def _upcast_trainable_parameters(model):
-    """Keep frozen tensors, buffers and parameter identities unchanged."""
-    for parameter in model.parameters():
-        if parameter.requires_grad and parameter.is_floating_point():
-            parameter.data = parameter.data.float()
-            if parameter.grad is not None:
-                parameter.grad.data = parameter.grad.data.float()
-
-
 def build_parallelize_model(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
@@ -1023,7 +989,6 @@ def build_parallelize_model(
     low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
-    preserve_frozen_dtype: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1034,19 +999,12 @@ def build_parallelize_model(
             model (SeedOmni ``fsdp_scope='model'``). The single-model trainers
             pass ``args.model.model_path``; per-module SeedOmni wrap passes that
             module's path; the composed wrap passes one path per child.
-        preserve_frozen_dtype: Opt-in PEFT/FSDP2 policy preserving caller-selected
-            frozen parameter and buffer dtypes while upcasting trainable parameters
-            to FP32. Requires mixed precision with a non-None param_dtype.
-            False keeps the existing whole-model FP32 conversion.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
         recompute_policy: Per-block recomputation strategy, bound after HF has
             enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
-    _validate_preserve_frozen_dtype(
-        preserve_frozen_dtype, kwargs.get("is_peft_model", False), parallel_state, mixed_precision
-    )
     if low_precision_reduce_scatter_comm is not False:
         # Only literal False bypasses validation; false-like non-booleans must still raise.
         validate_low_precision_reduce_scatter_comm(
@@ -1058,11 +1016,8 @@ def build_parallelize_model(
         if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
             raise ValueError("Only FSDP training supports `init_device=meta`.")
 
-    if mixed_precision.enable:  # FP32 optimizer storage; optionally retain frozen storage.
-        if preserve_frozen_dtype:
-            _upcast_trainable_parameters(model)
-        else:
-            model = model.float()
+    if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
+        model = model.float()
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):

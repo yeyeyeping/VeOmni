@@ -164,34 +164,6 @@ logger = logging.get_logger(__name__)
 _PEFT_PREFIX = "base_model.model."
 
 
-def _resolve_m3_activation(base_layer):
-    """Recognize M3 SwiGLU-OAI before taking ownership of expert weights."""
-    alpha = getattr(base_layer, "swiglu_alpha", None)
-    act_fn = getattr(base_layer, "act_fn", None)
-    if alpha is None and act_fn is None:
-        raise ValueError("Expert LoRA requires act_fn or swiglu_alpha")
-    return act_fn, alpha, getattr(base_layer, "swiglu_limit", None)
-
-
-def _expert_activation(module, gate, up):
-    if module.swiglu_alpha is None:
-        return module.act_fn(gate) * up
-    if module.swiglu_limit is not None:
-        gate = gate.clamp(max=module.swiglu_limit)
-        up = up.clamp(min=-module.swiglu_limit, max=module.swiglu_limit)
-    return (up + 1) * (gate * torch.sigmoid(module.swiglu_alpha * gate))
-
-
-def _activation_kwargs(module, fused_kernel):
-    if module.swiglu_alpha is None:
-        return {}
-    # The older Triton backend has a handwritten SiLU backward. Fail closed
-    # until its forward AND backward have been ported, rather than using SiLU.
-    if not fused_kernel.__module__.endswith("npu_moe_group_gemm"):
-        raise NotImplementedError("SwiGLU-OAI expert LoRA requires eager or fused_npu")
-    return {"swiglu_alpha": module.swiglu_alpha, "swiglu_limit": module.swiglu_limit}
-
-
 def _group_routing_assignments(top_k_index: torch.Tensor, num_experts: int):
     """Yield expert routing groups in the eager path's top-k-major order."""
     num_tokens = top_k_index.shape[0]
@@ -435,7 +407,6 @@ class LoraSharedExperts(nn.Module):
         # into self below so a downstream caller seeing the drained
         # base_layer would get a confusing error.
         _validate_fused_layout(base_layer)
-        act_fn, swiglu_alpha, swiglu_limit = _resolve_m3_activation(base_layer)
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -447,9 +418,7 @@ class LoraSharedExperts(nn.Module):
         self.num_experts = base_layer.num_experts
         self.hidden_dim = base_layer.hidden_dim
         self.intermediate_dim = base_layer.intermediate_dim
-        self.act_fn = act_fn
-        self.swiglu_alpha = swiglu_alpha
-        self.swiglu_limit = swiglu_limit
+        self.act_fn = base_layer.act_fn
 
         # Steal the base experts' Parameters / Buffers, then re-register
         # the Parameters under per-spec sub-modules at the PEFT-aligned
@@ -755,7 +724,6 @@ class LoraSharedExperts(nn.Module):
             lora_scale_gate=self._lora_scale_value,
             lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
-            **_activation_kwargs(self, fused_kernel),
         )
 
     def _eager_forward(
@@ -792,7 +760,7 @@ class LoraSharedExperts(nn.Module):
 
             gate_up = F.linear(current_state, gate_up_w[expert_idx]) + lora_x_gate_up[token_idx]
             gate, up = gate_up.chunk(2, dim=-1)
-            mid = _expert_activation(self, gate, up)
+            mid = self.act_fn(gate) * up
 
             # down LoRA depends on the per-expert intermediate, so compute inside the loop.
             lora_x_down = F.linear(F.linear(mid, a_dn), b_dn) * scale
@@ -900,7 +868,6 @@ class LoraIndependentExperts(nn.Module):
         # Validate before stealing — see LoraSharedExperts.__init__ for the
         # rationale on this ordering.
         _validate_fused_layout(base_layer)
-        act_fn, swiglu_alpha, swiglu_limit = _resolve_m3_activation(base_layer)
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -910,9 +877,7 @@ class LoraIndependentExperts(nn.Module):
         self.num_experts = base_layer.num_experts
         self.hidden_dim = base_layer.hidden_dim
         self.intermediate_dim = base_layer.intermediate_dim
-        self.act_fn = act_fn
-        self.swiglu_alpha = swiglu_alpha
-        self.swiglu_limit = swiglu_limit
+        self.act_fn = base_layer.act_fn
 
         # Steal base experts' Parameters / Buffers — see
         # LoraSharedExperts.__init__ for the per-spec sub-module layout
@@ -1130,7 +1095,6 @@ class LoraIndependentExperts(nn.Module):
             lora_scale_gate=self._lora_scale_value,
             lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
-            **_activation_kwargs(self, fused_kernel),
         )
 
     def _eager_forward(
@@ -1159,7 +1123,7 @@ class LoraIndependentExperts(nn.Module):
             up_hidden = F.linear(current_state, a_up[expert_idx])
             gate = torch.addmm(gate, gate_hidden, b_gate[expert_idx].T, alpha=self._lora_scale_value)
             up = torch.addmm(up, up_hidden, b_up[expert_idx].T, alpha=self._lora_scale_value)
-            mid = _expert_activation(self, gate, up)
+            mid = self.act_fn(gate) * up
 
             lora_x_down = F.linear(F.linear(mid, a_dn[expert_idx]), b_dn[expert_idx]) * scale
             current_hidden_states = F.linear(mid, down_w[expert_idx]) + lora_x_down

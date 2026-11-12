@@ -435,7 +435,6 @@ class _FakeMSACannOps:
 
     def generic_block_sparse_attention_grad_metadata(self, idx, count, hq, hkv, dim, block_shape, **kwargs):
         self.calls.append("metadata")
-        assert kwargs["softmax_precision"] == 1
         assert block_shape == [1, 128]
         assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_kv"] == idx.shape[-1]
         assert kwargs["cu_seqlens_q"].dtype == kwargs["cu_seqlens_kv"].dtype == torch.int64
@@ -460,7 +459,7 @@ class _FakeMSACannOps:
             else:
                 assert kwargs[key] == value
         assert kwargs["layout_q"] == kwargs["layout_kv"] == "TND"
-        assert kwargs["mask_mode"] == 1 and kwargs["softmax_precision"] == 1
+        assert kwargs["mask_mode"] == 1 and kwargs["softmax_precision"] == 0
         assert idx.shape[2] <= (k.shape[0] + 127) // 128  # Native GBSA TND tiling bound.
         keep = torch.zeros_like(self.forward_keep)
         cu = kwargs["cu_seqlens_q"]

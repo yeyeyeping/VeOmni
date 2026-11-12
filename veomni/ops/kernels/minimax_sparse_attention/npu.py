@@ -176,8 +176,7 @@ class _SplitKVGBSA(torch.autograd.Function):
             layout_kv="TND",
             layout_sparse_pattern=1,
             mask_mode=1,
-            # Keep metadata and backward on the same high-precision GBSA path.
-            softmax_precision=1,
+            softmax_precision=0,
             win_left=-1,
             win_right=-1,
             residual_block_mode=0,
