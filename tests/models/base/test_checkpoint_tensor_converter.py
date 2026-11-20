@@ -1,4 +1,5 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 verl contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -2304,6 +2305,36 @@ class TestQwen3OmniMoeConverterIntegration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def minimax_export_config():
+    return SimpleNamespace(
+        text_config=SimpleNamespace(
+            hidden_size=4,
+            intermediate_size=3,
+            dense_intermediate_size=6,
+            shared_intermediate_size=3,
+            num_local_experts=4,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=2,
+            vocab_size=8,
+            index_head_dim=2,
+            index_n_heads=1,
+        ),
+        vision_config=SimpleNamespace(
+            hidden_size=4,
+            intermediate_size=6,
+            num_hidden_layers=1,
+            num_channels=3,
+            temporal_patch_size=2,
+            patch_size=2,
+        ),
+        projector_hidden_size=6,
+        merged_hidden_size=16,
+    )
+
+
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 class TestMiniMaxM3VLConverter:
     def test_dense_and_projector_renaming(self):
@@ -2361,7 +2392,7 @@ class TestMiniMaxM3VLConverter:
         assert converted["model.language_model.layers.0.mlp.down_proj.weight"] == 4
         assert converted["model.multi_modal_projector.merge_linear_2.weight"] == 8
 
-    def test_public_checkpoint_index_maps_onto_every_model_parameter(self):
+    def test_public_checkpoint_index_maps_onto_every_model_parameter(self, monkeypatch):
         """Every key of the public MiniMaxAI/MiniMax-M3 index must reach a model key, and vice versa.
 
         A model key that no converted name reaches is silently randomly
@@ -2393,3 +2424,171 @@ class TestMiniMaxM3VLConverter:
         model_keys = set(model.state_dict())
         assert sorted(model_keys - converted) == []
         assert sorted(converted - model_keys) == []
+
+        from veomni.models.checkpoint import convert as loading
+
+        monkeypatch.setattr(loading.parallel_state, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
+        monkeypatch.setattr(loading, "get_device_type", lambda: "cpu")
+        exported = dict(get_checkpoint_tensor_converter(model).export_weights(model))
+        assert exported.keys() == set(public_keys)
+        # The reverse mapping must reproduce every internal key and shape, including ViT and projectors.
+        loader = get_checkpoint_tensor_converter(model)
+        restored = {}
+        for name, tensor in exported.items():
+            result = maybe_convert_checkpoint_tensor(name, tensor, loader)
+            if result is not None:
+                restored[result.name] = result.tensor
+        assert loader.finalize() == []
+        assert restored.keys() == model_keys
+        for name, tensor in model.state_dict().items():
+            assert restored[name].shape == tensor.shape
+            assert restored[name].dtype == tensor.dtype
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+class TestMiniMaxM3VLExport:
+    @pytest.fixture
+    def export(self, monkeypatch, minimax_export_config):
+        from veomni.models.checkpoint import convert as loading
+
+        monkeypatch.setattr(loading, "get_device_type", lambda: "cpu")
+
+        def run(params, state=None):
+            state = state if state is not None else SimpleNamespace(ep_enabled=False)
+            monkeypatch.setattr(loading.parallel_state, "get_parallel_state", lambda: state)
+            model = SimpleNamespace(config=minimax_export_config, state_dict=lambda: params)
+            return create_minimax_m3_vl_checkpoint_tensor_converter(model).export_weights(model)
+
+        return run
+
+    def test_round_trip_preserves_values_dtypes_and_native_state(self, export, minimax_export_config):
+        params = {
+            "model.language_model.layers.1.mlp.experts.gate_up_proj": torch.randn(4, 6, 4),
+            "model.language_model.layers.1.mlp.experts.down_proj": torch.randn(4, 4, 3),
+            "model.language_model.layers.0.mlp.gate_up_proj.weight": torch.randn(12, 4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.mlp.down_proj.weight": torch.randn(4, 6, dtype=torch.bfloat16),
+            "model.language_model.layers.1.mlp.shared_experts.gate_up_proj.weight": torch.randn(6, 4),
+            "model.language_model.layers.1.mlp.shared_experts.down_proj.weight": torch.randn(4, 3),
+            "model.language_model.layers.1.mlp.gate.weight": torch.randn(4, 4),
+            "model.language_model.layers.1.mlp.gate.e_score_correction_bias": torch.randn(4),
+            "model.language_model.layers.1.self_attn.indexer.q_proj.weight": torch.randn(2, 4),
+            "model.vision_tower.layers.0.mlp.fc1.weight": torch.randn(6, 4, dtype=torch.bfloat16),
+            "model.multi_modal_projector.merge_linear_1.weight": torch.randn(6, 16, dtype=torch.bfloat16),
+        }
+        before = {name: tensor.clone() for name, tensor in params.items()}
+        exported = dict(export(params))
+        loader = MiniMaxM3VLCheckpointTensorConverter(minimax_export_config.text_config.num_local_experts)
+        restored = {}
+        for name, tensor in exported.items():
+            result = maybe_convert_checkpoint_tensor(name, tensor, loader)
+            if result is not None:
+                restored[result.name] = result.tensor
+        assert loader.finalize() == []
+        assert restored.keys() == before.keys() == params.keys()
+        for name, expected in before.items():
+            torch.testing.assert_close(restored[name], expected, rtol=0, atol=0)
+            torch.testing.assert_close(params[name], expected, rtol=0, atol=0)
+            # Native VeOmni checkpoints keep their fused keys and bypass the public loader conversion.
+            native = maybe_convert_checkpoint_tensor(name, params[name], loader)
+            assert native.name == name and native.tensor is params[name]
+        native_index = dict.fromkeys(params, 0)
+        assert convert_minimax_m3_vl_fqn_to_index_mapping(native_index) == native_index
+
+    @pytest.mark.parametrize("rank", [0, 1, 2])
+    @pytest.mark.parametrize("proj,shape", [("gate_up_proj", (6, 6, 4)), ("down_proj", (6, 4, 3))])
+    def test_ep_reconstructs_experts_in_order(self, export, minimax_export_config, monkeypatch, rank, proj, shape):
+        minimax_export_config.text_config.num_local_experts = 6
+        full = torch.arange(torch.tensor(shape).prod().item()).reshape(shape)
+        group = object()
+        calls = []
+
+        def broadcast(tensor, group_src, group):
+            calls.append((group_src, group))
+            tensor.copy_(full[group_src * 2 : (group_src + 1) * 2])
+
+        monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+        name = f"model.language_model.layers.1.mlp.experts.{proj}"
+        params = {name: full[rank * 2 : (rank + 1) * 2].clone()}
+        state = SimpleNamespace(ep_enabled=True, ep_size=3, ep_rank=rank, ep_group=group)
+        # Consume/copy before advancing: the EP iterator reuses a remote-rank buffer.
+        values = {key: value.clone() for key, value in export(params, state)}
+        assert calls == [(index, group) for index in range(3)]
+        assert len(values) == (12 if proj == "gate_up_proj" else 6)
+        for expert in range(6):
+            prefix = f"language_model.model.layers.1.block_sparse_moe.experts.{expert}"
+            if proj == "gate_up_proj":
+                torch.testing.assert_close(values[prefix + ".w1.weight"], full[expert, :3])
+                torch.testing.assert_close(values[prefix + ".w3.weight"], full[expert, 3:])
+            else:
+                torch.testing.assert_close(values[prefix + ".w2.weight"], full[expert])
+
+    def test_global_experts_are_not_broadcast_twice(self, export, monkeypatch):
+        monkeypatch.setattr(torch.distributed, "broadcast", lambda *a, **kw: pytest.fail("already global"))
+        params = {"model.language_model.layers.1.mlp.experts.down_proj": torch.zeros(4, 4, 3)}
+        assert len(list(export(params, SimpleNamespace(ep_enabled=True)))) == 4
+
+    def test_dtensor_is_staged_before_gather(self, export, monkeypatch):
+        from veomni.models.checkpoint import convert as loading
+
+        calls = []
+        tensor = torch.randn(4, 4, 3)
+
+        class Shard:
+            def to(self, device, non_blocking):
+                calls.append("stage")
+                assert device == torch.device("cpu")
+                return self
+
+            def full_tensor(self):
+                calls.append("gather")
+                return tensor
+
+        monkeypatch.setattr(loading, "DTensor", Shard)
+        values = dict(export({"model.language_model.layers.1.mlp.experts.down_proj": Shard()}))
+        assert calls == ["stage", "gather"]
+        for expert in range(4):
+            torch.testing.assert_close(
+                values[f"language_model.model.layers.1.block_sparse_moe.experts.{expert}.w2.weight"], tensor[expert]
+            )
+
+    @pytest.mark.parametrize(
+        "name,shape,target",
+        [
+            (
+                "model.language_model.layers.1.self_attn.indexer.q_proj.weight",
+                (2, 4),
+                "language_model.model.layers.1.self_attn.index_q_proj.weight",
+            ),
+            (
+                "model.language_model.layers.1.mlp.gate.e_score_correction_bias",
+                (4,),
+                "language_model.model.layers.1.block_sparse_moe.e_score_correction_bias",
+            ),
+            (
+                "model.vision_tower.layers.0.mlp.fc1.weight",
+                (6, 4),
+                "vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight",
+            ),
+            ("model.multi_modal_projector.merge_linear_1.weight", (6, 16), "patch_merge_mlp.linear_1.weight"),
+        ],
+    )
+    def test_nonexpert_names_and_shape_validation(self, export, name, shape, target):
+        assert list(export({name: torch.zeros(shape)}))[0][0] == target
+        with pytest.raises(ValueError, match="expected shape"):
+            list(export({name: torch.zeros(1)}))
+
+    @pytest.mark.parametrize("ep_enabled", [False, True])
+    @pytest.mark.parametrize("shape", [(3, 4, 3), (0, 4, 3), (4, 3)])
+    def test_invalid_expert_stack_fails(self, export, monkeypatch, shape, ep_enabled):
+        monkeypatch.setattr(torch.distributed, "broadcast", lambda *a, **kw: pytest.fail("invalid stack"))
+        with pytest.raises(ValueError, match="cannot reconstruct|expected a 3D expert stack"):
+            list(
+                export(
+                    {"model.language_model.layers.1.mlp.experts.down_proj": torch.zeros(shape)},
+                    SimpleNamespace(ep_enabled=ep_enabled, ep_size=2),
+                )
+            )
+
+    def test_unknown_weight_fails(self, export):
+        with pytest.raises(ValueError, match="unsupported parameter"):
+            list(export({"new.weight": torch.zeros(1)}))

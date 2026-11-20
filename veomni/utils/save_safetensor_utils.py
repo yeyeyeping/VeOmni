@@ -92,7 +92,8 @@ def get_model_save_state(
 ) -> Dict[str, torch.Tensor]:
     """Build a flat state dict suitable for HuggingFace safetensors saving.
 
-    If the model's checkpoint tensor converter defines ``export_weights(model)``,
+    If the model's checkpoint tensor converter defines ``export_weights(model)``
+    and enables it for HF saves (the default),
     delegates directly to it (so online RL weight export and HF checkpoint save share
     the exact same key/dtype/quantization conversion) and partitions non-DTensor
     outputs across ranks by shard index when distributed is initialized.
@@ -109,7 +110,9 @@ def get_model_save_state(
     from veomni.models.checkpoint import get_checkpoint_tensor_converter
 
     converter = get_checkpoint_tensor_converter(model) if model is not None else None
-    if converter is not None and callable(getattr(converter, "export_weights", None)):
+    if callable(getattr(converter, "export_weights", None)) and getattr(
+        converter, "use_export_weights_for_hf_save", True
+    ):
         import inspect
 
         effective_mapping = (

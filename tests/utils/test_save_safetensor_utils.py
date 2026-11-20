@@ -183,6 +183,20 @@ class TestGetModelSaveState(unittest.TestCase):
     def test_empty_state_returns_empty(self):
         self.assertEqual(_call_get_model_save_state(self.model, {"k": 0}, {}), {})
 
+    def test_minimax_hf_save_preserves_fused_expert_layout(self):
+        from veomni.models.transformers.minimax_m3_vl.checkpoint_tensor_converter import (
+            MiniMaxM3VLCheckpointTensorConverter,
+        )
+
+        self.model._create_checkpoint_tensor_converter = lambda model: MiniMaxM3VLCheckpointTensorConverter(
+            num_experts=2
+        )
+        key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        fused = torch.randn(2, 8, 4)
+        saved = _call_get_model_save_state(self.model, {key: 0}, {key: fused})
+        self.assertEqual(set(saved), {key})
+        torch.testing.assert_close(saved[key], fused.bfloat16())
+
     def test_converter_export_weights_preserves_dtypes_and_filters_mapping(self):
         """Models whose converter defines export_weights bypass ModelState and keep exact dtypes."""
         from veomni.utils.save_safetensor_utils import get_model_save_state

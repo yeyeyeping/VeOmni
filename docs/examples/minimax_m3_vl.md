@@ -28,6 +28,36 @@ The public checkpoint can be referenced through either Hugging Face or ModelScop
 - `veomni/models/transformers/minimax_m3_vl/parallel_plan.py`
 - `veomni/models/transformers/minimax_m3_vl/checkpoint_tensor_converter.py`
 
+## Public weight export
+
+The model registers `MiniMaxM3VLCheckpointTensorConverter` for public-checkpoint
+loading and explicit public-layout export. Consumers such as verl call
+`get_checkpoint_tensor_converter(model).export_weights(model)`, using the same
+dispatch as DeepSeek V4. No M3 conversion is needed in the consumer.
+
+The hook delegates FSDP gathering, EP reconstruction, and per-expert splitting
+to `veomni.models.checkpoint.convert.export_weights`. Its optional
+`num_experts` argument supplies the global count, validates EP-local stacks,
+and avoids broadcasting stacks already reconstructed across EP. Existing
+callers without that argument retain the EP-local-stack convention.
+
+M3 then reverses the public checkpoint mapping: expert `gate/up/down` become
+`w1/w3/w2`, dense and shared `gate_up` are split, and language, indexer, vision,
+and projector names are restored. Unsupported names and shapes raise errors.
+Tensors retain their dtypes and the model state dict is not mutated. All ranks
+must consume the generator in the same order. Consume or copy each yielded
+tensor before advancing, because EP broadcasts reuse temporary buffers.
+
+This hook does not replace VeOmni's native DCP or HF writers. Training saves
+still use internal names and fused tensors; their existing dtype policy and
+resume behavior are unchanged. Public checkpoints load through `convert()`;
+native fused checkpoints still pass through the loader unchanged.
+
+`tests/models/base/test_checkpoint_tensor_converter.py` covers the complete public
+key layout, export/load round trips, dtype preservation, mocked EP reconstruction,
+DTensor staging, and invalid shapes. Real accelerator collectives require the
+corresponding distributed environment.
+
 ## Data Path
 
 The `minimax_m3_vl` data transform reuses VeOmni's multimodal fetch and collate pipeline, then delegates image/video tensorization and conversation rendering to the MiniMax Hugging Face processor:
@@ -84,4 +114,4 @@ Router auxiliary load balancing is intentionally disabled for MiniMax M3. The up
 
 The public MiniMax checkpoint stores separate per-expert `w1`/`w2`/`w3` tensors. Its runtime converter must first assemble the complete fused expert tensor, so keep `model.extra_parallel_stream_load=false` (the default) when loading this checkpoint. Only enable streaming after exporting the checkpoint in the fused VeOmni/Hugging Face v5 layout.
 
-Exported Hugging Face weights (`save_hf_weights`) use the transformers-native layout: `model.language_model.*`, fused `mlp.experts.gate_up_proj` / `down_proj`, `self_attn.indexer.*`, and a `config.json` with `layer_types` / `index_*` fields. Transformers loads them directly, but vLLM and SGLang read the original MiniMax layout (`language_model.model.*`, per-expert `block_sparse_moe.experts.{j}.w{1,2,3}`, `index_{q,k}_proj`) and the legacy `sparse_attention_config` / `moe_layer_freq` config fields, so an export cannot be served by them without converting back. For the same reason, RL frameworks that sync actor weights into a vLLM/SGLang rollout (e.g. verl's VeOmni engine) are not supported yet: the checkpoint converter does not implement `export_weights`, and the rollout loader silently skips the unmatched names.
+Exported Hugging Face weights (`save_hf_weights`) use the transformers-native layout: `model.language_model.*`, fused `mlp.experts.gate_up_proj` / `down_proj`, `self_attn.indexer.*`, and a `config.json` with `layer_types` / `index_*` fields. Transformers loads them directly. For online actor weight sync to a vLLM or SGLang rollout initialized with the original MiniMax config, use the [public weight export hook](#public-weight-export).

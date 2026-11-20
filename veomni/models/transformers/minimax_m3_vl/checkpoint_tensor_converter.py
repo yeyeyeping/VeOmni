@@ -1,4 +1,5 @@
 # Copyright 2026 The MiniMax AI Team, HuggingFace Team, and the VeOmni Team. All rights reserved.
+# Copyright 2026 verl contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,11 +43,11 @@ both into `model.multi_modal_projector`, naming the latter
 
 import re
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple
 
 import torch
 
-from ...checkpoint.convert import ConvertedCheckpointTensor
+from ...checkpoint.convert import ConvertedCheckpointTensor, export_weights
 
 
 _EXPERT_PATTERN = re.compile(
@@ -107,11 +108,152 @@ def _e_score_correction_bias_key(layer: str) -> str:
     return f"{_dense_mlp_prefix(layer)}.gate.e_score_correction_bias"
 
 
+def _check_shape(name, tensor, shape):
+    if tuple(tensor.shape) != tuple(shape):
+        raise ValueError(f"M3 export {name}: expected shape {tuple(shape)}, got {tuple(tensor.shape)}")
+
+
+def _export_m3_tensor(name, tensor, config):
+    """Validate and invert the public-to-VeOmni checkpoint conversion."""
+    text = config.text_config
+    hidden = text.hidden_size
+    if name in ("lm_head.weight", "model.language_model.embed_tokens.weight"):
+        _check_shape(name, tensor, (text.vocab_size, hidden))
+        target = (
+            "language_model.lm_head.weight" if name == "lm_head.weight" else "language_model.model.embed_tokens.weight"
+        )
+    elif name == "model.language_model.norm.weight":
+        _check_shape(name, tensor, (hidden,))
+        target = "language_model.model.norm.weight"
+    elif match := re.fullmatch(r"model\.language_model\.layers\.(\d+)\.(.+)", name):
+        layer, suffix = int(match[1]), match[2]
+        if not 0 <= layer < text.num_hidden_layers:
+            raise ValueError(f"M3 export: layer outside config: {name}")
+        prefix = f"language_model.model.layers.{layer}."
+        head_dim = getattr(text, "head_dim", hidden // text.num_attention_heads)
+        attn_shapes = {
+            "q_proj.weight": (text.num_attention_heads * head_dim, hidden),
+            "k_proj.weight": (text.num_key_value_heads * head_dim, hidden),
+            "v_proj.weight": (text.num_key_value_heads * head_dim, hidden),
+            "o_proj.weight": (hidden, text.num_attention_heads * head_dim),
+            "q_norm.weight": (head_dim,),
+            "k_norm.weight": (head_dim,),
+        }
+        if suffix.startswith("mlp.experts."):
+            match = re.fullmatch(r"mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight", suffix)
+            if match is None or not 0 <= int(match[1]) < text.num_local_experts:
+                raise ValueError(f"M3 export: unsupported expert parameter {name}")
+            proj = match[2]
+            inter = text.intermediate_size
+            shape = (hidden, inter) if proj == "down_proj" else (inter, hidden)
+            _check_shape(name, tensor, shape)
+            public_proj = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}[proj]
+            yield prefix + f"block_sparse_moe.experts.{match[1]}.{public_proj}.weight", tensor.contiguous()
+            return
+        if suffix.startswith("mlp.shared_experts.") or suffix in ("mlp.gate_up_proj.weight", "mlp.down_proj.weight"):
+            shared = suffix.startswith("mlp.shared_experts.")
+            inter = text.shared_intermediate_size if shared else text.dense_intermediate_size
+            mlp_prefix = prefix + ("block_sparse_moe.shared_experts." if shared else "mlp.")
+            if suffix.endswith("gate_up_proj.weight"):
+                _check_shape(name, tensor, (2 * inter, hidden))
+                yield mlp_prefix + "gate_proj.weight", tensor[:inter].contiguous()
+                yield mlp_prefix + "up_proj.weight", tensor[inter:].contiguous()
+                return
+            if not suffix.endswith("down_proj.weight"):
+                raise ValueError(f"M3 export: unsupported MLP parameter {name}")
+            _check_shape(name, tensor, (hidden, inter))
+            target = mlp_prefix + "down_proj.weight"
+        elif suffix == "mlp.gate.weight":
+            _check_shape(name, tensor, (text.num_local_experts, hidden))
+            target = prefix + "block_sparse_moe.gate.weight"
+        elif suffix == "mlp.gate.e_score_correction_bias":
+            _check_shape(name, tensor, (text.num_local_experts,))
+            target = prefix + "block_sparse_moe.e_score_correction_bias"
+        elif suffix in ("input_layernorm.weight", "post_attention_layernorm.weight"):
+            _check_shape(name, tensor, (hidden,))
+            target = prefix + suffix
+        elif suffix.startswith("self_attn.indexer."):
+            part = suffix.removeprefix("self_attn.indexer.")
+            dim = text.index_head_dim
+            shapes = {
+                "q_proj.weight": (text.index_n_heads * dim, hidden),
+                "k_proj.weight": (dim, hidden),
+                "q_norm.weight": (dim,),
+                "k_norm.weight": (dim,),
+            }
+            if part not in shapes:
+                raise ValueError(f"M3 export: unsupported indexer parameter {name}")
+            _check_shape(name, tensor, shapes[part])
+            target = prefix + "self_attn.index_" + part
+        elif suffix.startswith("self_attn.") and suffix.removeprefix("self_attn.") in attn_shapes:
+            _check_shape(name, tensor, attn_shapes[suffix.removeprefix("self_attn.")])
+            target = prefix + suffix
+        else:
+            raise ValueError(f"M3 export: unsupported language parameter {name}")
+    elif name.startswith("model.vision_tower."):
+        vision = config.vision_config
+        dim, inter = vision.hidden_size, vision.intermediate_size
+        suffix = name.removeprefix("model.vision_tower.")
+        target = "vision_tower.vision_model." + suffix
+        if suffix == "embeddings.proj.weight":
+            _check_shape(
+                name,
+                tensor,
+                (dim, vision.num_channels, vision.temporal_patch_size, vision.patch_size, vision.patch_size),
+            )
+            target = "vision_tower.vision_model.embeddings.patch_embedding.weight"
+        elif suffix in ("pre_layrnorm.weight", "pre_layrnorm.bias"):
+            _check_shape(name, tensor, (dim,))
+        elif match := re.fullmatch(r"layers\.(\d+)\.(.+)\.(weight|bias)", suffix):
+            if not 0 <= int(match[1]) < vision.num_hidden_layers:
+                raise ValueError(f"M3 export: vision layer outside config: {name}")
+            part, kind = match[2], match[3]
+            shapes = {
+                "self_attn.q_proj": (dim, dim),
+                "self_attn.k_proj": (dim, dim),
+                "self_attn.v_proj": (dim, dim),
+                "self_attn.out_proj": (dim, dim),
+                "mlp.fc1": (inter, dim),
+                "mlp.fc2": (dim, inter),
+                "layer_norm1": (dim,),
+                "layer_norm2": (dim,),
+            }
+            if part not in shapes:
+                raise ValueError(f"M3 export: unsupported vision parameter {name}")
+            shape = shapes[part]
+            _check_shape(name, tensor, shape[:1] if kind == "bias" else shape)
+            target = "vision_tower.vision_model.encoder." + suffix
+        else:
+            raise ValueError(f"M3 export: unsupported vision parameter {name}")
+    elif match := re.fullmatch(r"model\.multi_modal_projector\.(merge_)?linear_([12])\.(weight|bias)", name):
+        merge, index, kind = match.groups()
+        input_size = config.merged_hidden_size if merge else config.vision_config.hidden_size
+        shape = (config.projector_hidden_size, input_size) if index == "1" else (hidden, config.projector_hidden_size)
+        _check_shape(name, tensor, shape[:1] if kind == "bias" else shape)
+        target = ("patch_merge_mlp." if merge else "multi_modal_projector.") + f"linear_{index}.{kind}"
+    else:
+        raise ValueError(f"M3 export: unsupported parameter {name}; refusing an unconverted weight")
+    yield target, tensor.contiguous()
+
+
 class MiniMaxM3VLCheckpointTensorConverter:
+    # HF saves use fused Transformers keys; rollout consumers request the public M3 layout.
+    use_export_weights_for_hf_save = False
+
     def __init__(self, num_experts: int):
         self.num_experts = num_experts
         self._expert_buffer: Dict[Tuple[str, str], Dict[int, torch.Tensor]] = {}
         self._gate_up_buffer: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
+
+    def export_weights(self, model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Stream public M3 weights without changing the model's state dict or dtypes.
+
+        Like DeepSeek V4, delegate FSDP/EP reconstruction and expert splitting to
+        the generic iterator. Only the checkpoint layout is model-specific here.
+        VeOmni's native checkpoint writers do not call this export hook.
+        """
+        for name, tensor in export_weights(model, num_experts=self.num_experts):
+            yield from _export_m3_tensor(name, tensor, model.config)
 
     def can_handle(self, name: str) -> bool:
         return (
