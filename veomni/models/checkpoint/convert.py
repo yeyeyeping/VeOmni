@@ -437,6 +437,7 @@ def export_weights(
     model: torch.nn.Module,
     *,
     skip_frozen_ple: bool = False,
+    num_experts: Optional[int] = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """
     Export master weights from fully_sharded model, fused MoE weights are split into per-expert weights.
@@ -445,6 +446,8 @@ def export_weights(
         model: The fully_sharded model to export the master weights from.
         skip_frozen_ple: Omit frozen Qwen4-Exp PLE n-gram tables before unsharding
             ``DTensor`` shards. Disabled by default so checkpoint exports remain complete.
+        num_experts: Optional global expert count. When supplied, validate expert stacks
+            and skip EP reconstruction for stacks that are already global.
 
     Returns:
         A generator of tuples of the form (name, tensor).
@@ -484,8 +487,19 @@ def export_weights(
         is_expert_layer = "mlp.experts." in name
         is_proj = any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])
 
-        if is_expert_layer and is_proj and ps.ep_enabled:
+        needs_ep_gather = is_expert_layer and is_proj and ps.ep_enabled
+        if is_expert_layer and is_proj and num_experts is not None:
+            if unsharded_tensor.ndim != 3:
+                raise ValueError(f"Export {name}: expected a 3D expert stack, got {tuple(unsharded_tensor.shape)}")
+            count = unsharded_tensor.shape[0]
+            if count == num_experts:
+                needs_ep_gather = False
+            elif not ps.ep_enabled or count <= 0 or count * ps.ep_size != num_experts:
+                raise ValueError(f"Export {name}: cannot reconstruct {num_experts} experts from {count} local experts")
+
+        if needs_ep_gather:
             ep_rank, ep_size = ps.ep_rank, ps.ep_size
+            unsharded_tensor = unsharded_tensor.to(device or get_device_type(), non_blocking=True).contiguous()
             buffer = torch.empty_like(unsharded_tensor)  # [num_experts/ep_size, H, I]
             for src_ep_rank in range(ep_size):
                 tensor = unsharded_tensor if src_ep_rank == ep_rank else buffer
