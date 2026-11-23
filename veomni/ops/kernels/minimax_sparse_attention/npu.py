@@ -26,16 +26,13 @@ logger = logging.get_logger(__name__)
 _BLOCK_SIZE = 128
 
 
-def _select_from_scores(scores, cu_seqlens, max_seqlen, topk_blocks, local_blocks):
+def _select_from_scores(scores, metadata, max_seqlen, topk_blocks, local_blocks):
     """Return unique causal KV block IDs in [T,Hkv,K], with trailing -1 slots."""
     # Match eager's TopK width, including when max_seqlen is an upper bound.
     blocks = (max_seqlen + _BLOCK_SIZE - 1) // _BLOCK_SIZE
     scores = F.pad(scores, (0, blocks - scores.shape[-1]), value=-torch.inf)
     scores.masked_fill_(scores == torch.finfo(torch.float32).min, -torch.inf)
-    total = scores.shape[1]
-    positions = torch.arange(total, device=scores.device) - torch.repeat_interleave(
-        cu_seqlens[:-1], cu_seqlens.diff().long(), output_size=total
-    )
+    positions = metadata.positions
     scores.masked_fill_(
         torch.arange(blocks, device=scores.device)[None, None, :] > positions[None, :, None] // _BLOCK_SIZE,
         -torch.inf,
@@ -51,8 +48,19 @@ def _select_from_scores(scores, cu_seqlens, max_seqlen, topk_blocks, local_block
     return indices.permute(1, 0, 2).to(torch.int32).contiguous()
 
 
+def _require_metadata(metadata, device, total_tokens, max_seqlen):
+    if metadata is None:
+        raise ValueError("Pass sparse_metadata prepared before model.forward")
+    if metadata.total_tokens != total_tokens or metadata.max_seqlen != max_seqlen:
+        raise ValueError("Sparse metadata does not match this packed microbatch")
+    metadata.wait(device)
+    return metadata
+
+
 @torch.no_grad()
-def minimax_sparse_indexer_npu(index_q, index_k, cu_seqlens, max_seqlen, *, block_size, topk_blocks, local_blocks):
+def minimax_sparse_indexer_npu(
+    index_q, index_k, cu_seqlens, max_seqlen, *, block_size, topk_blocks, local_blocks, sparse_metadata=None
+):
     if block_size != _BLOCK_SIZE:
         raise ValueError("MiniMax CANN indexer requires index_block_size=128.")
     if topk_blocks <= 0 or local_blocks < 0:
@@ -62,15 +70,16 @@ def minimax_sparse_indexer_npu(index_q, index_k, cu_seqlens, max_seqlen, *, bloc
 
     from cann_ops_transformer import ops
 
-    cu = cu_seqlens.to(device=index_q.device, dtype=torch.int32)
+    metadata = _require_metadata(sparse_metadata, index_q.device, index_q.shape[0], max_seqlen)
+    cu = metadata.cu
     scores = ops.msa_index_score(
         query=index_q.contiguous(),
         key=index_k.contiguous(),
-        start_loc=torch.zeros(cu.numel() - 1, dtype=torch.int32, device=index_q.device),
+        start_loc=metadata.start_loc,
         block_table=None,
         scale=None,
         # The current kernel validates the template and computes causal bounds internally.
-        atten_mask=torch.zeros((2048, 2048), dtype=torch.int8, device=index_q.device),
+        atten_mask=metadata.atten_mask,
         actual_seq_qlen=cu,
         actual_seq_klen=cu,
         layout_key="TND",
@@ -78,21 +87,20 @@ def minimax_sparse_indexer_npu(index_q, index_k, cu_seqlens, max_seqlen, *, bloc
         init_blocks=0,
         local_blocks=0,
     )
-    return _select_from_scores(scores, cu, max_seqlen, topk_blocks, local_blocks)
+    return _select_from_scores(scores, metadata, max_seqlen, topk_blocks, local_blocks)
 
 
-def _csr_to_gbsa(row_ptr, q_indices, cu_seqlens, max_seqlen):
+def _csr_to_gbsa(row_ptr, q_indices, metadata):
     """Expand Q-sorted interleaved CSR into batch-local BNKQ lists on device."""
+    cu_seqlens = metadata.cu
+    max_seqlen = metadata.backward_max_seqlen
     batch = cu_seqlens.numel() - 1
     heads = row_ptr.shape[0]
     blocks = (max_seqlen + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-    block_counts = (cu_seqlens.diff() + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-    # Split-KV interleaves batches within each KV block, skipping absent blocks.
-    present = torch.arange(blocks, device=row_ptr.device)[:, None] < block_counts[None, :]
-    rows = (present.flatten().long().cumsum(0) - 1).clamp(min=0).view(blocks, batch).T
+    present, rows = metadata.gbsa_present, metadata.gbsa_rows
     idx = torch.empty((batch, heads, blocks, max_seqlen), dtype=torch.int32, device=row_ptr.device)
     counts = torch.empty((batch, heads, blocks), dtype=torch.int32, device=row_ptr.device)
-    slots = torch.arange(max_seqlen, device=row_ptr.device)
+    slots = metadata.gbsa_slots
     # Bound temporary gather storage to one batch; output capacity is fixed by GBSA.
     for b in range(batch):
         starts = row_ptr[:, rows[b]]
@@ -107,28 +115,20 @@ def _csr_to_gbsa(row_ptr, q_indices, cu_seqlens, max_seqlen):
 
 class _SplitKVGBSA(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, block_indices, cu_seqlens, max_seqlen, scale):
+    def forward(ctx, q, k, v, block_indices, metadata, max_seqlen, scale):
         from cann_ops_transformer import ops
 
         q, k, v = (tensor.contiguous() for tensor in (q, k, v))
-        cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
-        lengths = cu.diff()
-        block_counts = (cu_seqlens.diff() + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-        cu_blocks = F.pad(block_counts.cumsum(0, dtype=torch.int32), (1, 0))
-        # Use known host/shape metadata; otherwise the native wrapper infers sizes.
-        total_rows = max_kv = None
-        if cu_seqlens.device.type == "cpu":
-            total_rows, max_kv = int(cu_blocks[-1]), int(block_counts.max())
-        elif cu_seqlens.numel() == 2:
-            total_rows = max_kv = (q.shape[0] + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+        cu = metadata.cu
+        lengths = metadata.lengths
         # The indexer owns uniqueness, causality and -1 padding of selections.
         row_ptr, q_idx, slot_idx = ops.k2q_csr(
             block_indices.permute(1, 0, 2).contiguous(),
             cu,
-            cu_blocks.to(device=q.device),
+            metadata.cu_blocks,
             order_method=1,
-            total_rows=total_rows,
-            max_kv=max_kv,
+            total_rows=metadata.total_rows,
+            max_kv=metadata.max_kv,
             use_simt=False,
             q_global_offset=True,
         )
@@ -150,7 +150,8 @@ class _SplitKVGBSA(torch.autograd.Function):
             softmax_lse_flag=True,
             input_layout="TND",
         )
-        ctx.save_for_backward(q, k, v, out, lse, row_ptr, q_idx, cu)
+        ctx.save_for_backward(q, k, v, out, lse, row_ptr, q_idx)
+        ctx.sparse_metadata = metadata
         # GBSA bounds TND's KV-block dimension by the total packed K tokens.
         ctx.max_seqlen = min(max_seqlen, q.shape[0])
         ctx.scale = scale
@@ -161,12 +162,12 @@ class _SplitKVGBSA(torch.autograd.Function):
     def backward(ctx, dout):
         from cann_ops_transformer import ops
 
-        q, k, v, out, lse, row_ptr, q_idx, cu = ctx.saved_tensors
-        sparse_idx, sparse_count = _csr_to_gbsa(row_ptr, q_idx, cu, ctx.max_seqlen)
-        cu_i64 = cu.to(torch.int64)
-        # CANN GBSA requires one int32 used length per packed sequence.
-        # Pass the same lengths to metadata and backward, including empty segments.
-        lengths = cu.diff().contiguous()
+        q, k, v, out, lse, row_ptr, q_idx = ctx.saved_tensors
+        sparse_metadata = ctx.sparse_metadata
+        sparse_metadata.wait(q.device)
+        sparse_idx, sparse_count = _csr_to_gbsa(row_ptr, q_idx, sparse_metadata)
+        cu_i64 = sparse_metadata.cu_i64
+        lengths = sparse_metadata.lengths
         attrs = dict(
             cu_seqlens_q=cu_i64,
             cu_seqlens_kv=cu_i64,
@@ -211,7 +212,9 @@ class _SplitKVGBSA(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None
 
 
-def minimax_sparse_attention_npu(q, k, v, block_indices, cu_seqlens, max_seqlen, *, block_size, scale, dropout_p=0.0):
+def minimax_sparse_attention_npu(
+    q, k, v, block_indices, cu_seqlens, max_seqlen, *, block_size, scale, dropout_p=0.0, sparse_metadata=None
+):
     if block_indices is None or dropout_p != 0.0:
         if dropout_p != 0.0:
             logger.warning_once("MiniMax split-KV has no dropout support; using eager attention for nonzero dropout.")
@@ -227,4 +230,5 @@ def minimax_sparse_attention_npu(q, k, v, block_indices, cu_seqlens, max_seqlen,
         raise ValueError("MiniMax GBSA metadata exceeds its B * Hq * J task limit (1048576).")
     if q.shape[0] * block_indices.shape[-1] > torch.iinfo(torch.int32).max:
         raise ValueError("MiniMax CSR edge capacity exceeds int32 offsets.")
-    return _SplitKVGBSA.apply(q, k, v, block_indices, cu_seqlens, max_seqlen, scale)
+    metadata = _require_metadata(sparse_metadata, q.device, q.shape[0], max_seqlen)
+    return _SplitKVGBSA.apply(q, k, v, block_indices, metadata, max_seqlen, scale)

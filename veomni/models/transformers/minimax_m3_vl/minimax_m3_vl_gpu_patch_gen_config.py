@@ -343,7 +343,8 @@ def minimax_m3_vl_attention_forward_patched(
     # --- Patch.3 ---
     # The text model guarantees packed varlen metadata; training packs samples
     # with identical query/key boundaries.
-    cu_seqlens = kwargs["cu_seq_lens_q"]
+    sparse_metadata = kwargs.get("sparse_attention_metadata")
+    cu_seqlens = sparse_metadata.cu_host if sparse_metadata is not None else kwargs["cu_seq_lens_q"]
     max_seqlen = kwargs["max_length_q"]
     if self.indexer is not None:
         msa_indexer = veomni_msa_indexer if veomni_msa_indexer.use_non_eager_impl else minimax_sparse_indexer_eager
@@ -355,6 +356,11 @@ def minimax_m3_vl_attention_forward_patched(
             block_size=self.indexer.block_size,
             topk_blocks=self.indexer.topk_blocks,
             local_blocks=self.indexer.local_blocks,
+            **(
+                {"sparse_metadata": kwargs.get("sparse_attention_metadata")}
+                if IS_NPU_AVAILABLE and veomni_msa_indexer.use_non_eager_impl
+                else {}
+            ),
         )
     # --- Patch.5 ---
     if async_ulysses:
@@ -394,6 +400,11 @@ def minimax_m3_vl_attention_forward_patched(
             block_size=self.indexer.block_size,
             scale=self.scaling,
             dropout_p=dropout,
+            **(
+                {"sparse_metadata": kwargs.get("sparse_attention_metadata")}
+                if IS_NPU_AVAILABLE and veomni_msa_attention.use_non_eager_impl
+                else {}
+            ),
         ).unsqueeze(0)
 
     if parallel_state.ulysses_enabled:
@@ -706,6 +717,8 @@ def minimax_m3_vl_model_forward_patched(
         fake_features = self.multi_modal_projector(fake_vision.last_hidden_state.squeeze(0))
         inputs_embeds = inputs_embeds + fake_features.mean().to(inputs_embeds.device, inputs_embeds.dtype) * 0.0
 
+    if getattr(self, "skip_video_dummy", False) and pixel_values_videos is not None:
+        raise ValueError("skip_video_dummy requires an image-only batch on every rank")
     video_features = None
     if pixel_values_videos is not None:
         video_features = self.get_video_features(
@@ -713,7 +726,7 @@ def minimax_m3_vl_model_forward_patched(
         ).pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
         if parallel_state.sp_enabled:
             video_features = gather_outputs(video_features, gather_dim=0, group=parallel_state.sp_group)
-    elif parallel_state.fsdp_enabled:
+    elif parallel_state.fsdp_enabled and not getattr(self, "skip_video_dummy", False):
         fake_vision = self.vision_tower.dummy_forward()
         fake_features = self.multi_modal_projector(fake_vision.last_hidden_state.squeeze(0))
         inputs_embeds = inputs_embeds + fake_features.mean().to(inputs_embeds.device, inputs_embeds.dtype) * 0.0
