@@ -346,7 +346,7 @@
  class MiniMaxM3VLAttention(nn.Module):
      """
      M3 attention: per-head Gemma QK-norm + partial RoPE, optionally sparse indexer selection which require position IDs.
-@@ -429,64 +586,145 @@
+@@ -429,64 +586,156 @@
              MiniMaxM3VLIndexer(config, layer_idx) if config.layer_types[layer_idx] == "minimax_m3_sparse" else None
          )
 
@@ -444,7 +444,8 @@
 +        # --- Patch.3 ---
 +        # The text model guarantees packed varlen metadata; training packs samples
 +        # with identical query/key boundaries.
-+        cu_seqlens = kwargs["cu_seq_lens_q"]
++        sparse_metadata = kwargs.get("sparse_attention_metadata")
++        cu_seqlens = sparse_metadata.cu_host if sparse_metadata is not None else kwargs["cu_seq_lens_q"]
 +        max_seqlen = kwargs["max_length_q"]
          if self.indexer is not None:
 -            position_ids = kwargs.get("position_ids")
@@ -463,6 +464,11 @@
 +                block_size=self.indexer.block_size,
 +                topk_blocks=self.indexer.topk_blocks,
 +                local_blocks=self.indexer.local_blocks,
++                **(
++                    {"sparse_metadata": kwargs.get("sparse_attention_metadata")}
++                    if IS_NPU_AVAILABLE and veomni_msa_indexer.use_non_eager_impl
++                    else {}
++                ),
              )
 -            block_indices = self.indexer(hidden_states, position_embeddings, past_key_values, position_ids)
 -            if self.config._attn_implementation in ("eager", "sdpa"):
@@ -524,6 +530,11 @@
 +                block_size=self.indexer.block_size,
 +                scale=self.scaling,
 +                dropout_p=dropout,
++                **(
++                    {"sparse_metadata": kwargs.get("sparse_attention_metadata")}
++                    if IS_NPU_AVAILABLE and veomni_msa_attention.use_non_eager_impl
++                    else {}
++                ),
 +            ).unsqueeze(0)
 +
 +        if parallel_state.ulysses_enabled:
@@ -542,7 +553,7 @@
 
 
  class MiniMaxM3VLIndexer(nn.Module):
-@@ -536,7 +774,7 @@
+@@ -536,7 +785,7 @@
      """
 
      def __init__(self, config: MiniMaxM3VLTextConfig, layer_idx: int):
@@ -551,7 +562,7 @@
          self.config = config
          self.layer_idx = layer_idx
          self.head_dim = config.index_head_dim
-@@ -548,6 +786,16 @@
+@@ -548,6 +797,16 @@
          self.k_proj = nn.Linear(config.hidden_size, config.index_head_dim, bias=False)
          self.q_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
          self.k_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
@@ -568,7 +579,7 @@
 
      def forward(
          self,
-@@ -677,26 +925,38 @@
+@@ -677,26 +936,38 @@
          return hidden_states
 
 
@@ -611,7 +622,7 @@
 
      @torch.no_grad()
      def _init_weights(self, module):
-@@ -712,6 +972,12 @@
+@@ -712,6 +983,12 @@
              init.zeros_(module.weight)
 
 
@@ -624,7 +635,7 @@
  @auto_docstring
  class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
      config: MiniMaxM3VLTextConfig
-@@ -730,6 +996,17 @@
+@@ -730,6 +1007,17 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -642,7 +653,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -738,48 +1015,75 @@
+@@ -738,48 +1026,75 @@
          input_ids: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
@@ -745,7 +756,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -789,180 +1093,6 @@
+@@ -789,180 +1104,6 @@
          return MoeModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
@@ -926,7 +937,7 @@
          )
 
 
-@@ -990,6 +1120,12 @@
+@@ -990,6 +1131,12 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -939,7 +950,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,13 +1155,17 @@
+@@ -1019,13 +1166,17 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -964,7 +975,7 @@
          coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
-@@ -1156,6 +1296,12 @@
+@@ -1156,6 +1307,12 @@
          return hidden_states
 
 
@@ -977,7 +988,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1324,151 @@
+@@ -1178,23 +1335,151 @@
          )
          self.post_init()
 
@@ -1135,7 +1146,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1552,26 @@
+@@ -1278,6 +1563,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1162,7 +1173,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1644,123 @@
+@@ -1350,46 +1655,125 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1252,6 +1263,7 @@
 -                pixel_values=pixel_values, image_grid_thw=image_grid_thw
 +                pixel_values=pixel_values, image_grid_thw=image_grid_thw, **image_vit_kwargs
              ).pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
+-
 +            if parallel_state.sp_enabled:
 +                image_features = gather_outputs(image_features, gather_dim=0, group=parallel_state.sp_group)
 +
@@ -1259,7 +1271,9 @@
 +            fake_vision = self.vision_tower.dummy_forward()
 +            fake_features = self.multi_modal_projector(fake_vision.last_hidden_state.squeeze(0))
 +            inputs_embeds = inputs_embeds + fake_features.mean().to(inputs_embeds.device, inputs_embeds.dtype) * 0.0
-
++
++        if getattr(self, "skip_video_dummy", False) and pixel_values_videos is not None:
++            raise ValueError("skip_video_dummy requires an image-only batch on every rank")
          video_features = None
          if pixel_values_videos is not None:
              video_features = self.get_video_features(
@@ -1272,7 +1286,7 @@
 -        )
 +            if parallel_state.sp_enabled:
 +                video_features = gather_outputs(video_features, gather_dim=0, group=parallel_state.sp_group)
-+        elif parallel_state.fsdp_enabled:
++        elif parallel_state.fsdp_enabled and not getattr(self, "skip_video_dummy", False):
 +            fake_vision = self.vision_tower.dummy_forward()
 +            fake_features = self.multi_modal_projector(fake_vision.last_hidden_state.squeeze(0))
 +            inputs_embeds = inputs_embeds + fake_features.mean().to(inputs_embeds.device, inputs_embeds.dtype) * 0.0
@@ -1303,7 +1317,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,6 +1797,12 @@
+@@ -1426,6 +1810,12 @@
          return vision_outputs
 
 
@@ -1316,7 +1330,7 @@
  @auto_docstring(custom_intro="MiniMax M3 VL full model with LM head (text + vision).")
  class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3VLPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -1448,48 +1825,25 @@
+@@ -1448,48 +1838,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1383,7 +1397,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1858,42 @@
+@@ -1504,15 +1871,42 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1431,7 +1445,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1905,19 @@
+@@ -1524,9 +1918,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 
