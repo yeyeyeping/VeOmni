@@ -126,6 +126,7 @@ SUPPORTED_MOE_MODEL_TYPES: frozenset[str] = frozenset(
         "qwen3_moe",
         "qwen3_5_moe",
         "deepseek_v4",
+        "minimax_m3_vl",
         "qwen4_exp",
     }
 )

@@ -56,6 +56,7 @@ from veomni.ops.kernels.attention.ulysses import (
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
+from veomni.utils.moe_router_replay import maybe_replay_indices
 
 
 def collate_multimodal_metadata(batch, sp_pad):
@@ -416,6 +417,7 @@ class MiniMaxM3VLTopKRouter(nn.Module):
         routing_weights = F.sigmoid(router_logits.float())
         scores_for_choice = routing_weights + self.e_score_correction_bias
         _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)
+        top_k_index = maybe_replay_indices(self, scores_for_choice, top_k_index)
         top_k_weights = routing_weights.gather(1, top_k_index)
         top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
         return router_logits, top_k_weights, top_k_index

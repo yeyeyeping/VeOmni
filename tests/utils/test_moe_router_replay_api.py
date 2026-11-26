@@ -118,6 +118,33 @@ class _RecordingManager:
         return self.substitute_indices
 
 
+def test_minimax_router_replays_indices_before_weight_normalization():
+    from veomni.models.transformers.minimax_m3_vl.modeling_minimax_m3_vl import MiniMaxM3VLTopKRouter
+
+    router = MiniMaxM3VLTopKRouter(SimpleNamespace(hidden_size=4, num_local_experts=4, num_experts_per_tok=2))
+    with torch.no_grad():
+        router.weight.copy_(torch.eye(4))
+        router.e_score_correction_bias.copy_(torch.tensor([1.0, 1.0, 0.0, 0.0]))
+    inputs = torch.tensor([[-2.0, -1.0, 1.0, 2.0]])
+    _, native_weights, native_indices = router(inputs)
+    assert native_indices.sort().values.tolist() == [[0, 1]]
+    scores = inputs.sigmoid()
+    expected = scores.gather(1, native_indices)
+    torch.testing.assert_close(native_weights, expected / expected.sum(dim=-1, keepdim=True))
+
+    targets = torch.tensor([[3, 1]])
+    manager = _RecordingManager(substitute_indices=targets)
+    set_active_replay(manager)
+    _, weights, indices = router(inputs)
+    assert len(manager.calls) == 1
+    assert manager.calls[0]["module"] is router
+    torch.testing.assert_close(manager.calls[0]["routing_scores"], scores + router.e_score_correction_bias)
+    torch.testing.assert_close(manager.calls[0]["top_indices"], native_indices)
+    torch.testing.assert_close(indices, targets)
+    expected = scores.gather(1, targets)
+    torch.testing.assert_close(weights, expected / expected.sum(dim=-1, keepdim=True))
+
+
 def test_manager_receives_documented_arguments():
     module, scores, indices = _make_routing()
     mgr = _RecordingManager()
